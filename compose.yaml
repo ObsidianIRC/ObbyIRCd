@@ -45,7 +45,7 @@ services:
 
   hosted-backend:
     build:
-      context: ./hosted-backend
+      context: https://github.com/ObsidianIRC/hosted-backend.git#feat/voice-channels
       dockerfile: Dockerfile
     image: hosted-backend:local
     container_name: hosted-backend

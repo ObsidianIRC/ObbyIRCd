@@ -117,6 +117,8 @@ ENV SERVER_NAME=irc.example.com \
     RPC_PORT=8600 \
     MOTD_TEXT="Welcome to ObbyIRCd!"
 
+EXPOSE 6697 8080 8600
+
 VOLUME ["/home/obbyircd/obby/conf", \
         "/home/obbyircd/obby/data", \
         "/home/obbyircd/obby/logs", \
