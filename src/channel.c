@@ -932,8 +932,13 @@ int valid_channelname(const char *cname)
 {
 	const char *p;
 
-	/* Channel name must start with a dash */
-	if (*cname != '#')
+	/* Channel name must start with a recognised prefix:
+	 *   #  -- standard text channels
+	 *   ^  -- ObsidianIRC voice channels (handled by the
+	 *         "voice-channels" module; SDP/ICE flow over
+	 *         server-mediated TAGMSG)
+	 */
+	if (*cname != '#' && *cname != '^')
 		return 0;
 
 	if (strlen(cname) > CHANNELLEN)
