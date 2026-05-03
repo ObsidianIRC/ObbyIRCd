@@ -32,7 +32,7 @@ int extban_inchannel_is_ok(BanContext *b);
 const char *extban_inchannel_conv_param(BanContext *b, Extban *extban);
 int extban_inchannel_is_banned(BanContext *b);
 
-Extban *register_channel_extban(ModuleInfo *modinfo)
+static Extban *register_channel_extban(ModuleInfo *modinfo)
 {
 	ExtbanInfo req;
 

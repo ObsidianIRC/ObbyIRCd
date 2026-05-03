@@ -40,7 +40,7 @@ int maximum_inherit_ban_count = 1;
 int maximum_inherit_exempt_count = 0;
 int maximum_inherit_invex_count = 1;
 
-Extban *register_channel_extban(ModuleInfo *modinfo)
+static Extban *register_channel_extban(ModuleInfo *modinfo)
 {
 	ExtbanInfo req;
 

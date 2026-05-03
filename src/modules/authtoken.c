@@ -1202,8 +1202,6 @@ MOD_INIT()
 
 	CommandAdd(modinfo->handle, "TOKEN", cmd_token, MAXPARA,
 	           CMD_USER | CMD_UNREGISTERED);
-	CommandOverrideAdd(modinfo->handle, "BATCH", 0,
-	                   authtoken_override_batch);
 
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, authtoken_configrun);
 	HookAdd(modinfo->handle, HOOKTYPE_WELCOME, 0, authtoken_welcome);
@@ -1216,6 +1214,12 @@ MOD_LOAD()
 {
 	/* draft/AUTHTOKEN ISUPPORT (no value per spec) */
 	ISupportAdd(modinfo->handle, "draft/AUTHTOKEN", NULL);
+
+	/* CommandOverrideAdd must run in MOD_LOAD: the BATCH command is
+	 * registered by another module's MOD_INIT, so overriding it from
+	 * our MOD_INIT would race depending on module load order. */
+	CommandOverrideAdd(modinfo->handle, "BATCH", 0,
+	                   authtoken_override_batch);
 
 	/* Resolve the batch capability bit so we can quickly check it. */
 	{

@@ -107,3 +107,8 @@ ObsidianIRC/
 
 # Per-source backup files from in-place edits.
 *.bak
+
+# Bundled installer artifacts produced by Tauri builds (ObsidianIRC client).
+*.deb
+*.rpm
+*.AppImage
