@@ -1,0 +1,47 @@
+# ObbyIRCd service only -- IRC daemon with voice-channels module.
+# Shares obbyircd_voice_bridge volume with hosted-backend via Coolify's
+# named volume / service linking.
+
+services:
+  obbyircd:
+    build:
+      context: .
+      dockerfile: ./docker/Dockerfile
+    image: obbyircd:local
+    container_name: obbyircd
+    restart: unless-stopped
+    expose:
+      - "8080"
+    volumes:
+      - ${CONF_BIND:-obbyircd_conf}:/home/obbyircd/obby/conf
+      - ${DATA_BIND:-obbyircd_data}:/home/obbyircd/obby/data
+      - ${LOGS_BIND:-obbyircd_logs}:/home/obbyircd/obby/logs
+      - ${TLS_BIND:-obbyircd_tls}:/home/obbyircd/obby/tls
+      - ${CUSTOM_MODULES_BIND:-obbyircd_custom_modules}:/home/obbyircd/obby/custom-modules
+      # Voice bridge socket dir -- mount same path as hosted-backend
+      - ${VOICE_BRIDGE_BIND:-obbyircd_voice_bridge}:/run/obbyirc
+    environment:
+      WS_PORT: "8080"
+      VOICE_BRIDGE_SOCKET: ${VOICE_BRIDGE_SOCKET:-/run/obbyirc/voice.sock}
+    env_file:
+      - path: .env
+        required: false
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8080"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.obbyircd.rule=Host(`${IRC_FQDN}`)
+      - traefik.http.routers.obbyircd.tls=true
+      - traefik.http.services.obbyircd.loadbalancer.server.port=8080
+
+volumes:
+  obbyircd_conf:
+  obbyircd_data:
+  obbyircd_logs:
+  obbyircd_tls:
+  obbyircd_custom_modules:
+  obbyircd_voice_bridge:

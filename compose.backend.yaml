@@ -1,0 +1,43 @@
+# Hosted-backend service only -- Go HTTP API + WebRTC SFU + TURN server.
+# Depends on obbyircd being up (for voice signaling bridge).
+# Shares obbyircd_voice_bridge volume with obbyircd via Coolify.
+
+services:
+  hosted-backend:
+    build:
+      context: https://github.com/ObsidianIRC/hosted-backend.git#unreal60_dev
+      dockerfile: Dockerfile
+    image: hosted-backend:local
+    container_name: hosted-backend
+    restart: unless-stopped
+    expose:
+      - "8080"
+    ports:
+      # TURN UDP published direct on host -- Traefik does not handle UDP
+      - "${TURN_PORT:-3478}:3478/udp"
+    volumes:
+      - backend_data:/app/data
+      - backend_images:/app/images
+      # Voice bridge socket -- same path as obbyircd
+      - ${VOICE_BRIDGE_BIND:-obbyircd_voice_bridge}:/run/obbyirc
+    environment:
+      PORT: "8080"
+      VOICE_BRIDGE_SOCKET: ${VOICE_BRIDGE_SOCKET:-/run/obbyirc/voice.sock}
+      VOICE_TURN_SECRET: ${VOICE_TURN_SECRET:?set VOICE_TURN_SECRET in Coolify}
+      VOICE_PUBLIC_IP: ${VOICE_PUBLIC_IP:?set VOICE_PUBLIC_IP in Coolify}
+      VOICE_TURN_PORT: "3478"
+      VOICE_MAX_ROOM: "25"
+    env_file:
+      - path: .env
+        required: false
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.backend.rule=Host(`${API_FQDN}`)
+      - traefik.http.routers.backend.tls=true
+      - traefik.http.services.backend.loadbalancer.server.port=8080
+
+volumes:
+  backend_data:
+  backend_images:
+  # Voice bridge volume -- should match obbyircd's (by name across Coolify apps)
+  obbyircd_voice_bridge:
