@@ -100,6 +100,7 @@ MODULES= \
 	emoji.so \
 	account-recovery.so \
 	read-marker.so \
+	cmdslist.so \
 	voice-channels.so
 
 MODULEFLAGS=@MODULEFLAGS@
