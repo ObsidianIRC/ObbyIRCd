@@ -155,10 +155,12 @@ read-marker.so: read-marker.c $(INCLUDES)
 	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
 		-o read-marker.so read-marker.c -lsqlite3
 
-# voice-channels needs jansson for the Unix-socket bridge JSON
+# voice-channels needs jansson for the Unix-socket bridge JSON.
+# Use @JANSSON_LIBS@ from configure -- system jansson via pkg-config
+# if found, else the bundled extras/jansson copy at $(PRIVATELIBDIR).
 voice-channels.so: voice-channels.c $(INCLUDES)
 	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
-		-o voice-channels.so voice-channels.c -ljansson
+		-o voice-channels.so voice-channels.c @JANSSON_LIBS@
 
 # obbyscript embeds Duktape and needs -lm
 obbyscript.so: obbyscript.c duktape.c ../include/duktape.h ../include/duk_config.h $(INCLUDES)
