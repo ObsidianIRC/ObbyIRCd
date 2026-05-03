@@ -99,7 +99,8 @@ MODULES= \
 	smtp.so \
 	emoji.so \
 	account-recovery.so \
-	read-marker.so
+	read-marker.so \
+	voice-channels.so
 
 MODULEFLAGS=@MODULEFLAGS@
 RM=@RM@
@@ -153,6 +154,11 @@ account-recovery.so: account-recovery.c $(INCLUDES)
 read-marker.so: read-marker.c $(INCLUDES)
 	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
 		-o read-marker.so read-marker.c -lsqlite3
+
+# voice-channels needs jansson for the Unix-socket bridge JSON
+voice-channels.so: voice-channels.c $(INCLUDES)
+	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
+		-o voice-channels.so voice-channels.c -ljansson
 
 # obbyscript embeds Duktape and needs -lm
 obbyscript.so: obbyscript.c duktape.c ../include/duktape.h ../include/duk_config.h $(INCLUDES)

@@ -2508,7 +2508,9 @@ struct Ban {
 #define	ShowChannel(v,c)	(PubChannel(c) || IsMember((v),(c)))
 #define	PubChannel(x)		(!SecretChannel((x)) && !HiddenChannel((x)))
 
-#define	IsChannelName(name) ((name) && (*(name) == '#'))
+/* `^` is the ObsidianIRC voice-channel prefix, alongside the
+ * standard `#` text-channel prefix. */
+#define	IsChannelName(name) ((name) && ((*(name) == '#') || (*(name) == '^')))
 
 #define IsMember(blah,chan) ((blah && blah->user && \
                 find_membership_link((blah->user)->channel, chan)) ? 1 : 0)
