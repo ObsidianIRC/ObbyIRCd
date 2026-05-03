@@ -11,7 +11,7 @@ services:
   obbyircd:
     build:
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: ./docker/Dockerfile
     image: obbyircd:local
     container_name: obbyircd
     restart: unless-stopped
@@ -80,7 +80,7 @@ services:
   obsidian:
     build:
       context: ./ObsidianIRC
-      dockerfile: Dockerfile
+      dockerfile: ./Dockerfile
       args:
         VITE_DEFAULT_IRC_SERVER: wss://${IRC_FQDN}
         VITE_DEFAULT_IRC_SERVER_NAME: ${NETWORK_NAME:-ObbyNetwork}
