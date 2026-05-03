@@ -198,7 +198,13 @@ void crash_report_fix_libs(char *coredump, int *thirdpartymods)
 		if (!file_exists(target))
 		{
 			printf("WARNING: could not resolve %s: %s does not exist\n", path, target);
-		} else {
+		} else if (!file_exists(path)) {
+			/* Only attempt the symlink when the temp path is missing.
+			 * On a normal restart after a crash, the freshly-copied
+			 * temp .so already exists from this run's module load,
+			 * which would make symlink() fail with EEXIST and spam
+			 * the console.  In that case, silently skip -- the live
+			 * .so is already there, so gdb resolution still works. */
 			if (symlink(target, path) < 0)
 				printf("WARNING: could not create symlink %s -> %s\n", path, target);
 		}

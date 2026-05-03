@@ -186,16 +186,16 @@ typedef struct TwoFACredential {
 } TwoFACredential;
 
 /* Database */
-int   obsidian_open_database(const char *filename);
-void  obsidian_close_database(void);
-int   write_account_to_db(const Account *acc);
-int   update_account_verification(const Account *acc);
-int   update_account_scram(const Account *acc);
-int   update_account_twofa_enabled(const Account *acc);
-Account **read_accounts_from_db(const char *name);
-Account  *find_account(const char *name);
-Account  *find_account_by_client(Client *client);
-void  free_account(Account *acc);
+extern int   obsidian_open_database(const char *filename);
+extern void  obsidian_close_database(void);
+extern int   write_account_to_db(const Account *acc);
+extern int   update_account_verification(const Account *acc);
+extern int   update_account_scram(const Account *acc);
+extern int   update_account_twofa_enabled(const Account *acc);
+extern Account **read_accounts_from_db(const char *name);
+extern Account  *find_account(const char *name);
+extern Account  *find_account_by_client(Client *client);
+extern void  free_account(Account *acc);
 
 /* 2FA credentials */
 TwoFACredential *twofa_list_credentials(long int account_id);

@@ -43,7 +43,7 @@ void rmtkl_check_options(const char *param, int *skipperm, int *silent);
 int rmtkl_tryremove(Client *client, TKLType *tkltype, TKL *tkl, const char *uhmask, const char *commentmask, int skipperm, int silent);
 CMD_FUNC(rmtkl);
 
-TKLType tkl_types[] = {
+static TKLType tkl_types[] = {
 	{ TKL_KILL, 'k', "K-Line", "server-ban:kline:remove" },
 	{ TKL_ZAP, 'z',	"Z-Line", "server-ban:zline:local:remove" },
 	{ TKL_KILL | TKL_GLOBAL, 'G', "G-Line", "server-ban:gline:remove" },

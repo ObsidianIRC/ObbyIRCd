@@ -33,7 +33,31 @@
 #ifndef RTLD_NOW
 #define RTLD_NOW RTLD_LAZY
 #endif
+#ifndef RTLD_GLOBAL
+#define RTLD_GLOBAL 0
+#endif
 #include "modversion.h"
+
+/* ObbyIRCd: a small set of modules export shared symbols (the obsidian
+ * SQLite handle and the account API) that their dependents need to
+ * resolve at module-load time.  We can't blanket-load every .so with
+ * RTLD_GLOBAL -- many UnrealIRCd modules use non-static globals like
+ * `cfg`, `setconf`, `tkl_types`, etc., and global-scope loading would
+ * cause them to clobber each other.  Instead, we whitelist the few
+ * modules whose symbols are intentionally cross-module. */
+static int module_needs_global_symbols(const char *relpath)
+{
+	static const char * const exporters[] = {
+		"account-registration",
+		NULL
+	};
+	if (!relpath)
+		return 0;
+	for (int i = 0; exporters[i]; i++)
+		if (!strcmp(relpath, exporters[i]))
+			return 1;
+	return 0;
+}
 
 Hook	   	*Hooks[MAXHOOKTYPES];
 Hooktype	Hooktypes[MAXCUSTOMHOOKS];
@@ -377,7 +401,13 @@ const char *Module_Create(const char *path_)
 		}
 	}
 
-	if ((Mod = irc_dlopen(tmppath, RTLD_NOW)))
+	{
+		int dlflags = RTLD_NOW;
+		if (module_needs_global_symbols(relpath))
+			dlflags |= RTLD_GLOBAL;
+		Mod = irc_dlopen(tmppath, dlflags);
+	}
+	if (Mod)
 	{
 		/* We have engaged the borg cube. Scan for lifesigns. */
 		irc_dlsym(Mod, "Mod_Version", Mod_Version);

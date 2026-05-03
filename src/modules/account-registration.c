@@ -600,7 +600,7 @@ static void free_accreg_conf(void)
 /* ===================================================================
  * SQLite3 database layer
  * =================================================================== */
-int obsidian_open_database(const char *filename)
+extern int obsidian_open_database(const char *filename)
 {
     const char *sql;
     char *errmsg;
