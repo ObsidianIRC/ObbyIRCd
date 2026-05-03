@@ -99,7 +99,8 @@ MODULES= \
 	smtp.so \
 	emoji.so \
 	account-recovery.so \
-	read-marker.so
+	read-marker.so \
+	cmdslist.so
 
 MODULEFLAGS=@MODULEFLAGS@
 RM=@RM@
