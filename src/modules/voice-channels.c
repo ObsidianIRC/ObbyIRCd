@@ -46,10 +46,14 @@ ModuleHeader MOD_HEADER = {
 
 #define VOICE_CHAN_PREFIX  '^'
 #define VOICE_RTC_TAG      "+obsidianirc/rtc"
+#define VOICE_CAP_NAME     "obsidianirc/voice"
 #define VOICE_DEFAULT_SOCK "/tmp/obbyirc-voice.sock"
 
 /* Configurable via env var or set::voice-bridge-socket "<path>"; in obbyircd.conf. */
 static char *cfg_bridge_socket = NULL;
+
+/* CAP bit assigned by ClientCapabilityAdd; gates ^channel JOIN. */
+static long CAP_OBSIDIANIRC_VOICE = 0L;
 
 /* ===================================================================
  * Bridge connection state
@@ -395,6 +399,29 @@ static int voice_rtc_mtag_is_ok(Client *_client, const char *_name,
 	return 1;
 }
 
+/* HOOKTYPE_CAN_JOIN: only clients that negotiated the obsidianirc/voice
+ * capability are allowed into ^channels.  Plain IRC clients (HexChat,
+ * irssi, etc.) hitting these channels would just see an unintelligible
+ * stream of voice signaling traffic, so we hide them entirely. */
+static int voice_can_join(Client *client, Channel *channel,
+                           const char *_key, char **errmsg)
+{
+	static char fmt[160];
+
+	if (channel->name[0] != VOICE_CHAN_PREFIX)
+		return 0;
+	if (!MyUser(client))
+		return 0; /* trust remote servers for federated joins */
+	if (HasCapabilityFast(client, CAP_OBSIDIANIRC_VOICE))
+		return 0;
+
+	snprintf(fmt, sizeof(fmt),
+	         "%%s :Voice channels require the " VOICE_CAP_NAME
+	         " client capability");
+	*errmsg = fmt;
+	return ERR_NOSUCHCHANNEL;
+}
+
 /* HOOKTYPE_NEW_MESSAGE: copy "+obsidianirc/rtc" from the parsed recv
  * tag list onto the outgoing tag list so PRE_CHANMSG can see it.
  * Without this the tag is parsed and accepted but never propagated
@@ -451,6 +478,14 @@ MOD_INIT()
 	if (env && *env && !cfg_bridge_socket)
 		safe_strdup(cfg_bridge_socket, env);
 
+	/* Advertise the obsidianirc/voice client capability.  Clients that
+	 * support voice/video signaling REQ this in their CAP exchange; the
+	 * CAN_JOIN hook below uses it as the gate for ^channel access. */
+	ClientCapabilityInfo cap;
+	memset(&cap, 0, sizeof(cap));
+	cap.name = VOICE_CAP_NAME;
+	ClientCapabilityAdd(modinfo->handle, &cap, &CAP_OBSIDIANIRC_VOICE);
+
 	/* Without registering a MessageTagHandler the parser silently
 	 * drops "+obsidianirc/rtc" from incoming TAGMSGs (message_tag_ok()
 	 * rejects unknown tags from local clients), and PRE_CHANMSG sees
@@ -464,6 +499,7 @@ MOD_INIT()
 
 	HookAddVoid(modinfo->handle, HOOKTYPE_NEW_MESSAGE, 0, voice_rtc_new_message);
 	HookAdd(modinfo->handle, HOOKTYPE_PRE_CHANMSG, 0, voice_pre_chanmsg);
+	HookAdd(modinfo->handle, HOOKTYPE_CAN_JOIN, 0, voice_can_join);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_PART, 0, voice_local_part);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_QUIT, 0, voice_local_quit);
 
