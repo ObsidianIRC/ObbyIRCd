@@ -125,7 +125,7 @@ MOD_LOAD()
 	if (cfg.has_hosts)
 	{
 		ISupport *is;
-		if (!(is = ISupportAdd(modinfo->handle, "FILEHOST", cfg.isupport_line)))
+		if (!(is = ISupportAdd(modinfo->handle, "draft/FILEHOST", cfg.isupport_line)))
 			return MOD_FAILED;
 	}
 	return MOD_SUCCESS;

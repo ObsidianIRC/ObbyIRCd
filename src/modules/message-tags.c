@@ -24,7 +24,14 @@
 
 // https://ircv3.net/specs/extensions/message-tags#size-limit
 #define SERVER_TAG_SIZE_LIMIT 8191
-#define CLIENT_TAG_SIZE_LIMIT 4094
+/* Bumped from the IRCv3-default 4094 so a single TAGMSG can carry a
+ * full WebRTC SDP offer/answer escaped per IRCv3 message-tag rules.
+ * A typical Opus-only offer is ~2.5 KB raw; after escaping every
+ * space and newline (each replaced with two-byte \s / \n sequences)
+ * it routinely lands in the 5-7 KB range, which the previous 4094
+ * cap quietly rejected with ERR_INPUTTOOLONG.
+ */
+#define CLIENT_TAG_SIZE_LIMIT 8191
 
 ModuleHeader MOD_HEADER
   = {

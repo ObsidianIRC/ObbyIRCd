@@ -347,6 +347,7 @@ static int voice_pre_chanmsg(Client *client, Channel *channel,
 	if (sendtype != SEND_TYPE_TAGMSG)
 		return 0;
 
+
 	MessageTag *prev = NULL;
 	for (MessageTag *m = *mtags; m; m = m->next)
 	{
@@ -384,6 +385,30 @@ static int voice_local_quit(Client *client, MessageTag *_mtags,
 		return 0;
 	bridge_forward_quit(client);
 	return 0;
+}
+
+/* Permit "+obsidianirc/rtc" from anyone -- clients send it, the
+ * server module relays it back, and other servers may forward it. */
+static int voice_rtc_mtag_is_ok(Client *_client, const char *_name,
+                                 const char *_value)
+{
+	return 1;
+}
+
+/* HOOKTYPE_NEW_MESSAGE: copy "+obsidianirc/rtc" from the parsed recv
+ * tag list onto the outgoing tag list so PRE_CHANMSG can see it.
+ * Without this the tag is parsed and accepted but never propagated
+ * past new_message(). */
+static void voice_rtc_new_message(Client *_client, MessageTag *recv_mtags,
+                                   MessageTag **mtag_list,
+                                   const char *_signature)
+{
+	MessageTag *m = find_mtag(recv_mtags, VOICE_RTC_TAG);
+	if (m)
+	{
+		m = duplicate_mtag(m);
+		AddListItem(m, *mtag_list);
+	}
 }
 
 /* ===================================================================
@@ -426,6 +451,18 @@ MOD_INIT()
 	if (env && *env && !cfg_bridge_socket)
 		safe_strdup(cfg_bridge_socket, env);
 
+	/* Without registering a MessageTagHandler the parser silently
+	 * drops "+obsidianirc/rtc" from incoming TAGMSGs (message_tag_ok()
+	 * rejects unknown tags from local clients), and PRE_CHANMSG sees
+	 * an empty mtag list. */
+	MessageTagHandlerInfo mtag;
+	memset(&mtag, 0, sizeof(mtag));
+	mtag.name = VOICE_RTC_TAG;
+	mtag.is_ok = voice_rtc_mtag_is_ok;
+	mtag.flags = MTAG_HANDLER_FLAGS_NO_CAP_NEEDED;
+	MessageTagHandlerAdd(modinfo->handle, &mtag);
+
+	HookAddVoid(modinfo->handle, HOOKTYPE_NEW_MESSAGE, 0, voice_rtc_new_message);
 	HookAdd(modinfo->handle, HOOKTYPE_PRE_CHANMSG, 0, voice_pre_chanmsg);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_PART, 0, voice_local_part);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_QUIT, 0, voice_local_quit);

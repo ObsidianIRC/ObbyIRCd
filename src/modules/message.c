@@ -56,7 +56,7 @@ MOD_INIT()
 {
 	CommandAdd(modinfo->handle, "PRIVMSG", cmd_private, 2, CMD_USER|CMD_SERVER|CMD_RESETIDLE|CMD_VIRUS|CMD_TEXTANALYSIS);
 	CommandAdd(modinfo->handle, "NOTICE", cmd_notice, 2, CMD_USER|CMD_SERVER|CMD_TEXTANALYSIS);
-	CommandAdd(modinfo->handle, "TAGMSG", cmd_tagmsg, 1, CMD_USER|CMD_SERVER);
+	CommandAdd(modinfo->handle, "TAGMSG", cmd_tagmsg, 1, CMD_USER|CMD_SERVER|CMD_NOLAG);
 	MARK_AS_OFFICIAL_MODULE(modinfo);
 	return MOD_SUCCESS;
 }
@@ -256,7 +256,22 @@ void cmd_message(ClientContext *clictx, Client *client, MessageTag *recv_mtags, 
 			return;
 		}
 
-		p2 = strchr(targetstr, '#');
+		/* Find the start of the channel name within targetstr by
+		 * scanning for any character listed in ISUPPORT CHANTYPES.
+		 * Anything before that is a member-mode prefix like "@" or "+".
+		 */
+		{
+			ISupport *is_chantypes = ISupportFind("CHANTYPES");
+			const char *chantypes = is_chantypes && is_chantypes->value
+			                            ? is_chantypes->value : "#";
+			p2 = NULL;
+			for (const char *t = chantypes; *t; t++)
+			{
+				char *cand = strchr(targetstr, *t);
+				if (cand && (!p2 || cand < p2))
+					p2 = cand;
+			}
+		}
 
 		/* Message to channel */
 		if (p2 && (channel = find_channel(p2)))
