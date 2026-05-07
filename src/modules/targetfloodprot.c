@@ -238,13 +238,13 @@ int targetfloodprot_can_send_to_channel(Client *client, Channel *channel, Member
 	if (IsULine(client) || !IsUser(client) || (IsOper(client) && ValidatePermissionsForPath("immune:target-flood",client,NULL,channel,NULL)))
 		return HOOK_CONTINUE;
 
-	/* Voice channels (^prefix) carry WebRTC signaling -- many small
-	 * TAGMSGs per second per peer for ICE candidates / SDP / presence.
-	 * voice-channels.c strips +obsidianirc/rtc before broadcast so
-	 * other channel members never actually see the storm, but the
-	 * per-channel target-flood counter still ticks up and rejects the
-	 * sender. Skip the check entirely on voice channels. */
-	if (channel->name[0] == '^')
+	/* Voice (^) and stream ($) channels carry WebRTC signaling --
+	 * many small TAGMSGs per second per peer for ICE candidates /
+	 * SDP / presence. voice-channels.c strips +obsidianirc/rtc before
+	 * broadcast so other channel members never actually see the
+	 * storm, but the per-channel target-flood counter still ticks up
+	 * and rejects the sender. Skip the check entirely. */
+	if (channel->name[0] == '^' || channel->name[0] == '$')
 		return HOOK_CONTINUE;
 
 	what = sendtypetowhat(sendtype);

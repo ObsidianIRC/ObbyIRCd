@@ -95,7 +95,7 @@ void isupport_init(void)
 	ISupportSetFmt(NULL, "CHANMODES",
 	               CHPAR1 "%s,%s,%s,%s",
 	               EXPAR1, EXPAR2, EXPAR3, EXPAR4);
-	ISupportSet(NULL, "CHANTYPES", "#^");
+	ISupportSet(NULL, "CHANTYPES", "#^$");
 	ISupportSetFmt(NULL, "MODES", "%d", MAXMODEPARAMS);
 	ISupportSetFmt(NULL, "SILENCE", "%d", SILENCE_LIMIT);
 	if (WATCH_AWAY_NOTIFICATION)

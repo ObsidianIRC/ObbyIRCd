@@ -2508,9 +2508,19 @@ struct Ban {
 #define	ShowChannel(v,c)	(PubChannel(c) || IsMember((v),(c)))
 #define	PubChannel(x)		(!SecretChannel((x)) && !HiddenChannel((x)))
 
-/* `^` is the ObsidianIRC voice-channel prefix, alongside the
- * standard `#` text-channel prefix. */
-#define	IsChannelName(name) ((name) && ((*(name) == '#') || (*(name) == '^')))
+/* Channel-name predicate. Used by JOIN, message routing, and other
+ * call sites to decide whether a target string is a channel. Drive
+ * this from the live CHANTYPES ISUPPORT token (set in api-isupport.c)
+ * so every prefix the server advertises -- '#', '^' (voice), '$'
+ * (stream), and any future ones -- is recognised consistently with
+ * valid_channelname(). Falls back to "#" if ISupport hasn't been
+ * initialized yet (config preprocessor runs before main_isupport_set). */
+#define IsChannelName(name) \
+	((name) && (*(name)) && \
+	 (strchr( \
+		(ISupportFind("CHANTYPES") && ISupportFind("CHANTYPES")->value) \
+			? ISupportFind("CHANTYPES")->value : "#", \
+		*(name)) != NULL))
 
 #define IsMember(blah,chan) ((blah && blah->user && \
                 find_membership_link((blah->user)->channel, chan)) ? 1 : 0)
