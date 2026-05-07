@@ -474,6 +474,28 @@ Cmode *CmodeAdd(Module *module, CmodeInfo req, Cmode_t *mode)
 	return cm;
 }
 
+/** Look up a registered channel mode by IRCv3 long-form name.
+ * @param name		Long name (e.g. "op", "topiclock",
+ *			"obsidianirc/floodprot")
+ * @returns		The Cmode handler, or NULL if no mode is
+ *			registered under that name (or it is currently
+ *			unloaded).
+ */
+Cmode *find_channel_mode_handler_by_name(const char *name)
+{
+	Cmode *cm;
+	if (BadPtr(name))
+		return NULL;
+	for (cm = channelmodes; cm; cm = cm->next)
+	{
+		if (cm->unloaded)
+			continue;
+		if (cm->name && !strcmp(cm->name, name))
+			return cm;
+	}
+	return NULL;
+}
+
 /** Delete a previously registered channel mode.
  * @note Modules do not need to call this function,
  *       it is done automatically on module unload.

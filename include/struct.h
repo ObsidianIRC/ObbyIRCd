@@ -1412,9 +1412,11 @@ extern MODVAR Cmode *channelmodes;
 
 extern Umode *UmodeAdd(Module *module, const char *name, char ch, int options, int unset_on_deoper, int (*allowed)(Client *client, int what), long *mode);
 extern void UmodeDel(Umode *umode);
+extern Umode *find_user_mode_handler_by_name(const char *name);
 
 extern Cmode *CmodeAdd(Module *reserved, CmodeInfo req, Cmode_t *mode);
 extern void CmodeDel(Cmode *cmode);
+extern Cmode *find_channel_mode_handler_by_name(const char *name);
 
 extern void moddata_init(void);
 extern ModDataInfo *ModDataAdd(Module *module, ModDataInfo req);

@@ -281,6 +281,28 @@ Umode *UmodeAdd(Module *module, const char *name, char ch, int global, int unset
 }
 
 
+/** Look up a registered user mode by IRCv3 long-form name.
+ * @param name		Long name (e.g. "invisible", "wallops",
+ *			"obsidianirc/bot")
+ * @returns		The Umode handler, or NULL if no mode is
+ *			registered under that name (or it is currently
+ *			unloaded).
+ */
+Umode *find_user_mode_handler_by_name(const char *name)
+{
+	Umode *um;
+	if (BadPtr(name))
+		return NULL;
+	for (um = usermodes; um; um = um->next)
+	{
+		if (um->unloaded)
+			continue;
+		if (um->name && !strcmp(um->name, name))
+			return um;
+	}
+	return NULL;
+}
+
 /** Delete a user mode.
  * @param umode		The user mode to delete
  * @note Modules do not need to call this function,

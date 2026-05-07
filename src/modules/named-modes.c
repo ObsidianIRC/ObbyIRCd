@@ -28,15 +28,8 @@ ModuleHeader MOD_HEADER = {
 
 #define NAMED_MODES_CAP "draft/named-modes"
 
-/* Numerics owned by this module. The 96X range is the spec's */
-/* placeholder allocation (final assignment will replace these */
-/* if/when the draft graduates). */
-#define RPL_ENDOFPROPLIST       960
-#define RPL_PROPLIST            961
-#define RPL_ENDOFLISTPROPLIST   962
-#define RPL_LISTPROPLIST        963
-#define RPL_CHMODELIST          964
-#define RPL_UMODELIST           965
+/* RPL_PROPLIST etc. live in include/numeric.h alongside the rest of
+ * the IRC numeric registry. */
 
 static long CAP_NAMED_MODES = 0L;
 
@@ -54,9 +47,11 @@ static void send_chmodelist(Client *to);
 static void send_umodelist(Client *to);
 static int prop_classify_chanmode(Cmode *cm);
 static int prop_classify_umode(Umode *um);
-static Cmode *find_chanmode_by_name(const char *name);
-static Umode *find_umode_by_name(const char *name);
 static const char *strip_vendor(const char *name);
+/* Mode lookup-by-name helpers live in api-channelmode.c /
+ * api-usermode.c respectively (find_channel_mode_handler_by_name,
+ * find_user_mode_handler_by_name) since they're useful beyond
+ * named-modes. */
 
 /* ===================================================================
  * Module wiring
@@ -126,32 +121,6 @@ static const struct {
 	{ 1, "invex", 'I' },
 	{ 0, NULL,    0   }
 };
-
-static Cmode *find_chanmode_by_name(const char *name)
-{
-	Cmode *cm;
-	for (cm = channelmodes; cm; cm = cm->next)
-	{
-		if (cm->unloaded)
-			continue;
-		if (cm->name && !strcmp(cm->name, name))
-			return cm;
-	}
-	return NULL;
-}
-
-static Umode *find_umode_by_name(const char *name)
-{
-	Umode *um;
-	for (um = usermodes; um; um = um->next)
-	{
-		if (um->unloaded)
-			continue;
-		if (um->name && !strcmp(um->name, name))
-			return um;
-	}
-	return NULL;
-}
 
 /* For the relay path: when a client sends PROP +foo=bar with a vendor
  * prefix (obsidianirc/foo), we accept either form. strip_vendor returns
@@ -616,13 +585,13 @@ CMD_FUNC(cmd_prop)
 				strlcpy(namebuf, item, sizeof(namebuf));
 			}
 
-			cm = find_chanmode_by_name(namebuf);
+			cm = find_channel_mode_handler_by_name(namebuf);
 			if (!cm)
 			{
 				/* Try stripping our vendor prefix. */
 				unq = strip_vendor(namebuf);
 				if (unq && unq != namebuf)
-					cm = find_chanmode_by_name(unq);
+					cm = find_channel_mode_handler_by_name(unq);
 			}
 			/* Fallback: hardcoded list-mode names. */
 			if (!cm)
