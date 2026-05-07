@@ -225,7 +225,7 @@ struct Cmode {
 
 	/** Long name for IRCv3 named-modes ("op", "voice", "ban", ...).
 	 * REQUIRED at registration. May contain a vendor prefix
-	 * ("obby.world/foo") for non-standard modes. */
+	 * ("obsidianirc/foo") for non-standard modes. */
 	char		*name;
 
 	/** Mode character (like 'Z'). Optional now -- 0 means the mode

@@ -82,7 +82,7 @@ MOD_INIT()
 	creq.paracount = 1;
 	creq.is_ok = history_chanmode_is_ok;
 	creq.letter = 'H';
-	creq.name = "obby.world/history";
+	creq.name = "obsidianirc/history";
 	creq.put_param = history_chanmode_put_param;
 	creq.get_param = history_chanmode_get_param;
 	creq.conv_param = history_chanmode_conv_param;

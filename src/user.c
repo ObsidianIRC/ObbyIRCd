@@ -447,7 +447,80 @@ void send_umode_out(Client *client, int show_to_user, long old)
 	{
 		build_umode_string(client, old, ALL_UMODES, buf);
 		if (*buf)
-			sendto_one(client, NULL, ":%s MODE %s :%s", client->name, client->name, buf);
+		{
+			/* IRCv3 draft/named-modes: cap-holders see PROP with
+			 * the long-form mode names instead of MODE. The umode
+			 * name lookup walks the live registry so vendored
+			 * names ("obsidianirc/...") come through correctly. */
+			long named_modes_bit =
+				ClientCapabilityBit("draft/named-modes");
+			if (named_modes_bit &&
+			    HasCapabilityFast(client, named_modes_bit))
+			{
+				char propbuf[BUFSIZE];
+				const char *p = buf;
+				char what = '+';
+				size_t plen = 0;
+				propbuf[0] = '\0';
+				for (; *p; p++)
+				{
+					Umode *um;
+					char item[80];
+					size_t ilen;
+					if (*p == '+' || *p == '-')
+					{
+						what = *p;
+						continue;
+					}
+					/* Walk usermodes list to find handler by
+					 * letter (umode_letter_to_handler[] is
+					 * file-local in api-usermode.c). The
+					 * list is short -- one pass is fine. */
+					{
+						Umode *cand;
+						um = NULL;
+						for (cand = usermodes; cand; cand = cand->next)
+						{
+							if (!cand->unloaded && cand->letter == *p)
+							{
+								um = cand;
+								break;
+							}
+						}
+					}
+					if (!um || !um->name)
+						continue;
+					snprintf(item, sizeof(item), "%c%s",
+					         what, um->name);
+					ilen = strlen(item);
+					if (plen + ilen + 2 >= sizeof(propbuf))
+					{
+						sendto_one(client, NULL,
+						           ":%s PROP %s %s",
+						           client->name,
+						           client->name,
+						           propbuf);
+						propbuf[0] = '\0';
+						plen = 0;
+					}
+					if (plen)
+						propbuf[plen++] = ' ';
+					strlcpy(propbuf + plen, item,
+					        sizeof(propbuf) - plen);
+					plen += ilen;
+				}
+				if (plen)
+					sendto_one(client, NULL,
+					           ":%s PROP %s %s",
+					           client->name,
+					           client->name, propbuf);
+			}
+			else
+			{
+				sendto_one(client, NULL, ":%s MODE %s :%s",
+				           client->name, client->name, buf);
+			}
+		}
 	}
 }
 

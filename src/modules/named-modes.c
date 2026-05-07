@@ -154,14 +154,14 @@ static Umode *find_umode_by_name(const char *name)
 }
 
 /* For the relay path: when a client sends PROP +foo=bar with a vendor
- * prefix (obby.world/foo), we accept either form. strip_vendor returns
+ * prefix (obsidianirc/foo), we accept either form. strip_vendor returns
  * the unqualified part if the vendor matches our own; else NULL. */
 static const char *strip_vendor(const char *name)
 {
 	const char *slash = strchr(name, '/');
 	if (!slash)
 		return name;
-	if (!strncmp(name, "obby.world/", 11))
+	if (!strncmp(name, "obsidianirc/", 12))
 		return slash + 1;
 	return NULL;
 }
@@ -501,38 +501,77 @@ CMD_FUNC(cmd_prop)
 		return;
 	}
 
-	/* PROP <chan> <listmode>  --  delegate to MODE +b/+e/+I and
-	 * re-emit the entries under 963/962. v1: only ban/banex/invex. */
+	/* PROP <chan> <listmode> -- enumerate the entries of a list-mode.
+	 * Table-driven so future vendored list-modes can extend by adding
+	 * an entry here (no parser changes needed). */
 	if (parv[2][0] != '+' && parv[2][0] != '-')
 	{
+		static const struct {
+			const char *name;
+			size_t list_offset;   /* offsetof(Channel, banlist) etc. */
+		} listmodes[] = {
+			{ "ban",   offsetof(Channel, banlist)   },
+			{ "banex", offsetof(Channel, exlist)    },
+			{ "invex", offsetof(Channel, invexlist) },
+			/* Future: vendored list-modes register here, e.g.
+			 *   { "obsidianirc/timedban", offsetof(...) }, */
+			{ NULL, 0 }
+		};
 		const char *name = parv[2];
+		const char *resolved = NULL;
+		Ban *b, *list_head = NULL;
+		int i;
+
 		if (*name == ':')
 			name++;
-		if (!strcmp(name, "ban") || !strcmp(name, "banex") ||
-		    !strcmp(name, "invex"))
+
+		/* Accept the unqualified form if the request matches one of
+		 * our vendored list-mode names with the prefix stripped. */
+		for (i = 0; listmodes[i].name; i++)
 		{
-			Ban *b, *list_head = NULL;
-			char letter = (!strcmp(name, "ban")) ? 'b'
-			            : (!strcmp(name, "banex")) ? 'e' : 'I';
-			if (letter == 'b') list_head = channel->banlist;
-			if (letter == 'e') list_head = channel->exlist;
-			if (letter == 'I') list_head = channel->invexlist;
-			for (b = list_head; b; b = b->next)
+			if (!strcmp(name, listmodes[i].name))
 			{
-				sendto_one(client, NULL,
-				           ":%s %d %s %s %s %s %s :%lld",
-				           me.name, RPL_LISTPROPLIST,
-				           client->name, channel->name, name,
-				           b->banstr,
-				           b->who ? b->who : me.name,
-				           (long long)b->when);
+				resolved = listmodes[i].name;
+				list_head = *(Ban **)((char *)channel +
+				                      listmodes[i].list_offset);
+				break;
 			}
-			sendto_one(client, NULL, ":%s %d %s %s %s :End of list",
-			           me.name, RPL_ENDOFLISTPROPLIST,
-			           client->name, channel->name, name);
+		}
+		if (!resolved)
+		{
+			const char *unq = strip_vendor(name);
+			if (unq && unq != name)
+			{
+				for (i = 0; listmodes[i].name; i++)
+				{
+					if (!strcmp(unq, listmodes[i].name))
+					{
+						resolved = listmodes[i].name;
+						list_head = *(Ban **)((char *)channel +
+						              listmodes[i].list_offset);
+						break;
+					}
+				}
+			}
+		}
+		if (!resolved)
+		{
+			sendnumeric(client, ERR_UNKNOWNMODE, *name);
 			return;
 		}
-		sendnumeric(client, ERR_UNKNOWNMODE, *name);
+		for (b = list_head; b; b = b->next)
+		{
+			sendto_one(client, NULL,
+			           ":%s %d %s %s %s %s %s :%lld",
+			           me.name, RPL_LISTPROPLIST,
+			           client->name, channel->name, resolved,
+			           b->banstr,
+			           b->who ? b->who : me.name,
+			           (long long)b->when);
+		}
+		sendto_one(client, NULL, ":%s %d %s %s %s :End of list",
+		           me.name, RPL_ENDOFLISTPROPLIST,
+		           client->name, channel->name, resolved);
 		return;
 	}
 
@@ -617,10 +656,54 @@ CMD_FUNC(cmd_prop)
 			}
 			if (!cm->letter)
 			{
-				/* Name-only mode without a legacy letter --
-				 * v1 doesn't have a path to execute these
-				 * via mode.c. Surface the limitation. */
-				sendnumeric(client, ERR_UNKNOWNMODE, '?');
+				/* Name-only mode (no legacy letter). The
+				 * cmd_mode dispatcher is letter-keyed so we
+				 * can't route through it; instead apply the
+				 * change directly here. Only flag (type 4)
+				 * modes are handled this way -- list/param
+				 * modes still need a letter or a richer
+				 * non-letter executor (TODO if/when we
+				 * register name-only param modes). */
+				int cls = prop_classify_chanmode(cm);
+				int mode_change_what =
+					(sign == '+') ? MODE_ADD : MODE_DEL;
+				if (cls != 4 || cm->type != CMODE_NORMAL)
+				{
+					sendnumeric(client, ERR_UNKNOWNMODE, '?');
+					continue;
+				}
+				if (cm->is_ok)
+				{
+					int access = cm->is_ok(client, channel, 0,
+					                       NULL, EXCHK_ACCESS_ERR,
+					                       mode_change_what);
+					if (access != EX_ALLOW)
+						continue;
+				}
+				/* No-op? */
+				if (mode_change_what == MODE_ADD &&
+				    (channel->mode.mode & cm->mode))
+					continue;
+				if (mode_change_what == MODE_DEL &&
+				    !(channel->mode.mode & cm->mode))
+					continue;
+				if (mode_change_what == MODE_ADD)
+					channel->mode.mode |= cm->mode;
+				else
+					channel->mode.mode &= ~cm->mode;
+				/* Echo PROP back to all cap-holders directly
+				 * (no MODE-letter equivalent exists). */
+				{
+					MessageTag *mt = NULL;
+					new_message(client, recv_mtags, &mt);
+					sendto_channel(channel, client, NULL, 0,
+					               CAP_NAMED_MODES, SEND_LOCAL,
+					               mt,
+					               ":%s PROP %s %c%s",
+					               client->name, channel->name,
+					               sign, cm->name);
+					free_message_tags(mt);
+				}
 				continue;
 			}
 			if (sign != what)

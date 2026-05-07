@@ -70,7 +70,7 @@ MOD_INIT()
 	req.paracount = 1;
 	req.is_ok = cmodeL_is_ok;
 	req.letter = 'L';
-	req.name = "obby.world/link";
+	req.name = "obsidianirc/link";
 	req.unset_with_param = 1; /* Oh yeah, we are special! */
 	req.put_param = cmodeL_put_param;
 	req.get_param = cmodeL_get_param;

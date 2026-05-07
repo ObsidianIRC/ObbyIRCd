@@ -209,7 +209,7 @@ MOD_INIT()
 	creq.paracount = 1;
 	creq.is_ok = cmodef_is_ok;
 	creq.letter = 'f';
-	creq.name = "obby.world/floodprot";
+	creq.name = "obsidianirc/floodprot";
 	creq.unset_with_param = 1; /* ah yeah, +f is special! */
 	creq.put_param = cmodef_put_param;
 	creq.get_param = cmodef_get_param;
@@ -223,7 +223,7 @@ MOD_INIT()
 	creq.paracount = 1;
 	creq.is_ok = cmodef_profile_is_ok;
 	creq.letter = 'F';
-	creq.name = "obby.world/floodprot-profile";
+	creq.name = "obsidianirc/floodprot-profile";
 	creq.put_param = cmodef_profile_put_param;
 	creq.get_param = cmodef_profile_get_param;
 	creq.conv_param = cmodef_profile_conv_param;

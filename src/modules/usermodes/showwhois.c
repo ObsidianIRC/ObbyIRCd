@@ -44,7 +44,7 @@ MOD_TEST()
 
 MOD_INIT()
 {
-	UmodeAdd(modinfo->handle, "obby.world/showwhois", 'W', UMODE_GLOBAL, 1, umode_allow_opers, &UMODE_SHOWWHOIS);
+	UmodeAdd(modinfo->handle, "obsidianirc/showwhois", 'W', UMODE_GLOBAL, 1, umode_allow_opers, &UMODE_SHOWWHOIS);
 	
 	HookAdd(modinfo->handle, HOOKTYPE_WHOIS, 0, showwhois_whois);
 	

@@ -40,7 +40,7 @@ int secureonlymsg_can_send_to_user(Client *client, Client *target, const char **
                     
 MOD_INIT()
 {
-	UmodeAdd(modinfo->handle, "obby.world/secureonlymsg", 'Z', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_SECUREONLYMSG);
+	UmodeAdd(modinfo->handle, "obsidianirc/secureonlymsg", 'Z', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_SECUREONLYMSG);
 	
 	HookAdd(modinfo->handle, HOOKTYPE_CAN_SEND_TO_USER, 0, secureonlymsg_can_send_to_user);
 	

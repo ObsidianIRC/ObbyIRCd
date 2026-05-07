@@ -5520,7 +5520,7 @@ duk_ret_t js_api_registerChannelMode(duk_context *ctx)
 
 	/* Get mode name (REQUIRED for IRCv3 draft/named-modes). Scripts
 	 * MAY use an unprefixed name for one of the standard modes; for
-	 * anything custom the caller should pass an obby.world/foo style
+	 * anything custom the caller should pass an obsidianirc/foo style
 	 * vendored name to avoid clashing with future spec additions. */
 	duk_get_prop_string(ctx, 0, "name");
 	name = duk_is_string(ctx, -1) ? duk_get_string(ctx, -1) : NULL;

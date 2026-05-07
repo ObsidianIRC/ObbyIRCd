@@ -47,7 +47,7 @@ CmodeInfo req;
 	memset(&req, 0, sizeof(req));
 	req.paracount = 0;
 	req.letter = 'N';
-	req.name = "obby.world/nonickchange";
+	req.name = "obsidianirc/nonickchange";
 	req.is_ok = extcmode_default_requirehalfop;
 	CmodeAdd(modinfo->handle, req, &EXTCMODE_NONICKCHANGE);
 	

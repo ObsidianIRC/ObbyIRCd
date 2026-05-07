@@ -67,18 +67,18 @@ void umode_init(void)
 	memset(umode_letter_to_handler, 0, sizeof(umode_letter_to_handler));
 	/* Some built-in modes */
 	/* Names taken from the IRCv3 draft/named-modes spec table where
-	 * defined; UnrealIRCd-specific modes get the obby.world/ vendor
+	 * defined; UnrealIRCd-specific modes get the obsidianirc/ vendor
 	 * prefix per our local convention. */
 	UmodeAdd(NULL, "invisible", 'i', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_INVISIBLE);
 	UmodeAdd(NULL, "oper", 'o', UMODE_GLOBAL, 1, umode_allow_opers, &UMODE_OPER);
-	UmodeAdd(NULL, "obby.world/regnick", 'r', UMODE_GLOBAL, 0, umode_allow_none, &UMODE_REGNICK);
+	UmodeAdd(NULL, "obsidianirc/regnick", 'r', UMODE_GLOBAL, 0, umode_allow_none, &UMODE_REGNICK);
 	UmodeAdd(NULL, "snomask", 's', UMODE_LOCAL, 0, umode_allow_all, &UMODE_SERVNOTICE);
 	UmodeAdd(NULL, "cloak", 'x', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_HIDE);
-	UmodeAdd(NULL, "obby.world/secureconn", 'z', UMODE_GLOBAL, 0, umode_allow_none, &UMODE_SECURE);
-	UmodeAdd(NULL, "obby.world/deaf", 'd', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_DEAF);
-	UmodeAdd(NULL, "obby.world/hideoper", 'H', UMODE_GLOBAL, 1, umode_allow_opers, &UMODE_HIDEOPER);
-	UmodeAdd(NULL, "obby.world/sethost", 't', UMODE_GLOBAL, 0, umode_allow_unset, &UMODE_SETHOST);
-	UmodeAdd(NULL, "obby.world/hideidle", 'I', UMODE_GLOBAL, 0, umode_hidle_allow, &UMODE_HIDLE);
+	UmodeAdd(NULL, "obsidianirc/secureconn", 'z', UMODE_GLOBAL, 0, umode_allow_none, &UMODE_SECURE);
+	UmodeAdd(NULL, "obsidianirc/deaf", 'd', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_DEAF);
+	UmodeAdd(NULL, "obsidianirc/hideoper", 'H', UMODE_GLOBAL, 1, umode_allow_opers, &UMODE_HIDEOPER);
+	UmodeAdd(NULL, "obsidianirc/sethost", 't', UMODE_GLOBAL, 0, umode_allow_unset, &UMODE_SETHOST);
+	UmodeAdd(NULL, "obsidianirc/hideidle", 'I', UMODE_GLOBAL, 0, umode_hidle_allow, &UMODE_HIDLE);
 }
 
 void make_umodestr(void)
