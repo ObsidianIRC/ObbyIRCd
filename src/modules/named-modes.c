@@ -176,16 +176,18 @@ static const char *strip_vendor(const char *name)
  * =================================================================== */
 static int named_modes_connect(Client *client, int after_numeric)
 {
-	/* Only fire once per client; pick a numeric that lands after
-	 * RPL_ISUPPORT so the client has CHANTYPES etc. before our
-	 * RPL_CHMODELIST. 005 (RPL_ISUPPORT) is fine as the trigger. */
+	/* Only fire once per client (after ISUPPORT lands), and only for
+	 * cap-holders -- non-cap clients have no idea what 964/965 mean
+	 * and the spec says clients MUST negotiate draft/named-modes
+	 * before receiving the new numerics. */
 	if (after_numeric != 5)
 		return 0;
-	if (MyUser(client))
-	{
-		send_chmodelist(client);
-		send_umodelist(client);
-	}
+	if (!MyUser(client))
+		return 0;
+	if (!CAP_NAMED_MODES || !HasCapabilityFast(client, CAP_NAMED_MODES))
+		return 0;
+	send_chmodelist(client);
+	send_umodelist(client);
 	return 0;
 }
 
