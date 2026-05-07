@@ -42,6 +42,7 @@ MOD_INIT()
 	creq.paracount = 1;
 	creq.is_ok = cmode_chanowner_is_ok;
 	creq.letter = 'q';
+	creq.name = "owner";
 	creq.prefix = '~';
 	creq.sjoin_prefix = '*';
 	creq.rank = RANK_CHANOWNER;

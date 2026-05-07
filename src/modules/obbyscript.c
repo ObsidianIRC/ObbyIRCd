@@ -5518,21 +5518,29 @@ duk_ret_t js_api_registerChannelMode(duk_context *ctx)
 	letter = letter_str[0];
 	duk_pop(ctx);
 
-	/* Get mode name (optional) */
+	/* Get mode name (REQUIRED for IRCv3 draft/named-modes). Scripts
+	 * MAY use an unprefixed name for one of the standard modes; for
+	 * anything custom the caller should pass an obby.world/foo style
+	 * vendored name to avoid clashing with future spec additions. */
 	duk_get_prop_string(ctx, 0, "name");
 	name = duk_is_string(ctx, -1) ? duk_get_string(ctx, -1) : NULL;
 	duk_pop(ctx);
+	if (!name || !*name)
+	{
+		duk_error(ctx, DUK_ERR_TYPE_ERROR, "name is required");
+		return 0;
+	}
 
 	/* Create structure */
 	jscm = safe_alloc(sizeof(JSChannelMode));
 	jscm->letter = letter;
-	if (name)
-		safe_strdup(jscm->name, name);
+	safe_strdup(jscm->name, name);
 	jscm->ctx = global_ctx;
 
 	/* Register with UnrealIRCd */
 	memset(&req, 0, sizeof(req));
 	req.letter = letter;
+	req.name = name;
 	req.paracount = 0;
 	req.is_ok = js_channelmode_is_ok;
 	req.type = CMODE_NORMAL;
@@ -5609,10 +5617,15 @@ duk_ret_t js_api_registerPrefixMode(duk_context *ctx)
 	rank = duk_get_int(ctx, -1);
 	duk_pop(ctx);
 
-	/* Get mode name (optional) */
+	/* Get mode name (REQUIRED for IRCv3 draft/named-modes). */
 	duk_get_prop_string(ctx, 0, "name");
 	name = duk_is_string(ctx, -1) ? duk_get_string(ctx, -1) : NULL;
 	duk_pop(ctx);
+	if (!name || !*name)
+	{
+		duk_error(ctx, DUK_ERR_TYPE_ERROR, "name is required");
+		return 0;
+	}
 
 	/* Create structure */
 	jspm = safe_alloc(sizeof(JSPrefixMode));
@@ -5620,13 +5633,13 @@ duk_ret_t js_api_registerPrefixMode(duk_context *ctx)
 	jspm->prefix = prefix;
 	jspm->sjoin_prefix = prefix; /* Same as prefix by default */
 	jspm->rank = rank;
-	if (name)
-		safe_strdup(jspm->name, name);
+	safe_strdup(jspm->name, name);
 	jspm->ctx = global_ctx;
 
 	/* Register with UnrealIRCd */
 	memset(&req, 0, sizeof(req));
 	req.letter = letter;
+	req.name = name;
 	req.prefix = prefix;
 	req.sjoin_prefix = prefix;
 	req.rank = rank;
@@ -5687,10 +5700,15 @@ duk_ret_t js_api_registerUserMode(duk_context *ctx)
 	letter = letter_str[0];
 	duk_pop(ctx);
 
-	/* Get mode name (optional) */
+	/* Get mode name (REQUIRED for IRCv3 draft/named-modes). */
 	duk_get_prop_string(ctx, 0, "name");
 	name = duk_is_string(ctx, -1) ? duk_get_string(ctx, -1) : NULL;
 	duk_pop(ctx);
+	if (!name || !*name)
+	{
+		duk_error(ctx, DUK_ERR_TYPE_ERROR, "name is required");
+		return 0;
+	}
 
 	/* Get global flag (optional, default true) */
 	if (duk_get_prop_string(ctx, 0, "global"))
@@ -5707,12 +5725,11 @@ duk_ret_t js_api_registerUserMode(duk_context *ctx)
 	jsum->letter = letter;
 	jsum->is_global = is_global;
 	jsum->unset_on_deoper = unset_on_deoper;
-	if (name)
-		safe_strdup(jsum->name, name);
+	safe_strdup(jsum->name, name);
 	jsum->ctx = global_ctx;
 
 	/* Register with UnrealIRCd */
-	jsum->umode = UmodeAdd(js_modinfo->handle, letter, 
+	jsum->umode = UmodeAdd(js_modinfo->handle, name, letter,
 	                       is_global ? UMODE_GLOBAL : UMODE_LOCAL,
 	                       unset_on_deoper,
 	                       js_usermode_allowed,

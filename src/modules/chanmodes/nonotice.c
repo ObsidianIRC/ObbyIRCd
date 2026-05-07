@@ -46,6 +46,7 @@ MOD_INIT()
 	memset(&req, 0, sizeof(req));
 	req.paracount = 0;
 	req.letter = 'T';
+	req.name = "obby.world/nonotice";
 	req.is_ok = extcmode_default_requirechop;
 	CmodeAdd(modinfo->handle, req, &EXTCMODE_NONOTICE);
 	

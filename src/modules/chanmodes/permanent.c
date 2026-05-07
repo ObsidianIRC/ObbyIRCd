@@ -76,6 +76,7 @@ CmodeInfo req;
 	memset(&req, 0, sizeof(req));
 	req.paracount = 0;
 	req.letter = 'P';
+	req.name = "permanent";
 	req.is_ok = permanent_is_ok;
 	CmodeAdd(modinfo->handle, req, &EXTMODE_PERMANENT);
 

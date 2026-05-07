@@ -50,6 +50,7 @@ MOD_INIT()
 	memset(&req, 0, sizeof(req));
 	req.paracount = 0;
 	req.letter = 'z';
+	req.name = "secureonly";
 	req.is_ok = extcmode_default_requirechop;
 	CmodeAdd(modinfo->handle, req, &EXTCMODE_SECUREONLY);
 

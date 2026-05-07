@@ -44,6 +44,7 @@ MOD_INIT()
 	memset(&req, 0, sizeof(req));
 	req.paracount = 0;
 	req.letter = 's';
+	req.name = "secret";
 	req.is_ok = extcmode_default_requirehalfop;
 	CmodeAdd(modinfo->handle, req, &EXTCMODE_SECRET);
 

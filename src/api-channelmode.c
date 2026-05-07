@@ -314,9 +314,36 @@ Cmode *CmodeAdd(Module *module, CmodeInfo req, Cmode_t *mode)
 	int existing = 0;
 	Cmode *cm;
 
+	/* IRCv3 draft/named-modes: name is required at registration so
+	 * every chanmode is reachable via PROP. The legacy MODE letter
+	 * (req.letter) is optional now -- 0 means a name-only mode. */
+	if (BadPtr(req.name))
+	{
+		unreal_log(ULOG_ERROR, "module", "CHANNEL_MODE_MISSING_NAME", NULL,
+			   "CmodeAdd(): name is required (letter '$letter') from $module_name",
+			   log_data_char("letter", req.letter ? req.letter : '?'),
+			   log_data_string("module_name", module ? module->header->name : "<core>"));
+		if (module)
+			module->errorcode = MODERR_INVALID;
+		return NULL;
+	}
+
 	for (cm=channelmodes; cm; cm = cm->next)
 	{
-		if (cm->letter == req.letter)
+		if (req.letter && cm->letter == req.letter)
+		{
+			if (cm->unloaded)
+			{
+				cm->unloaded = 0;
+				existing = 1;
+				break;
+			} else {
+				if (module)
+					module->errorcode = MODERR_EXISTS;
+				return NULL;
+			}
+		}
+		if (cm->name && !strcmp(cm->name, req.name))
 		{
 			if (cm->unloaded)
 			{
@@ -410,6 +437,7 @@ Cmode *CmodeAdd(Module *module, CmodeInfo req, Cmode_t *mode)
 	}
 
 	cm->letter = req.letter;
+	safe_strdup(cm->name, req.name);
 	cm->type = req.type;
 	cm->prefix = req.prefix;
 	cm->sjoin_prefix = req.sjoin_prefix;
@@ -570,6 +598,7 @@ static void unload_extcmode_commit(Cmode *cmode)
 	}
 
 	DelListItem(cmode, channelmodes);
+	safe_free(cmode->name);
 	safe_free(cmode);
 }
 

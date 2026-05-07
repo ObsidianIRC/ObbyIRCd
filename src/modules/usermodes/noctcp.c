@@ -45,7 +45,7 @@ MOD_INIT()
 {
 CmodeInfo req;
 
-	UmodeAdd(modinfo->handle, 'T', UMODE_GLOBAL, 0, NULL, &UMODE_NOCTCP);
+	UmodeAdd(modinfo->handle, "obby.world/noctcp", 'T', UMODE_GLOBAL, 0, NULL, &UMODE_NOCTCP);
 	
 	HookAdd(modinfo->handle, HOOKTYPE_CAN_SEND_TO_USER, 0, noctcp_can_send_to_user);
 	

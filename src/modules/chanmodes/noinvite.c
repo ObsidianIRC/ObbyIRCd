@@ -49,6 +49,7 @@ MOD_INIT()
 	memset(&req, 0, sizeof(req));
 	req.paracount = 0;
 	req.letter = 'V';
+	req.name = "obby.world/noinvite";
 	req.is_ok = extcmode_default_requirechop;
 	CmodeAdd(modinfo->handle, req, &EXTCMODE_NOINVITE);
 	

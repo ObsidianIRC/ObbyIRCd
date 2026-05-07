@@ -42,6 +42,7 @@ MOD_INIT()
 	creq.paracount = 1;
 	creq.is_ok = cmode_chanop_is_ok;
 	creq.letter = 'o';
+	creq.name = "op";
 	creq.prefix = '@';
 	creq.sjoin_prefix = '@';
 	creq.rank = RANK_CHANOP;

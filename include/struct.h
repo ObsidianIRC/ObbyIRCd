@@ -1410,7 +1410,7 @@ struct CommandOverride {
 extern MODVAR Umode *usermodes;
 extern MODVAR Cmode *channelmodes;
 
-extern Umode *UmodeAdd(Module *module, char ch, int options, int unset_on_deoper, int (*allowed)(Client *client, int what), long *mode);
+extern Umode *UmodeAdd(Module *module, const char *name, char ch, int options, int unset_on_deoper, int (*allowed)(Client *client, int what), long *mode);
 extern void UmodeDel(Umode *umode);
 
 extern Cmode *CmodeAdd(Module *reserved, CmodeInfo req, Cmode_t *mode);

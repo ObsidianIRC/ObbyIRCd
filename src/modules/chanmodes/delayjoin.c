@@ -43,12 +43,14 @@ MOD_INIT()
 	req.paracount = 0;
 	req.is_ok = extcmode_default_requirechop;
 	req.letter = 'D';
+	req.name = "obby.world/delayjoin";
 	CmodeDelayed = CmodeAdd(modinfo->handle, req, &EXTMODE_DELAYED);
 
 	memset(&req, 0, sizeof(req));
 	req.paracount = 0;
 	req.is_ok = delayjoin_is_ok;
 	req.letter = 'd';
+	req.name = "obby.world/delayjoin-rejoinhide";
 	req.local = 1;
 	CmodePostDelayed = CmodeAdd(modinfo->handle, req, &EXTMODE_POST_DELAYED);
 

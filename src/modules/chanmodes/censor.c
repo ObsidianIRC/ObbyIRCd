@@ -50,6 +50,7 @@ MOD_INIT()
 	req.paracount = 0;
 	req.is_ok = extcmode_default_requirechop;
 	req.letter = 'G';
+	req.name = "obby.world/censor";
 	CmodeAdd(modinfo->handle, req, &EXTMODE_CENSOR);
 
 	HookAdd(modinfo->handle, HOOKTYPE_CAN_SEND_TO_CHANNEL, 0, censor_can_send_to_channel);

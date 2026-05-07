@@ -50,7 +50,7 @@ MOD_TEST()
 
 MOD_INIT()
 {
-	UmodeAdd(modinfo->handle, 'S', UMODE_GLOBAL, 1, umode_allow_none, &UMODE_SERVICEBOT);
+	UmodeAdd(modinfo->handle, "obby.world/servicebot", 'S', UMODE_GLOBAL, 1, umode_allow_none, &UMODE_SERVICEBOT);
 	
 	HookAdd(modinfo->handle, HOOKTYPE_CAN_KICK, 0, servicebot_can_kick);
 	HookAdd(modinfo->handle, HOOKTYPE_MODE_DEOP, 0, servicebot_mode_deop);
