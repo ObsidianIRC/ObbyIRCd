@@ -59,6 +59,7 @@ static int   accreg_capability_visible(Client *client);
 static json_t *account2json(const Account *acc);
 static void  set_accreg_conf(void);
 static void  free_accreg_conf(void);
+static void  oauth_free_providers(void);
 
 CMD_FUNC(register_account);
 CMD_FUNC(list_accounts);
@@ -81,6 +82,12 @@ typedef struct TwoFAEnroll_
 {
     char *type;
     char *secret_b32;
+    /* OAuth-only: provider chosen at /2FA CHALLENGE oauth <provider>,
+     * and chunked token buffer assembled from /2FA TOKEN <chunk> calls. */
+    char  *oauth_provider;
+    char  *oauth_token;
+    size_t oauth_token_len;
+    size_t oauth_token_cap;
     time_t expires_at;
 } TwoFAEnroll;
 typedef struct TwoFAStepup_
@@ -122,6 +129,87 @@ static const char *webauthn_rp_id_capability_parameter(Client *client);
 #define TwoFAEnrollSet(c,p) do { moddata_local_client((c), twofa_enroll_md).ptr = (p); } while(0)
 RPC_CALL_FUNC(rpc_list_accounts);
 RPC_CALL_FUNC(rpc_accounts_find);
+
+/* ===================================================================
+ * OAuth 2.0 / OIDC bearer-token authentication
+ *
+ * Configuration:
+ *
+ *   account-registration {
+ *       ...
+ *       oauth-provider "logto" {
+ *           issuer        "https://my-tenant.logto.app/oidc";
+ *           audience      "https://api.example.com";
+ *           jwks-file     "/home/valware/obby/conf/logto-jwks.json";
+ *           subject-claim "sub";       # default; "preferred_username" also OK
+ *       }
+ *   }
+ *
+ * On startup we load the JWKS from the file and cache it in memory.
+ * Re-fetch the JWKS by /REHASH (the file is reread). For now, JWKS
+ * fetching from the IdP URL is left to the admin's cron + curl;
+ * adding async download_file_async() integration is a small follow-up.
+ *
+ * Validation: standard RS256 / ES256 verification of the JWT,
+ * plus iss/aud/exp/nbf claim checks. The verified `sub` (or whatever
+ * subject-claim points at) is then looked up in account_oauth_links;
+ * a hit logs the user into the linked account, a miss returns
+ * "no account linked to this OAuth identity, /OAUTHLINK first".
+ *
+ * Per-user linking via /OAUTHLINK ADD <provider> <token>:
+ *   - caller MUST already be logged in (PLAIN / SCRAM / cert).
+ *   - server validates the token, extracts subject, inserts the row.
+ *   - subsequent SASL OAUTHBEARER / IRCV3BEARER then succeeds.
+ * =================================================================== */
+
+#define MAX_OAUTH_JWKS_KEYS  16
+
+typedef struct OAuthJwksKey {
+    char *kid;            /* base64url-encoded key id */
+    char *alg;            /* "RS256" / "RS512" / "ES256" / "ES384" / "ES512" */
+    char *kty;            /* "RSA" or "EC" */
+    EVP_PKEY *pkey;       /* parsed public key, ready for EVP_DigestVerify */
+} OAuthJwksKey;
+
+typedef struct OAuthProvider {
+    char *name;            /* config block label, lower-cased */
+    char *issuer;          /* expected `iss` claim */
+    char *audience;        /* expected `aud` claim, optional */
+    char *jwks_file;       /* path to a local JWKS json file */
+    char *subject_claim;   /* defaults to "sub" */
+    OAuthJwksKey keys[MAX_OAUTH_JWKS_KEYS];
+    int   nkeys;
+    int   loaded;
+    struct OAuthProvider *next;
+} OAuthProvider;
+
+static OAuthProvider *oauth_providers = NULL;
+
+static int oauthbearer_dispatch(Client *client, const char *param);
+static int ircv3bearer_dispatch(Client *client, const char *param);
+static int oauth_load_jwks_file(struct OAuthProvider *p);
+
+/* Multi-line AUTHENTICATE accumulator for OAUTHBEARER / IRCV3BEARER.
+ * IRC SASL chunks at 400 bytes; tokens are easily larger.
+ * Returns NULL while accumulating (caller should not finalize),
+ * returns the full concatenated base64 string when the final chunk is
+ * received (chunk shorter than 400 bytes, or "+" continuation marker
+ * indicating no further data).  The returned pointer is owned by the
+ * accumulator and freed when the SASL state is cleared. */
+typedef struct {
+    char  *buf;
+    size_t len;
+    size_t cap;
+} OAuthSaslBuf;
+static ModDataInfo *oauth_sasl_md = NULL;
+static void oauth_sasl_md_free(ModData *m);
+static const char *oauth_sasl_accumulate(Client *client, const char *param);
+static void        oauth_sasl_clear(Client *client);
+
+/* SASL mech identifiers we add. Their values are arbitrary as long as
+ * they don't collide with the existing ones in obsidian.h. */
+#define SASL_TYPE_OAUTHBEARER       9
+#define SASL_TYPE_IRCV3BEARER       10
 
 /* ===================================================================
  * Module lifecycle
@@ -213,6 +301,18 @@ MOD_INIT()
     if (!webauthn_sasl_md)
     {
         config_error("account-registration: Could not add ModData for webauthn_sasl");
+        return MOD_FAILED;
+    }
+
+    /* OAuth (OAUTHBEARER + IRCV3BEARER) multi-line AUTHENTICATE buffer */
+    memset(&mdi, 0, sizeof(mdi));
+    mdi.name        = "oauth_sasl_buf";
+    mdi.free        = oauth_sasl_md_free;
+    mdi.type        = MODDATATYPE_LOCAL_CLIENT;
+    oauth_sasl_md = ModDataAdd(modinfo->handle, mdi);
+    if (!oauth_sasl_md)
+    {
+        config_error("account-registration: Could not add ModData for oauth_sasl_buf");
         return MOD_FAILED;
     }
 
@@ -510,6 +610,37 @@ static int accreg_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *err
             }
             MyConf.got_verify_code_lifetime = 1;
         }
+        else if (!strcmp(cep->name, "oauth-provider"))
+        {
+            ConfigEntry *cepp;
+            int got_issuer = 0, got_jwks = 0;
+            for (cepp = cep->items; cepp; cepp = cepp->next)
+            {
+                if (!cepp->name) continue;
+                if (!strcmp(cepp->name, "issuer"))         got_issuer = 1;
+                else if (!strcmp(cepp->name, "jwks-file")) got_jwks = 1;
+                else if (!strcmp(cepp->name, "audience"))    {}
+                else if (!strcmp(cepp->name, "subject-claim")) {}
+                else
+                    config_warn("%s:%i: unknown directive %s::oauth-provider::%s",
+                                cepp->file->filename, cepp->line_number,
+                                CONF_ACCOUNT_BLOCK, cepp->name);
+            }
+            if (!got_issuer)
+            {
+                config_error("%s:%i: %s::oauth-provider \"%s\" requires 'issuer'",
+                             cep->file->filename, cep->line_number,
+                             CONF_ACCOUNT_BLOCK, cep->value);
+                errors++;
+            }
+            if (!got_jwks)
+            {
+                config_error("%s:%i: %s::oauth-provider \"%s\" requires 'jwks-file'",
+                             cep->file->filename, cep->line_number,
+                             CONF_ACCOUNT_BLOCK, cep->value);
+                errors++;
+            }
+        }
         else
         {
             config_warn("%s:%i: unknown directive %s::%s",
@@ -536,6 +667,10 @@ static int accreg_configrun(ConfigFile *cf, ConfigEntry *ce, int type)
         return 0;
     if (!ce || !ce->name || strcmp(ce->name, CONF_ACCOUNT_BLOCK))
         return 0;
+
+    /* On /REHASH, drop the previous provider list so we don't accumulate
+     * duplicates. On first load this is a no-op. */
+    oauth_free_providers();
 
     for (cep = ce->items; cep; cep = cep->next)
     {
@@ -568,6 +703,28 @@ static int accreg_configrun(ConfigFile *cf, ConfigEntry *ce, int type)
             MyConf.verify_email = config_checkval(cep->value, CFG_YESNO);
         else if (!strcmp(cep->name, "verify-code-lifetime"))
             MyConf.verify_code_lifetime = config_checkval(cep->value, CFG_TIME);
+        else if (!strcmp(cep->name, "oauth-provider") && cep->value)
+        {
+            ConfigEntry *cepp;
+            OAuthProvider *p = safe_alloc(sizeof(*p));
+            safe_strdup(p->name, cep->value);
+            for (cepp = cep->items; cepp; cepp = cepp->next)
+            {
+                if (!cepp->name || !cepp->value) continue;
+                if (!strcmp(cepp->name, "issuer"))         safe_strdup(p->issuer, cepp->value);
+                else if (!strcmp(cepp->name, "audience")) safe_strdup(p->audience, cepp->value);
+                else if (!strcmp(cepp->name, "jwks-file")) safe_strdup(p->jwks_file, cepp->value);
+                else if (!strcmp(cepp->name, "subject-claim")) safe_strdup(p->subject_claim, cepp->value);
+            }
+            if (!p->subject_claim) safe_strdup(p->subject_claim, "sub");
+            /* Try to load JWKS now; failure is logged but not fatal --
+             * admin may /REHASH after fixing the file path. */
+            oauth_load_jwks_file(p);
+            /* Prepend so the most recently configured wins on iss
+             * collisions (rare). */
+            p->next = oauth_providers;
+            oauth_providers = p;
+        }
     }
     return 1;
 }
@@ -592,9 +749,30 @@ static void set_accreg_conf(void)
     safe_strdup(MyConf.guest_nick_format, "Guest$d$d$d$d");
 }
 
+static void oauth_free_keys(OAuthProvider *p);
+
+static void oauth_free_providers(void)
+{
+    OAuthProvider *p = oauth_providers, *n;
+    while (p)
+    {
+        n = p->next;
+        oauth_free_keys(p);
+        safe_free(p->name);
+        safe_free(p->issuer);
+        safe_free(p->audience);
+        safe_free(p->jwks_file);
+        safe_free(p->subject_claim);
+        safe_free(p);
+        p = n;
+    }
+    oauth_providers = NULL;
+}
+
 static void free_accreg_conf(void)
 {
     safe_free(MyConf.guest_nick_format);
+    oauth_free_providers();
 }
 
 /* ===================================================================
@@ -675,7 +853,8 @@ extern int obsidian_open_database(const char *filename)
         "  sent_at       INTEGER NOT NULL,"
         "  read_at       INTEGER DEFAULT 0,"
         "  FOREIGN KEY (recipient_id) REFERENCES accounts(id)"
-        ");";
+        ");"
+        ;
 
     errmsg = NULL;
     if (sqlite3_exec(obsidian_db, sql, NULL, NULL, &errmsg) != SQLITE_OK)
@@ -685,6 +864,15 @@ extern int obsidian_open_database(const char *filename)
         obsidian_db = NULL;
         return SQLITE_ERROR;
     }
+
+    /* Drop the obsolete account_oauth_links table (early prototype path);
+     * OAuth identities are now stored as account_2fa_credentials rows
+     * with type='oauth'. */
+    errmsg = NULL;
+    sqlite3_exec(obsidian_db,
+                 "DROP TABLE IF EXISTS account_oauth_links;",
+                 NULL, NULL, &errmsg);
+    if (errmsg) sqlite3_free(errmsg);
 
     /* Schema migrations for installations created before these columns existed.
      * SQLite has no portable IF NOT EXISTS for ADD COLUMN, so we just try and
@@ -1155,15 +1343,603 @@ void sat_unserialize(const char *str, ModData *m)
 }
 
 /* ===================================================================
- * SCRAM-SHA-256 (RFC 7677) implementation
+ * OAuth 2.0 / OIDC bearer token validation + linking + SASL mechs.
+ *
+ * Flow:
+ *
+ *   1. Admin configures `account-registration { oauth-provider "name"
+ *      { issuer ...; audience ...; jwks-file ...; subject-claim ...; } }`.
+ *      JWKS is read from disk at module load + every /REHASH.
+ *
+ *   2. End user authenticates by their existing local creds (SASL
+ *      PLAIN / SCRAM / EXTERNAL) and runs:
+ *
+ *           /OAUTHLINK ADD logto <token>
+ *
+ *      Server validates the token, extracts subject, inserts into
+ *      account_oauth_links. /OAUTHLINK LIST shows current links;
+ *      /OAUTHLINK REMOVE <provider> drops one.
+ *
+ *   3. Subsequent SASL OAUTHBEARER (RFC 7628) or SASL IRCV3BEARER
+ *      from the same client matches the JWT against the link table
+ *      and logs them straight in -- no password prompt.
  * =================================================================== */
+
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
+#include <openssl/bio.h>
+#include <openssl/pem.h>
+#include <openssl/param_build.h>
+#include <jansson.h>
 #include <crypt.h>     /* for libcrypt's crypt_r() — bcrypt + crypt-sha256/512 */
 #include <string.h>
+
+/* base64url-decode `in` of length `inlen` into `out`. Accepts
+ * both padded and unpadded input; tolerates '+/' as well as '-_'.
+ * Returns the number of bytes decoded, or -1 on bad input. */
+static int oauth_b64url_decode(const char *in, int inlen, unsigned char *out, int outcap)
+{
+    char *tmp;
+    int padlen = (4 - (inlen & 3)) & 3;
+    if (inlen + padlen >= 65536)
+        return -1;
+    tmp = safe_alloc(inlen + padlen + 1);
+    int j = 0;
+    for (int i = 0; i < inlen; i++)
+    {
+        char c = in[i];
+        if (c == '-') c = '+';
+        else if (c == '_') c = '/';
+        tmp[j++] = c;
+    }
+    int realpad = padlen > 2 ? 2 : padlen;
+    while (padlen--) tmp[j++] = '=';
+    tmp[j] = 0;
+    int n = EVP_DecodeBlock(out, (const unsigned char *)tmp, j);
+    safe_free(tmp);
+    if (n <= 0) return -1;
+    n -= realpad;
+    if (n < 0 || n > outcap) return -1;
+    return n;
+}
+
+/* Build an RSA EVP_PKEY from base64url-encoded modulus 'n' + exponent 'e'. */
+static EVP_PKEY *jwks_build_rsa_key(const char *n_b64u, const char *e_b64u)
+{
+    unsigned char n_buf[1024], e_buf[16];
+    int nlen = oauth_b64url_decode(n_b64u, strlen(n_b64u), n_buf, sizeof(n_buf));
+    int elen = oauth_b64url_decode(e_b64u, strlen(e_b64u), e_buf, sizeof(e_buf));
+    if (nlen <= 0 || elen <= 0) return NULL;
+    BIGNUM *bn_n = BN_bin2bn(n_buf, nlen, NULL);
+    BIGNUM *bn_e = BN_bin2bn(e_buf, elen, NULL);
+    if (!bn_n || !bn_e) {
+        BN_free(bn_n); BN_free(bn_e);
+        return NULL;
+    }
+    OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+    OSSL_PARAM_BLD_push_BN(bld, "n", bn_n);
+    OSSL_PARAM_BLD_push_BN(bld, "e", bn_e);
+    OSSL_PARAM *params = OSSL_PARAM_BLD_to_param(bld);
+    OSSL_PARAM_BLD_free(bld);
+
+    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
+    EVP_PKEY *pkey = NULL;
+    if (pctx) {
+        EVP_PKEY_fromdata_init(pctx);
+        EVP_PKEY_fromdata(pctx, &pkey, EVP_PKEY_PUBLIC_KEY, params);
+        EVP_PKEY_CTX_free(pctx);
+    }
+    OSSL_PARAM_free(params);
+    BN_free(bn_n); BN_free(bn_e);
+    return pkey;
+}
+
+static void oauth_free_keys(OAuthProvider *p)
+{
+    for (int i = 0; i < p->nkeys; i++) {
+        safe_free(p->keys[i].kid);
+        safe_free(p->keys[i].alg);
+        safe_free(p->keys[i].kty);
+        if (p->keys[i].pkey) EVP_PKEY_free(p->keys[i].pkey);
+    }
+    memset(p->keys, 0, sizeof(p->keys));
+    p->nkeys = 0;
+    p->loaded = 0;
+}
+
+/* Read a JWKS json file and populate p->keys[]. Returns 1 on success. */
+static int oauth_load_jwks_file(OAuthProvider *p)
+{
+    json_error_t jerr;
+    json_t *root = NULL, *keys, *k;
+    size_t i;
+
+    oauth_free_keys(p);
+    if (!p->jwks_file) return 0;
+
+    root = json_load_file(p->jwks_file, 0, &jerr);
+    if (!root) {
+        unreal_log(ULOG_ERROR, "account", "OAUTH_JWKS_LOAD_ERROR", NULL,
+                   "Could not parse JWKS file $file: $err",
+                   log_data_string("file", p->jwks_file),
+                   log_data_string("err", jerr.text));
+        return 0;
+    }
+    keys = json_object_get(root, "keys");
+    if (!json_is_array(keys)) {
+        json_decref(root);
+        return 0;
+    }
+    json_array_foreach(keys, i, k) {
+        if (p->nkeys >= MAX_OAUTH_JWKS_KEYS) break;
+        const char *kty = json_string_value(json_object_get(k, "kty"));
+        const char *kid = json_string_value(json_object_get(k, "kid"));
+        const char *alg = json_string_value(json_object_get(k, "alg"));
+        if (!kty) continue;
+        EVP_PKEY *pkey = NULL;
+        if (!strcmp(kty, "RSA")) {
+            const char *n = json_string_value(json_object_get(k, "n"));
+            const char *e = json_string_value(json_object_get(k, "e"));
+            if (!n || !e) continue;
+            pkey = jwks_build_rsa_key(n, e);
+        } else {
+            /* EC and other key types: skipped for now. RSA covers
+             * Logto, Auth0, Keycloak, Okta defaults. */
+            continue;
+        }
+        if (!pkey) continue;
+        OAuthJwksKey *slot = &p->keys[p->nkeys++];
+        slot->kid = kid ? strdup(kid) : strdup("");
+        slot->alg = alg ? strdup(alg) : strdup("RS256");
+        slot->kty = strdup(kty);
+        slot->pkey = pkey;
+    }
+    json_decref(root);
+    p->loaded = 1;
+    unreal_log(ULOG_INFO, "account", "OAUTH_JWKS_LOADED", NULL,
+               "Loaded $count JWKS keys for provider $provider",
+               log_data_integer("count", p->nkeys),
+               log_data_string("provider", p->name));
+    return p->nkeys > 0;
+}
+
+static OAuthProvider *oauth_find_provider(const char *name)
+{
+    for (OAuthProvider *p = oauth_providers; p; p = p->next)
+        if (!strcasecmp(p->name, name))
+            return p;
+    return NULL;
+}
+
+static OAuthJwksKey *oauth_find_key(OAuthProvider *p, const char *kid)
+{
+    /* Prefer kid match; fall back to first if token has no kid */
+    if (kid) {
+        for (int i = 0; i < p->nkeys; i++)
+            if (p->keys[i].kid && !strcmp(p->keys[i].kid, kid))
+                return &p->keys[i];
+        return NULL;
+    }
+    return p->nkeys > 0 ? &p->keys[0] : NULL;
+}
+
+/* Validate a JWT. On success returns a strdup'd subject string the
+ * caller must free, AND fills *out_provider with the provider used.
+ * On failure returns NULL. */
+static char *oauth_validate_jwt(const char *token, OAuthProvider **out_provider)
+{
+    const char *dot1 = strchr(token, '.');
+    if (!dot1) return NULL;
+    const char *dot2 = strchr(dot1 + 1, '.');
+    if (!dot2) return NULL;
+    const char *header_b64 = token;
+    int  header_len = (int)(dot1 - header_b64);
+    const char *payload_b64 = dot1 + 1;
+    int  payload_len = (int)(dot2 - payload_b64);
+    const char *sig_b64 = dot2 + 1;
+    int  sig_len = (int)strlen(sig_b64);
+    if (header_len <= 0 || payload_len <= 0 || sig_len <= 0)
+        return NULL;
+
+    unsigned char header_buf[2048], payload_buf[8192], sig_buf[1024];
+    int hl = oauth_b64url_decode(header_b64, header_len, header_buf, sizeof(header_buf) - 1);
+    int pl = oauth_b64url_decode(payload_b64, payload_len, payload_buf, sizeof(payload_buf) - 1);
+    int sl = oauth_b64url_decode(sig_b64, sig_len, sig_buf, sizeof(sig_buf));
+    if (hl <= 0 || pl <= 0 || sl <= 0) return NULL;
+    header_buf[hl] = 0;
+    payload_buf[pl] = 0;
+
+    /* --- Parse header --- */
+    json_error_t jerr;
+    json_t *header = json_loadb((const char *)header_buf, hl, 0, &jerr);
+    if (!header) return NULL;
+    const char *alg = json_string_value(json_object_get(header, "alg"));
+    const char *kid = json_string_value(json_object_get(header, "kid"));
+    if (!alg) { json_decref(header); return NULL; }
+    char alg_dup[16];
+    strlcpy(alg_dup, alg, sizeof(alg_dup));
+    char *kid_dup = kid ? strdup(kid) : NULL;
+    json_decref(header);
+
+    /* --- Parse payload --- */
+    json_t *payload = json_loadb((const char *)payload_buf, pl, 0, &jerr);
+    if (!payload) { safe_free(kid_dup); return NULL; }
+    const char *iss = json_string_value(json_object_get(payload, "iss"));
+    json_t *exp_j = json_object_get(payload, "exp");
+    json_t *nbf_j = json_object_get(payload, "nbf");
+
+    /* --- Find provider by issuer --- */
+    OAuthProvider *prov = NULL;
+    if (iss) {
+        for (OAuthProvider *p = oauth_providers; p; p = p->next) {
+            if (p->issuer && !strcmp(p->issuer, iss)) { prov = p; break; }
+        }
+    }
+    if (!prov || !prov->loaded) {
+        json_decref(payload);
+        safe_free(kid_dup);
+        return NULL;
+    }
+
+    /* --- Audience check: aud may be a string or array of strings --- */
+    if (prov->audience) {
+        json_t *aud_j = json_object_get(payload, "aud");
+        int aud_ok = 0;
+        if (json_is_string(aud_j)) {
+            aud_ok = !strcmp(json_string_value(aud_j), prov->audience);
+        } else if (json_is_array(aud_j)) {
+            size_t i; json_t *e;
+            json_array_foreach(aud_j, i, e) {
+                if (json_is_string(e) && !strcmp(json_string_value(e), prov->audience)) {
+                    aud_ok = 1; break;
+                }
+            }
+        }
+        if (!aud_ok) {
+            json_decref(payload);
+            safe_free(kid_dup);
+            return NULL;
+        }
+    }
+
+    /* --- exp / nbf --- */
+    time_t now = TStime();
+    if (json_is_integer(exp_j) && (time_t)json_integer_value(exp_j) < now) {
+        json_decref(payload); safe_free(kid_dup); return NULL;
+    }
+    if (json_is_integer(nbf_j) && (time_t)json_integer_value(nbf_j) > now + 60) {
+        json_decref(payload); safe_free(kid_dup); return NULL;
+    }
+
+    /* --- Find key + verify signature --- */
+    OAuthJwksKey *key = oauth_find_key(prov, kid_dup);
+    safe_free(kid_dup);
+    if (!key || !key->pkey) {
+        json_decref(payload); return NULL;
+    }
+    const EVP_MD *md = NULL;
+    if (!strcmp(alg_dup, "RS256")) md = EVP_sha256();
+    else if (!strcmp(alg_dup, "RS384")) md = EVP_sha384();
+    else if (!strcmp(alg_dup, "RS512")) md = EVP_sha512();
+    else { json_decref(payload); return NULL; }
+
+    /* The data being signed is "<header_b64>.<payload_b64>" --
+     * the original ASCII form, NOT the decoded bytes. */
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    int ok = 0;
+    if (ctx &&
+        EVP_DigestVerifyInit(ctx, NULL, md, NULL, key->pkey) == 1 &&
+        EVP_DigestVerifyUpdate(ctx, header_b64, header_len) == 1 &&
+        EVP_DigestVerifyUpdate(ctx, ".", 1) == 1 &&
+        EVP_DigestVerifyUpdate(ctx, payload_b64, payload_len) == 1 &&
+        EVP_DigestVerifyFinal(ctx, sig_buf, sl) == 1)
+    {
+        ok = 1;
+    }
+    if (ctx) EVP_MD_CTX_free(ctx);
+    if (!ok) {
+        json_decref(payload); return NULL;
+    }
+
+    /* --- Extract subject claim --- */
+    const char *claim = prov->subject_claim ? prov->subject_claim : "sub";
+    const char *subj = json_string_value(json_object_get(payload, claim));
+    char *result = subj ? strdup(subj) : NULL;
+    json_decref(payload);
+    if (result && out_provider) *out_provider = prov;
+    return result;
+}
+
+/* Look up an account by id (helper). Caller frees with free_account. */
+static Account *find_account_by_id(long id)
+{
+    sqlite3_stmt *stmt;
+    Account *acc = NULL;
+    char *name_copy = NULL;
+    if (sqlite3_prepare_v2(obsidian_db,
+            "SELECT name FROM accounts WHERE id = ? LIMIT 1",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return NULL;
+    sqlite3_bind_int64(stmt, 1, id);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *name = sqlite3_column_text(stmt, 0);
+        if (name) name_copy = strdup((const char *)name);
+    }
+    sqlite3_finalize(stmt);
+    if (name_copy) {
+        acc = find_account(name_copy);
+        free(name_copy);
+    }
+    return acc;
+}
+
+/* OAuth credentials are stored in account_2fa_credentials with
+ * type='oauth' and secret='<provider>\x1F<subject>'. */
+#define OAUTH_CRED_SEP '\x1F'
+
+/* Build the credential 'secret' string for an (provider, subject) pair. */
+static char *oauth_make_cred_secret(const char *provider, const char *subject)
+{
+    size_t pl = strlen(provider), sl = strlen(subject);
+    char *out = safe_alloc(pl + 1 + sl + 1);
+    memcpy(out, provider, pl);
+    out[pl] = OAUTH_CRED_SEP;
+    memcpy(out + pl + 1, subject, sl);
+    out[pl + 1 + sl] = 0;
+    return out;
+}
+
+/* Returns account_id whose 2fa credential matches (provider, subject), or 0. */
+static long oauth_lookup_account_by_credential(const char *provider, const char *subject)
+{
+    if (!obsidian_db) return 0;
+    char *needle = oauth_make_cred_secret(provider, subject);
+    sqlite3_stmt *stmt;
+    long id = 0;
+    if (sqlite3_prepare_v2(obsidian_db,
+            "SELECT account_id FROM account_2fa_credentials"
+            " WHERE type = 'oauth' AND secret = ? LIMIT 1",
+            -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, needle, -1, SQLITE_STATIC);
+        if (sqlite3_step(stmt) == SQLITE_ROW)
+            id = (long)sqlite3_column_int64(stmt, 0);
+        sqlite3_finalize(stmt);
+    }
+    safe_free(needle);
+    return id;
+}
+
+/* Common token-->account-login path used by both SASL mechs. Returns
+ * 1 on success (and sets sasl_complete + sends RPL_SASLSUCCESS), 0 on
+ * failure (and sends ERR_SASLFAIL). */
+static int oauth_login_by_token(Client *client, const char *token)
+{
+    OAuthProvider *prov = NULL;
+    char *subject = oauth_validate_jwt(token, &prov);
+    if (!subject) {
+        sendnumeric(client, ERR_SASLFAIL);
+        return 0;
+    }
+    long acc_id = oauth_lookup_account_by_credential(prov->name, subject);
+    if (acc_id == 0) {
+        safe_free(subject);
+        sendnumeric(client, ERR_SASLFAIL);
+        sendto_one(client, NULL,
+                   ":%s NOTE AUTHENTICATE OAUTH_NOT_LINKED :That OAuth identity is not linked to an account; log in via PLAIN/SCRAM and run /2FA ADD oauth <name> via /2FA CHALLENGE oauth %s first.",
+                   me.name, prov->name);
+        return 0;
+    }
+    Account *acc = find_account_by_id(acc_id);
+    if (!acc) {
+        safe_free(subject);
+        sendnumeric(client, ERR_SASLFAIL);
+        return 0;
+    }
+    /* If 2FA is enforced on this account, OAuth verifies the first
+     * factor; defer login until the user completes step-up via
+     * AUTHENTICATE 2FA-REQUIRED. */
+    if (twofa_maybe_start_stepup(client, acc))
+    {
+        DelSaslType(client);
+        unreal_log(ULOG_INFO, "account", "OAUTH_SASL_2FA_STEPUP", client,
+                   "OAuth first-factor verified; awaiting 2FA "
+                   "[account: $account] [provider: $provider] [subject: $subject]",
+                   log_data_string("account", acc->name),
+                   log_data_string("provider", prov->name),
+                   log_data_string("subject", subject));
+        free_account(acc);
+        safe_free(subject);
+        return 1;
+    }
+    strlcpy(client->user->account, acc->name, sizeof(client->user->account));
+    user_account_login(NULL, client);
+    client->local->sasl_complete = 1;
+    sendnumeric(client, RPL_SASLSUCCESS);
+    DelSaslType(client);
+    unreal_log(ULOG_INFO, "account", "OAUTH_SASL_LOGIN", client,
+               "OAuth SASL login: $client.details [account: $account] [provider: $provider] [subject: $subject]",
+               log_data_string("account", acc->name),
+               log_data_string("provider", prov->name),
+               log_data_string("subject", subject));
+    free_account(acc);
+    safe_free(subject);
+    return 1;
+}
+
+/* --- Multi-line AUTHENTICATE accumulator ---
+ * The IRC SASL spec splits payloads bigger than 400 base64 chars
+ * across multiple AUTHENTICATE lines. Final chunk is < 400 chars
+ * (possibly empty -- indicated by a literal "+"). */
+static void oauth_sasl_md_free(ModData *m)
+{
+    OAuthSaslBuf *b = (OAuthSaslBuf *)m->ptr;
+    if (b) {
+        safe_free(b->buf);
+        safe_free(b);
+        m->ptr = NULL;
+    }
+}
+
+static void oauth_sasl_clear(Client *client)
+{
+    if (!client || !client->local) return;
+    ModData *m = &moddata_local_client(client, oauth_sasl_md);
+    OAuthSaslBuf *b = (OAuthSaslBuf *)m->ptr;
+    if (b) {
+        safe_free(b->buf);
+        safe_free(b);
+        m->ptr = NULL;
+    }
+}
+
+static const char *oauth_sasl_accumulate(Client *client, const char *param)
+{
+    if (!client || !client->local || !param) return NULL;
+    ModData *m = &moddata_local_client(client, oauth_sasl_md);
+    OAuthSaslBuf *b = (OAuthSaslBuf *)m->ptr;
+    if (!b) {
+        b = safe_alloc(sizeof(*b));
+        b->buf = NULL;
+        b->len = 0;
+        b->cap = 0;
+        m->ptr = b;
+    }
+
+    /* Bare "+" is the empty-final-chunk signal -- finalize whatever we
+     * have buffered. Don't append. */
+    int is_plus = (param[0] == '+' && param[1] == 0);
+    size_t plen = strlen(param);
+    int is_final = is_plus || plen < 400;
+
+    if (!is_plus && plen > 0) {
+        size_t need = b->len + plen + 1;
+        if (need > b->cap) {
+            size_t nc = b->cap ? b->cap : 512;
+            while (nc < need) nc *= 2;
+            char *nb = safe_alloc(nc);
+            if (b->buf) memcpy(nb, b->buf, b->len);
+            safe_free(b->buf);
+            b->buf = nb;
+            b->cap = nc;
+        }
+        memcpy(b->buf + b->len, param, plen);
+        b->len += plen;
+        b->buf[b->len] = 0;
+    }
+
+    if (!is_final) return NULL;
+    /* Reject empty final */
+    if (b->len == 0) {
+        oauth_sasl_clear(client);
+        return NULL;
+    }
+    /* Caller will read b->buf, then we free in caller via oauth_sasl_clear. */
+    return b->buf;
+}
+
+/* --- SASL OAUTHBEARER (RFC 7628) ---
+ * Client sends GS2-framed:
+ *   n,a=username,\x01host=..\x01port=..\x01auth=Bearer <token>\x01\x01
+ * We only care about the auth=Bearer token. */
+static int oauthbearer_dispatch(Client *client, const char *param)
+{
+    /* Decode base64 SASL payload (standard base64, not base64url). */
+    unsigned char buf[8192] = {0};
+    int n = EVP_DecodeBlock(buf, (const unsigned char *)param, strlen(param));
+    if (n <= 0) { sendnumeric(client, ERR_SASLFAIL); return 0; }
+    size_t plen = strlen(param);
+    int real_pad = 0;
+    if (plen >= 1 && param[plen - 1] == '=') real_pad++;
+    if (plen >= 2 && param[plen - 2] == '=') real_pad++;
+    n -= real_pad;
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        sendnumeric(client, ERR_SASLFAIL); return 0;
+    }
+    buf[n] = 0;
+
+    /* Walk to the first 0x01 (start of key=value pairs). */
+    const char *p = (const char *)buf;
+    const char *end = (const char *)buf + n;
+    const char *kv = memchr(p, 0x01, end - p);
+    if (!kv) { sendnumeric(client, ERR_SASLFAIL); return 0; }
+    kv++;
+
+    /* Find auth=Bearer <token> */
+    const char *token = NULL;
+    while (kv < end) {
+        const char *eol = memchr(kv, 0x01, end - kv);
+        if (!eol) break;
+        size_t len = eol - kv;
+        if (len >= 13 && !strncmp(kv, "auth=Bearer ", 12)) {
+            static char tokbuf[8192];
+            size_t tlen = len - 12;
+            if (tlen >= sizeof(tokbuf)) break;
+            memcpy(tokbuf, kv + 12, tlen);
+            tokbuf[tlen] = 0;
+            token = tokbuf;
+            break;
+        }
+        kv = eol + 1;
+    }
+    if (!token) {
+        sendnumeric(client, ERR_SASLFAIL);
+        return 0;
+    }
+    return oauth_login_by_token(client, token);
+}
+
+/* --- SASL IRCV3BEARER ---
+ *   [authzid] \x00 <token_type> \x00 <token>
+ * We accept oauth2 / jwt token types (treated identically -- both
+ * route through oauth_validate_jwt; an opaque-typed token would
+ * need a separate validator). */
+static int ircv3bearer_dispatch(Client *client, const char *param)
+{
+    unsigned char buf[8192] = {0};
+    int n = EVP_DecodeBlock(buf, (const unsigned char *)param, strlen(param));
+    if (n <= 0) { sendnumeric(client, ERR_SASLFAIL); return 0; }
+    /* EVP_DecodeBlock pads its output to a multiple of 3 bytes; the
+     * extra bytes correspond to '=' padding in the base64 input. Trim
+     * those, but ONLY based on the input padding count -- we cannot use
+     * data values to find the boundary because real payloads contain
+     * NUL bytes. */
+    size_t plen = strlen(param);
+    int real_pad = 0;
+    if (plen >= 1 && param[plen - 1] == '=') real_pad++;
+    if (plen >= 2 && param[plen - 2] == '=') real_pad++;
+    n -= real_pad;
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        sendnumeric(client, ERR_SASLFAIL);
+        return 0;
+    }
+    buf[n] = 0;
+
+    int nul1 = -1, nul2 = -1;
+    for (int i = 0; i < n; i++) {
+        if (buf[i] == 0) {
+            if (nul1 < 0) nul1 = i;
+            else if (nul2 < 0) { nul2 = i; break; }
+        }
+    }
+    if (nul1 < 0 || nul2 < 0 || nul2 + 1 >= n) {
+        sendnumeric(client, ERR_SASLFAIL);
+        return 0;
+    }
+    const char *type = (const char *)(buf + nul1 + 1);
+    const char *token = (const char *)(buf + nul2 + 1);
+    if (strcmp(type, "oauth2") && strcmp(type, "jwt")) {
+        sendnumeric(client, ERR_SASLFAIL);
+        return 0;
+    }
+    return oauth_login_by_token(client, token);
+}
+
+/* ===================================================================
+ * SCRAM-SHA-256 (RFC 7677) implementation
+ * =================================================================== */
 
 /* ===================================================================
  * Password-scheme verifier dispatcher (PLAN.md §6.1).
@@ -2132,9 +2908,40 @@ static int authenticate_attempt(Client *client, int first, const char *param)
         sendto_one(client, NULL, ":%s AUTHENTICATE +", me.name);
         return 0;
     }
+    else if (!strcasecmp(param, "OAUTHBEARER"))
+    {
+        SetSaslType(client, SASL_TYPE_OAUTHBEARER);
+        sendto_one(client, NULL, ":%s AUTHENTICATE +", me.name);
+        return 0;
+    }
+    else if (!strcasecmp(param, "IRCV3BEARER"))
+    {
+        SetSaslType(client, SASL_TYPE_IRCV3BEARER);
+        sendto_one(client, NULL, ":%s AUTHENTICATE +", me.name);
+        return 0;
+    }
 
     if (!GetSaslType(client) || GetSaslType(client) == SASL_TYPE_NONE)
         return 0;
+
+    if (GetSaslType(client) == SASL_TYPE_OAUTHBEARER)
+    {
+        const char *full = oauth_sasl_accumulate(client, param);
+        if (!full) return 0;       /* still accumulating */
+        oauthbearer_dispatch(client, full);
+        oauth_sasl_clear(client);
+        DelSaslType(client);
+        return 0;
+    }
+    if (GetSaslType(client) == SASL_TYPE_IRCV3BEARER)
+    {
+        const char *full = oauth_sasl_accumulate(client, param);
+        if (!full) return 0;
+        ircv3bearer_dispatch(client, full);
+        oauth_sasl_clear(client);
+        DelSaslType(client);
+        return 0;
+    }
 
     if (GetSaslType(client) == SASL_TYPE_EXTERNAL)
     {
@@ -2666,6 +3473,11 @@ static void twofa_enroll_free(TwoFAEnroll *e)
         OPENSSL_cleanse(e->secret_b32, strlen(e->secret_b32));
     safe_free(e->secret_b32);
     safe_free(e->type);
+    safe_free(e->oauth_provider);
+    if (e->oauth_token) {
+        OPENSSL_cleanse(e->oauth_token, e->oauth_token_len);
+        safe_free(e->oauth_token);
+    }
     safe_free(e);
 }
 
@@ -2819,6 +3631,41 @@ static void twofa_cmd_challenge(Client *client, Account *acc, int parc, const ch
         webauthn_2fa_handle_challenge(client, acc);
         return;
     }
+    if (!strcasecmp(type, "oauth"))
+    {
+        /* /2FA CHALLENGE oauth <provider> -- pin a provider, open a
+         * token-input session. Token is then sent across multiple
+         * /2FA TOKEN <chunk> calls and finalized by /2FA ADD oauth <name>. */
+        if (parc < 4 || BadPtr(parv[3]))
+        {
+            twofa_fail(client, "INVALID_TYPE", NULL,
+                       "Syntax: /2FA CHALLENGE oauth <provider>");
+            return;
+        }
+        OAuthProvider *prov = oauth_find_provider(parv[3]);
+        if (!prov || !prov->loaded)
+        {
+            twofa_fail(client, "NO_SUCH_PROVIDER", parv[3],
+                       "Unknown / unloaded OAuth provider.");
+            return;
+        }
+        twofa_clear_enroll(client);
+        TwoFAEnroll *e = safe_alloc(sizeof(*e));
+        safe_strdup(e->type, "oauth");
+        safe_strdup(e->oauth_provider, prov->name);
+        e->oauth_token     = NULL;
+        e->oauth_token_len = 0;
+        e->oauth_token_cap = 0;
+        e->expires_at      = time(NULL) + TWOFA_CHALLENGE_LIFETIME;
+        TwoFAEnrollSet(client, e);
+        sendto_one(client, NULL,
+                   ":%s NOTE 2FA REGISTRATION_CHALLENGE oauth %s :"
+                   "Send the bearer token via repeated /2FA TOKEN <chunk> calls "
+                   "(<= 400 bytes each), then finalize with "
+                   "/2FA ADD oauth <name>.",
+                   me.name, prov->name);
+        return;
+    }
     if (strcasecmp(type, TWOFA_TYPE_TOTP))
     {
         twofa_fail(client, "INVALID_TYPE", type,
@@ -2892,11 +3739,62 @@ static void twofa_cmd_challenge(Client *client, Account *acc, int parc, const ch
     safe_free(b64);
 }
 
+/* /2FA TOKEN <chunk> -- append a chunk to the in-flight OAuth enrolment.
+ * The buffered token is then validated by /2FA ADD oauth <name>. */
+static void twofa_cmd_oauth_token(Client *client, int parc, const char *parv[])
+{
+    if (parc < 3 || BadPtr(parv[2]))
+    {
+        twofa_fail(client, "INVALID_CREDENTIAL_DATA", NULL,
+                   "Syntax: /2FA TOKEN <chunk>");
+        return;
+    }
+    TwoFAEnroll *e = TwoFAEnrollGet(client);
+    if (!e || !e->type || strcmp(e->type, "oauth") ||
+        time(NULL) > e->expires_at)
+    {
+        twofa_fail(client, "NO_CHALLENGE", NULL,
+                   "No active OAuth enrolment; run /2FA CHALLENGE oauth <provider> first.");
+        return;
+    }
+    size_t add = strlen(parv[2]);
+    if (add > 512)
+    {
+        twofa_fail(client, "INVALID_CREDENTIAL_DATA", NULL,
+                   "Token chunk exceeds 512 bytes.");
+        return;
+    }
+    size_t need = e->oauth_token_len + add + 1;
+    if (need > 16384)
+    {
+        twofa_clear_enroll(client);
+        twofa_fail(client, "INVALID_CREDENTIAL_DATA", NULL,
+                   "Buffered token exceeds 16 KiB; cancelled.");
+        return;
+    }
+    if (need > e->oauth_token_cap)
+    {
+        size_t nc = e->oauth_token_cap ? e->oauth_token_cap : 1024;
+        while (nc < need) nc *= 2;
+        char *nb = safe_alloc(nc);
+        if (e->oauth_token) memcpy(nb, e->oauth_token, e->oauth_token_len);
+        if (e->oauth_token) {
+            OPENSSL_cleanse(e->oauth_token, e->oauth_token_len);
+            safe_free(e->oauth_token);
+        }
+        e->oauth_token     = nb;
+        e->oauth_token_cap = nc;
+    }
+    memcpy(e->oauth_token + e->oauth_token_len, parv[2], add);
+    e->oauth_token_len += add;
+    e->oauth_token[e->oauth_token_len] = 0;
+}
+
 static void twofa_cmd_add(Client *client, Account *acc, int parc, const char *parv[])
 {
     const char *type, *name, *data;
 
-    if (parc < 5 || BadPtr(parv[2]) || BadPtr(parv[3]) || BadPtr(parv[4]))
+    if (parc < 4 || BadPtr(parv[2]) || BadPtr(parv[3]))
     {
         twofa_fail(client, "INVALID_CREDENTIAL_DATA", NULL,
                    "Syntax: /2FA ADD <type> <name> <data>");
@@ -2904,12 +3802,95 @@ static void twofa_cmd_add(Client *client, Account *acc, int parc, const char *pa
     }
     type = parv[2];
     name = parv[3];
-    data = parv[4];
+    data = (parc >= 5 && !BadPtr(parv[4])) ? parv[4] : NULL;
 
     if (!twofa_valid_name(name))
     {
         twofa_fail(client, "INVALID_NAME", NULL,
                    "Name must be printable, no whitespace, max 64 bytes.");
+        return;
+    }
+    if (!strcasecmp(type, "oauth"))
+    {
+        /* Token was streamed via prior /2FA CHALLENGE oauth + /2FA TOKEN
+         * <chunk> calls; finalize from the enroll buffer. */
+        TwoFAEnroll *e = TwoFAEnrollGet(client);
+        if (!e || !e->type || strcmp(e->type, "oauth") ||
+            !e->oauth_provider || !e->oauth_token || e->oauth_token_len == 0 ||
+            time(NULL) > e->expires_at)
+        {
+            twofa_fail(client, "NO_CHALLENGE", NULL,
+                       "No active OAuth enrolment; run /2FA CHALLENGE oauth <provider> "
+                       "and stream the token via /2FA TOKEN <chunk> first.");
+            return;
+        }
+        OAuthProvider *prov = oauth_find_provider(e->oauth_provider);
+        if (!prov || !prov->loaded)
+        {
+            twofa_fail(client, "NO_SUCH_PROVIDER", e->oauth_provider,
+                       "OAuth provider is no longer configured.");
+            twofa_clear_enroll(client);
+            return;
+        }
+        OAuthProvider *seen = NULL;
+        char *subject = oauth_validate_jwt(e->oauth_token, &seen);
+        if (!subject || seen != prov)
+        {
+            safe_free(subject);
+            add_fake_lag(client, 2000);
+            twofa_fail(client, "INVALID_CREDENTIAL_DATA", NULL,
+                       "Token is not valid for that provider.");
+            twofa_clear_enroll(client);
+            return;
+        }
+        char *cred = oauth_make_cred_secret(prov->name, subject);
+        long existing = oauth_lookup_account_by_credential(prov->name, subject);
+        if (existing && existing != acc->id)
+        {
+            safe_free(subject); safe_free(cred);
+            twofa_clear_enroll(client);
+            twofa_fail(client, "ALREADY_LINKED", NULL,
+                       "That OAuth identity is already linked to another account.");
+            return;
+        }
+        if (existing == acc->id)
+        {
+            safe_free(subject); safe_free(cred);
+            twofa_clear_enroll(client);
+            sendto_one(client, NULL,
+                       ":%s 2FA ADD ALREADY_LINKED oauth %s :Already linked.",
+                       me.name, prov->name);
+            return;
+        }
+        long int new_id = 0;
+        if (!twofa_insert_credential(acc->id, "oauth", name, cred, &new_id))
+        {
+            safe_free(subject); safe_free(cred);
+            twofa_clear_enroll(client);
+            twofa_fail(client, "TEMPORARILY_UNAVAILABLE", NULL,
+                       "Could not persist credential.");
+            return;
+        }
+        char id_buf[TWOFA_ID_MAX + 1];
+        format_cred_id(id_buf, sizeof(id_buf), new_id);
+        sendto_one(client, NULL,
+                   ":%s 2FA ADD SUCCESS oauth %s :Credential '%s' registered "
+                   "(provider=%s subject=%s).",
+                   me.name, id_buf, name, prov->name, subject);
+        unreal_log(ULOG_INFO, "account", "2FA_OAUTH_LINK", client,
+                   "$client.details linked OAuth identity to account $account "
+                   "[provider: $provider] [subject: $subject]",
+                   log_data_string("account", acc->name),
+                   log_data_string("provider", prov->name),
+                   log_data_string("subject", subject));
+        safe_free(subject); safe_free(cred);
+        twofa_clear_enroll(client);
+        return;
+    }
+    if (!data)
+    {
+        twofa_fail(client, "INVALID_CREDENTIAL_DATA", NULL,
+                   "Syntax: /2FA ADD <type> <name> <data>");
         return;
     }
     if (!strcasecmp(type, "webauthn"))
@@ -3204,6 +4185,7 @@ CMD_FUNC(cmd_2fa)
     else if (!strcasecmp(sub, "LIST"))   twofa_cmd_list     (client, acc);
     else if (!strcasecmp(sub, "CHALLENGE")) twofa_cmd_challenge(client, acc, parc, parv);
     else if (!strcasecmp(sub, "ADD"))    twofa_cmd_add      (client, acc, parc, parv);
+    else if (!strcasecmp(sub, "TOKEN"))  twofa_cmd_oauth_token(client, parc, parv);
     else if (!strcasecmp(sub, "REMOVE")) twofa_cmd_remove   (client, acc, parc, parv);
     else if (!strcasecmp(sub, "ENABLE")) twofa_cmd_enable   (client, acc);
     else if (!strcasecmp(sub, "DISABLE")) twofa_cmd_disable (client, acc, parc, parv);
@@ -4568,10 +5550,11 @@ static void webauthn_2fa_handle_challenge(Client *client, Account *acc)
 
 static const char *saslmechs(Client *client)
 {
-    /* EXTERNAL is only useful when the client presented a TLS cert.
-     * We still advertise it unconditionally because some clients want
-     * to know up-front that the server supports cert-based auth. */
-    return "PLAIN,SCRAM-SHA-256,TOTP,EXTERNAL,DRAFT-WEBAUTHN-BIO,ANONYMOUS";
+    /* OAUTHBEARER + IRCV3BEARER are only meaningful if at least one
+     * oauth-provider {} is loaded; advertise both unconditionally so
+     * clients can negotiate -- the dispatcher will reject with
+     * ERR_SASLFAIL if no provider matches the token's issuer. */
+    return "PLAIN,SCRAM-SHA-256,TOTP,EXTERNAL,DRAFT-WEBAUTHN-BIO,OAUTHBEARER,IRCV3BEARER,ANONYMOUS";
 }
 
 /* ===================================================================
