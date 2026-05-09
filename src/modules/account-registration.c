@@ -173,10 +173,12 @@ typedef struct OAuthJwksKey {
 
 typedef struct OAuthProvider {
     char *name;            /* config block label, lower-cased */
-    char *issuer;          /* expected `iss` claim */
+    char *issuer;          /* expected `iss` claim (JWT path) */
     char *audience;        /* expected `aud` claim, optional */
-    char *jwks_file;       /* path to a local JWKS json file */
-    char *subject_claim;   /* defaults to "sub" */
+    char *jwks_file;       /* path to a local JWKS json file (JWT path) */
+    char *userinfo_url;    /* HTTPS URL hit with Authorization: Bearer <token>
+                            * (opaque path -- e.g. https://api.github.com/user) */
+    char *subject_claim;   /* defaults to "sub"; for GitHub use "login" or "id" */
     OAuthJwksKey keys[MAX_OAUTH_JWKS_KEYS];
     int   nkeys;
     int   loaded;
@@ -188,6 +190,16 @@ static OAuthProvider *oauth_providers = NULL;
 static int oauthbearer_dispatch(Client *client, const char *param);
 static int ircv3bearer_dispatch(Client *client, const char *param);
 static int oauth_load_jwks_file(struct OAuthProvider *p);
+static int oauth_validate_opaque_async(Client *client, struct OAuthProvider *prov,
+                                       const char *token);
+static void oauth_userinfo_callback(OutgoingWebRequest *request,
+                                    OutgoingWebResponse *response);
+/* Forward decls for the 2FA helpers used inside the userinfo callback;
+ * the actual definitions live in the 2FA section further down. */
+static void twofa_fail(Client *c, const char *code, const char *param,
+                       const char *human);
+static void twofa_clear_enroll(Client *c);
+static void format_cred_id(char *out, size_t out_size, long int id);
 
 /* Multi-line AUTHENTICATE accumulator for OAUTHBEARER / IRCV3BEARER.
  * IRC SASL chunks at 400 bytes; tokens are easily larger.
@@ -378,6 +390,11 @@ MOD_INIT()
     /* Built-in SASL hooks */
     HookAddConstString(modinfo->handle, HOOKTYPE_SASL_MECHS, 0, saslmechs);
     HookAdd(modinfo->handle, HOOKTYPE_SASL_AUTHENTICATE, 0, authenticate_attempt);
+
+    /* Async HTTP callback for opaque-token (userinfo) validation. */
+    RegisterApiCallbackWebResponse(modinfo->handle,
+                                   "oauth_userinfo_callback",
+                                   oauth_userinfo_callback);
 
     /* RPC handlers */
     memset(&rpc, 0, sizeof(rpc));
@@ -613,29 +630,29 @@ static int accreg_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *err
         else if (!strcmp(cep->name, "oauth-provider"))
         {
             ConfigEntry *cepp;
-            int got_issuer = 0, got_jwks = 0;
+            int got_jwks = 0, got_userinfo = 0;
             for (cepp = cep->items; cepp; cepp = cepp->next)
             {
                 if (!cepp->name) continue;
-                if (!strcmp(cepp->name, "issuer"))         got_issuer = 1;
-                else if (!strcmp(cepp->name, "jwks-file")) got_jwks = 1;
-                else if (!strcmp(cepp->name, "audience"))    {}
+                if (!strcmp(cepp->name, "issuer"))             {}
+                else if (!strcmp(cepp->name, "jwks-file"))     got_jwks = 1;
+                else if (!strcmp(cepp->name, "userinfo-url"))  got_userinfo = 1;
+                else if (!strcmp(cepp->name, "audience"))      {}
                 else if (!strcmp(cepp->name, "subject-claim")) {}
                 else
                     config_warn("%s:%i: unknown directive %s::oauth-provider::%s",
                                 cepp->file->filename, cepp->line_number,
                                 CONF_ACCOUNT_BLOCK, cepp->name);
             }
-            if (!got_issuer)
+            /* Either path is fine; both is also fine -- jwks-file feeds the
+             * JWT validator (Logto/Auth0/Keycloak/Google id_token), and
+             * userinfo-url feeds the opaque-token validator (GitHub,
+             * Discord, Slack, ...). At least one must be configured. */
+            if (!got_jwks && !got_userinfo)
             {
-                config_error("%s:%i: %s::oauth-provider \"%s\" requires 'issuer'",
-                             cep->file->filename, cep->line_number,
-                             CONF_ACCOUNT_BLOCK, cep->value);
-                errors++;
-            }
-            if (!got_jwks)
-            {
-                config_error("%s:%i: %s::oauth-provider \"%s\" requires 'jwks-file'",
+                config_error("%s:%i: %s::oauth-provider \"%s\" requires "
+                             "either 'jwks-file' (for JWT tokens) or "
+                             "'userinfo-url' (for opaque tokens), or both.",
                              cep->file->filename, cep->line_number,
                              CONF_ACCOUNT_BLOCK, cep->value);
                 errors++;
@@ -711,15 +728,21 @@ static int accreg_configrun(ConfigFile *cf, ConfigEntry *ce, int type)
             for (cepp = cep->items; cepp; cepp = cepp->next)
             {
                 if (!cepp->name || !cepp->value) continue;
-                if (!strcmp(cepp->name, "issuer"))         safe_strdup(p->issuer, cepp->value);
-                else if (!strcmp(cepp->name, "audience")) safe_strdup(p->audience, cepp->value);
-                else if (!strcmp(cepp->name, "jwks-file")) safe_strdup(p->jwks_file, cepp->value);
+                if (!strcmp(cepp->name, "issuer"))             safe_strdup(p->issuer, cepp->value);
+                else if (!strcmp(cepp->name, "audience"))      safe_strdup(p->audience, cepp->value);
+                else if (!strcmp(cepp->name, "jwks-file"))     safe_strdup(p->jwks_file, cepp->value);
+                else if (!strcmp(cepp->name, "userinfo-url"))  safe_strdup(p->userinfo_url, cepp->value);
                 else if (!strcmp(cepp->name, "subject-claim")) safe_strdup(p->subject_claim, cepp->value);
             }
             if (!p->subject_claim) safe_strdup(p->subject_claim, "sub");
             /* Try to load JWKS now; failure is logged but not fatal --
-             * admin may /REHASH after fixing the file path. */
-            oauth_load_jwks_file(p);
+             * admin may /REHASH after fixing the file path. Userinfo-only
+             * providers (GitHub etc.) skip this entirely. */
+            if (p->jwks_file) oauth_load_jwks_file(p);
+            /* Mark the provider 'loaded' if either path is operational.
+             * Opaque-only providers don't have keys but are still usable
+             * via their userinfo-url. */
+            if (!p->loaded && p->userinfo_url) p->loaded = 1;
             /* Prepend so the most recently configured wins on iss
              * collisions (rare). */
             p->next = oauth_providers;
@@ -762,6 +785,7 @@ static void oauth_free_providers(void)
         safe_free(p->issuer);
         safe_free(p->audience);
         safe_free(p->jwks_file);
+        safe_free(p->userinfo_url);
         safe_free(p->subject_claim);
         safe_free(p);
         p = n;
@@ -1712,20 +1736,16 @@ static long oauth_lookup_account_by_credential(const char *provider, const char 
     return id;
 }
 
-/* Common token-->account-login path used by both SASL mechs. Returns
- * 1 on success (and sets sasl_complete + sends RPL_SASLSUCCESS), 0 on
- * failure (and sends ERR_SASLFAIL). */
-static int oauth_login_by_token(Client *client, const char *token)
+/* Given a verified (provider, subject) pair, finish the SASL handshake:
+ * find the linked account, optionally route into 2FA step-up, otherwise
+ * complete the login. Used by both the synchronous JWT path and the
+ * async userinfo callback. Returns 1 on success, 0 on failure (and
+ * sends the appropriate numeric in either case). */
+static int oauth_complete_login(Client *client, OAuthProvider *prov,
+                                const char *subject)
 {
-    OAuthProvider *prov = NULL;
-    char *subject = oauth_validate_jwt(token, &prov);
-    if (!subject) {
-        sendnumeric(client, ERR_SASLFAIL);
-        return 0;
-    }
     long acc_id = oauth_lookup_account_by_credential(prov->name, subject);
     if (acc_id == 0) {
-        safe_free(subject);
         sendnumeric(client, ERR_SASLFAIL);
         sendto_one(client, NULL,
                    ":%s NOTE AUTHENTICATE OAUTH_NOT_LINKED :That OAuth identity is not linked to an account; log in via PLAIN/SCRAM and run /2FA ADD oauth <name> via /2FA CHALLENGE oauth %s first.",
@@ -1734,13 +1754,9 @@ static int oauth_login_by_token(Client *client, const char *token)
     }
     Account *acc = find_account_by_id(acc_id);
     if (!acc) {
-        safe_free(subject);
         sendnumeric(client, ERR_SASLFAIL);
         return 0;
     }
-    /* If 2FA is enforced on this account, OAuth verifies the first
-     * factor; defer login until the user completes step-up via
-     * AUTHENTICATE 2FA-REQUIRED. */
     if (twofa_maybe_start_stepup(client, acc))
     {
         DelSaslType(client);
@@ -1751,7 +1767,6 @@ static int oauth_login_by_token(Client *client, const char *token)
                    log_data_string("provider", prov->name),
                    log_data_string("subject", subject));
         free_account(acc);
-        safe_free(subject);
         return 1;
     }
     strlcpy(client->user->account, acc->name, sizeof(client->user->account));
@@ -1765,7 +1780,238 @@ static int oauth_login_by_token(Client *client, const char *token)
                log_data_string("provider", prov->name),
                log_data_string("subject", subject));
     free_account(acc);
+    return 1;
+}
+
+/* Common JWT-path token-->account-login. Returns 1 on success
+ * (and sets sasl_complete + sends RPL_SASLSUCCESS), 0 on failure
+ * (and sends ERR_SASLFAIL). */
+static int oauth_login_by_token(Client *client, const char *token)
+{
+    OAuthProvider *prov = NULL;
+    char *subject = oauth_validate_jwt(token, &prov);
+    if (!subject) {
+        sendnumeric(client, ERR_SASLFAIL);
+        return 0;
+    }
+    int rc = oauth_complete_login(client, prov, subject);
     safe_free(subject);
+    return rc;
+}
+
+/* ============================================================
+ * Opaque-token validation (GitHub-style)
+ *
+ * For tokens that are not JWTs (no embedded subject claims), we ask
+ * the IdP's userinfo endpoint who the bearer is. This is the path
+ * used by GitHub, Discord, Slack, Reddit, Twitter, etc. -- any IdP
+ * that issues OAuth2 access tokens without an OIDC id_token.
+ *
+ * We can't block the IRC server while waiting for the upstream HTTP
+ * response, so the SASL handshake is suspended: we emit no numeric
+ * after the AUTHENTICATE payload arrives, kick off url_start_async(),
+ * and complete (903 / 904) inside oauth_userinfo_callback() once the
+ * response lands. The client side just sees a brief stall.
+ *
+ * The pending request struct stashes client->id (a stable string id
+ * that survives the client_t pointer becoming invalid after a
+ * disconnect) so the callback can safely re-resolve the Client* and
+ * bail if the user gave up first.
+ * ============================================================ */
+typedef enum { OAUTH_OP_LOGIN, OAUTH_OP_ENROLL } OAuthOpaqueOp;
+
+typedef struct {
+    OAuthOpaqueOp op;
+    char *session_id;       /* client->id at request time */
+    char *provider_name;    /* re-resolved on callback to dodge /REHASH */
+    /* enroll-only: */
+    long  account_id;
+    char *credential_name;
+} OAuthOpaquePending;
+
+static void oauth_opaque_free(OAuthOpaquePending *p)
+{
+    if (!p) return;
+    safe_free(p->session_id);
+    safe_free(p->provider_name);
+    safe_free(p->credential_name);
+    safe_free(p);
+}
+
+/* Async HTTP callback: parse the userinfo JSON and either complete
+ * SASL (903) or fail (904). */
+static void oauth_userinfo_callback(OutgoingWebRequest *request,
+                                    OutgoingWebResponse *response)
+{
+    OAuthOpaquePending *pending = (OAuthOpaquePending *)response->ptr;
+    if (!pending) return;
+
+    Client *client = hash_find_id(pending->session_id, NULL);
+    if (!client || !client->local) {
+        oauth_opaque_free(pending);
+        return;
+    }
+
+    OAuthProvider *prov = oauth_find_provider(pending->provider_name);
+    if (!prov) {
+        sendnumeric(client, ERR_SASLFAIL);
+        oauth_opaque_free(pending);
+        return;
+    }
+
+    if (response->errorbuf) {
+        unreal_log(ULOG_WARNING, "account", "OAUTH_USERINFO_HTTP_ERROR", client,
+                   "Userinfo fetch failed for provider $provider: $err",
+                   log_data_string("provider", prov->name),
+                   log_data_string("err", response->errorbuf));
+        sendnumeric(client, ERR_SASLFAIL);
+        oauth_opaque_free(pending);
+        return;
+    }
+    if (!response->memory || response->memory_len <= 0) {
+        sendnumeric(client, ERR_SASLFAIL);
+        oauth_opaque_free(pending);
+        return;
+    }
+
+    json_error_t jerr;
+    json_t *body = json_loadb(response->memory, response->memory_len, 0, &jerr);
+    if (!body) {
+        sendnumeric(client, ERR_SASLFAIL);
+        oauth_opaque_free(pending);
+        return;
+    }
+    /* Subject claim may be a string ("login") or an integer ("id" on
+     * GitHub). Coerce integers to a decimal string so the credential
+     * row format matches what /2FA CHALLENGE oauth + /2FA TOKEN +
+     * /2FA ADD oauth stored. */
+    const char *claim = prov->subject_claim ? prov->subject_claim : "sub";
+    json_t *sj = json_object_get(body, claim);
+    char subject_buf[128];
+    const char *subject = NULL;
+    if (json_is_string(sj)) {
+        subject = json_string_value(sj);
+    } else if (json_is_integer(sj)) {
+        snprintf(subject_buf, sizeof(subject_buf), "%lld",
+                 (long long)json_integer_value(sj));
+        subject = subject_buf;
+    }
+    if (!subject || !*subject) {
+        json_decref(body);
+        if (pending->op == OAUTH_OP_LOGIN)
+            sendnumeric(client, ERR_SASLFAIL);
+        else
+            twofa_fail(client, "INVALID_CREDENTIAL_DATA", NULL,
+                       "Userinfo response had no subject claim.");
+        oauth_opaque_free(pending);
+        return;
+    }
+    if (pending->op == OAUTH_OP_LOGIN) {
+        oauth_complete_login(client, prov, subject);
+    } else {
+        /* Enrollment path: store the credential row and tell the user. */
+        char *cred = oauth_make_cred_secret(prov->name, subject);
+        long existing = oauth_lookup_account_by_credential(prov->name, subject);
+        if (existing && existing != pending->account_id) {
+            twofa_fail(client, "ALREADY_LINKED", NULL,
+                       "That OAuth identity is already linked to another account.");
+            safe_free(cred);
+        } else if (existing == pending->account_id) {
+            sendto_one(client, NULL,
+                       ":%s 2FA ADD ALREADY_LINKED oauth %s :Already linked.",
+                       me.name, prov->name);
+            safe_free(cred);
+        } else {
+            long int new_id = 0;
+            if (!twofa_insert_credential(pending->account_id, "oauth",
+                                         pending->credential_name, cred,
+                                         &new_id)) {
+                twofa_fail(client, "TEMPORARILY_UNAVAILABLE", NULL,
+                           "Could not persist credential.");
+            } else {
+                char id_buf[TWOFA_ID_MAX + 1];
+                format_cred_id(id_buf, sizeof(id_buf), new_id);
+                sendto_one(client, NULL,
+                           ":%s 2FA ADD SUCCESS oauth %s :Credential '%s' "
+                           "registered (provider=%s subject=%s).",
+                           me.name, id_buf, pending->credential_name,
+                           prov->name, subject);
+                unreal_log(ULOG_INFO, "account", "2FA_OAUTH_LINK", client,
+                           "$client.details linked OAuth identity to "
+                           "account [provider: $provider] [subject: $subject]",
+                           log_data_string("provider", prov->name),
+                           log_data_string("subject", subject));
+            }
+            safe_free(cred);
+        }
+        twofa_clear_enroll(client);
+    }
+    json_decref(body);
+    oauth_opaque_free(pending);
+}
+
+/* Internal helper: assemble + dispatch the userinfo HTTP request. */
+static void oauth_userinfo_request(OAuthProvider *prov, const char *token,
+                                   OAuthOpaquePending *pending)
+{
+    NameValuePrioList *headers = NULL;
+    char auth[1024];
+    snprintf(auth, sizeof(auth), "Bearer %s", token);
+    add_nvplist(&headers, 0, "Authorization", auth);
+    /* GitHub demands a User-Agent or returns 403; harmless on others. */
+    add_nvplist(&headers, 0, "User-Agent", "obbyircd/oauth");
+    add_nvplist(&headers, 0, "Accept", "application/json");
+
+    OutgoingWebRequest *w = safe_alloc(sizeof(OutgoingWebRequest));
+    safe_strdup(w->url, prov->userinfo_url);
+    w->http_method      = HTTP_METHOD_GET;
+    w->headers          = headers;
+    w->max_redirects    = 1;
+    w->connect_timeout  = 10;
+    w->transfer_timeout = 15;
+    safe_strdup(w->apicallback, "oauth_userinfo_callback");
+    w->callback_data    = pending;
+
+    url_start_async(w);
+}
+
+/* SASL login path: validate an opaque token via userinfo, then
+ * complete the SASL handshake. Returns 1 if the request was enqueued
+ * (caller MUST NOT send any SASL numeric -- the callback will), 0 if
+ * the kickoff itself failed (caller has already gotten ERR_SASLFAIL). */
+static int oauth_validate_opaque_async(Client *client, OAuthProvider *prov,
+                                       const char *token)
+{
+    if (!prov->userinfo_url || !*prov->userinfo_url) {
+        sendnumeric(client, ERR_SASLFAIL);
+        return 0;
+    }
+    OAuthOpaquePending *pending = safe_alloc(sizeof(*pending));
+    pending->op = OAUTH_OP_LOGIN;
+    safe_strdup(pending->session_id, client->id);
+    safe_strdup(pending->provider_name, prov->name);
+    oauth_userinfo_request(prov, token, pending);
+    return 1;
+}
+
+/* /2FA ADD oauth path for opaque providers: validate via userinfo,
+ * then store a credential row keyed by (provider, subject). */
+static int oauth_enroll_opaque_async(Client *client, OAuthProvider *prov,
+                                     const char *token, long account_id,
+                                     const char *credential_name)
+{
+    if (!prov->userinfo_url || !*prov->userinfo_url) {
+        twofa_fail(client, "NO_SUCH_PROVIDER", prov->name,
+                   "Opaque-token provider missing userinfo-url config.");
+        return 0;
+    }
+    OAuthOpaquePending *pending = safe_alloc(sizeof(*pending));
+    pending->op          = OAUTH_OP_ENROLL;
+    pending->account_id  = account_id;
+    safe_strdup(pending->session_id, client->id);
+    safe_strdup(pending->provider_name, prov->name);
+    safe_strdup(pending->credential_name, credential_name);
+    oauth_userinfo_request(prov, token, pending);
     return 1;
 }
 
@@ -1867,8 +2113,14 @@ static int oauthbearer_dispatch(Client *client, const char *param)
     if (!kv) { sendnumeric(client, ERR_SASLFAIL); return 0; }
     kv++;
 
-    /* Find auth=Bearer <token> */
+    /* Pull out auth=Bearer <token>, plus an optional provider=<name>
+     * hint that lets the caller route opaque tokens to the right
+     * userinfo endpoint. The provider hint is an obbyircd extension
+     * over RFC 7628 -- vanilla OAUTHBEARER clients omit it and we
+     * treat the token as a JWT. */
     const char *token = NULL;
+    static char prov_buf[128];
+    prov_buf[0] = 0;
     while (kv < end) {
         const char *eol = memchr(kv, 0x01, end - kv);
         if (!eol) break;
@@ -1876,17 +2128,31 @@ static int oauthbearer_dispatch(Client *client, const char *param)
         if (len >= 13 && !strncmp(kv, "auth=Bearer ", 12)) {
             static char tokbuf[8192];
             size_t tlen = len - 12;
-            if (tlen >= sizeof(tokbuf)) break;
-            memcpy(tokbuf, kv + 12, tlen);
-            tokbuf[tlen] = 0;
-            token = tokbuf;
-            break;
+            if (tlen < sizeof(tokbuf)) {
+                memcpy(tokbuf, kv + 12, tlen);
+                tokbuf[tlen] = 0;
+                token = tokbuf;
+            }
+        } else if (len > 9 && !strncmp(kv, "provider=", 9)) {
+            size_t plen = len - 9;
+            if (plen < sizeof(prov_buf)) {
+                memcpy(prov_buf, kv + 9, plen);
+                prov_buf[plen] = 0;
+            }
         }
         kv = eol + 1;
     }
     if (!token) {
         sendnumeric(client, ERR_SASLFAIL);
         return 0;
+    }
+    if (prov_buf[0]) {
+        OAuthProvider *prov = oauth_find_provider(prov_buf);
+        if (!prov || !prov->loaded || !prov->userinfo_url) {
+            sendnumeric(client, ERR_SASLFAIL);
+            return 0;
+        }
+        return oauth_validate_opaque_async(client, prov, token);
     }
     return oauth_login_by_token(client, token);
 }
@@ -1928,8 +2194,26 @@ static int ircv3bearer_dispatch(Client *client, const char *param)
         sendnumeric(client, ERR_SASLFAIL);
         return 0;
     }
-    const char *type = (const char *)(buf + nul1 + 1);
-    const char *token = (const char *)(buf + nul2 + 1);
+    const char *authzid = (const char *)buf;          /* may be empty */
+    const char *type    = (const char *)(buf + nul1 + 1);
+    const char *token   = (const char *)(buf + nul2 + 1);
+
+    /* type=opaque routes to the userinfo HTTP path; the authzid carries
+     * the provider-name hint (no per-token claims to look at, so we
+     * have to be told). */
+    if (!strcmp(type, "opaque")) {
+        if (!*authzid) {
+            sendnumeric(client, ERR_SASLFAIL);
+            return 0;
+        }
+        OAuthProvider *prov = oauth_find_provider(authzid);
+        if (!prov || !prov->loaded || !prov->userinfo_url) {
+            sendnumeric(client, ERR_SASLFAIL);
+            return 0;
+        }
+        return oauth_validate_opaque_async(client, prov, token);
+    }
+
     if (strcmp(type, "oauth2") && strcmp(type, "jwt")) {
         sendnumeric(client, ERR_SASLFAIL);
         return 0;
@@ -3832,6 +4116,22 @@ static void twofa_cmd_add(Client *client, Account *acc, int parc, const char *pa
             twofa_clear_enroll(client);
             return;
         }
+
+        /* JWT tokens have exactly two '.' separators. If the buffered
+         * token doesn't look like a JWT and the provider has a
+         * userinfo-url configured (e.g. GitHub), route through the
+         * opaque-validation async path instead. The callback completes
+         * the enrollment on its own. */
+        const char *d1 = strchr(e->oauth_token, '.');
+        const char *d2 = d1 ? strchr(d1 + 1, '.') : NULL;
+        int looks_like_jwt = (d1 != NULL && d2 != NULL);
+        if (!looks_like_jwt && prov->userinfo_url) {
+            oauth_enroll_opaque_async(client, prov, e->oauth_token,
+                                      acc->id, name);
+            /* keep the enroll buffer alive until the callback fires */
+            return;
+        }
+
         OAuthProvider *seen = NULL;
         char *subject = oauth_validate_jwt(e->oauth_token, &seen);
         if (!subject || seen != prov)
