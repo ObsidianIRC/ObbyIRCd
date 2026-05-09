@@ -22,7 +22,7 @@ int privdeaf_can_send_to_user(Client *client, Client *target, const char **text,
 MOD_INIT()
 {
 	MARK_AS_OFFICIAL_MODULE(modinfo);
-	UmodePrivdeaf = UmodeAdd(modinfo->handle, 'D', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_PRIVDEAF);
+	UmodePrivdeaf = UmodeAdd(modinfo->handle, "obsidianirc/privdeaf", 'D', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_PRIVDEAF);
 	if (!UmodePrivdeaf)
 	{
 		/* I use config_error() here because it's printed to stderr in case of a load

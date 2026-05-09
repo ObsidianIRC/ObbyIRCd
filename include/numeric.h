@@ -346,6 +346,17 @@
 #define ERR_SASLABORTED         906
 #define RPL_SASLMECHS           908
 
+/* IRCv3 draft/named-modes -- src/modules/named-modes.c.
+ * 96X is the spec's placeholder allocation. Final numbers will land
+ * here unchanged if the draft graduates; if they shift, every
+ * RPL_*PROPLIST/CHMODELIST/UMODELIST consumer just rebuilds. */
+#define RPL_ENDOFPROPLIST       960
+#define RPL_PROPLIST            961
+#define RPL_ENDOFLISTPROPLIST   962
+#define RPL_LISTPROPLIST        963
+#define RPL_CHMODELIST          964
+#define RPL_UMODELIST           965
+
 /* Numeric texts */
 
 #define STR_RPL_WELCOME			/* 001 */	":Welcome to the %s IRC Network %s!%s@%s"
@@ -575,5 +586,14 @@
 #define STR_ERR_SASLTOOLONG		/* 905 */	":SASL message too long"
 #define STR_ERR_SASLABORTED		/* 906 */	":SASL authentication aborted"
 #define STR_RPL_SASLMECHS		/* 908 */	"%s :are available SASL mechanisms"
+
+/* IRCv3 draft/named-modes formats. 961/964/965 carry variable-length
+ * mode lists and are formatted directly by the named-modes module
+ * (sendto_one); only the fixed-format numerics get STR_ entries here
+ * for sendnumeric() callers. */
+#define STR_RPL_ENDOFPROPLIST		/* 960 */	"%s :End of mode list"
+#define STR_RPL_LISTPROPLIST		/* 963 */	"%s %s %s %s :%lld"
+#define STR_RPL_ENDOFLISTPROPLIST	/* 962 */	"%s %s :End of list"
+
 #define STR_ERR_CANNOTDOCOMMAND		/* 972 */	"%s :%s"
 #define STR_ERR_CANNOTCHANGECHANMODE	/* 974 */	"%c :%s"

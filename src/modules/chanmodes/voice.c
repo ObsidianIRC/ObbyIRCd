@@ -42,6 +42,7 @@ MOD_INIT()
 	creq.paracount = 1;
 	creq.is_ok = cmode_voice_is_ok;
 	creq.letter = 'v';
+	creq.name = "voice";
 	creq.prefix = '+';
 	creq.sjoin_prefix = '+';
 	creq.rank = RANK_VOICE;

@@ -95,8 +95,11 @@ void isupport_init(void)
 	ISupportSetFmt(NULL, "CHANMODES",
 	               CHPAR1 "%s,%s,%s,%s",
 	               EXPAR1, EXPAR2, EXPAR3, EXPAR4);
-	ISupportSet(NULL, "CHANTYPES", "#^");
+	ISupportSet(NULL, "CHANTYPES", "#^$");
 	ISupportSetFmt(NULL, "MODES", "%d", MAXMODEPARAMS);
+	/* IRCv3 draft/named-modes REQUIRES this token. Same value as MODES
+	 * since PROP and MODE share the per-line item budget on the wire. */
+	ISupportSetFmt(NULL, "MAXMODES", "%d", MAXMODEPARAMS);
 	ISupportSetFmt(NULL, "SILENCE", "%d", SILENCE_LIMIT);
 	if (WATCH_AWAY_NOTIFICATION)
 		ISupportSet(NULL, "WATCHOPTS", "A");

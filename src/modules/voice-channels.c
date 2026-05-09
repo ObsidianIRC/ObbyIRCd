@@ -45,9 +45,19 @@ ModuleHeader MOD_HEADER = {
 };
 
 #define VOICE_CHAN_PREFIX  '^'
+#define STREAM_CHAN_PREFIX '$'
 #define VOICE_RTC_TAG      "+obsidianirc/rtc"
 #define VOICE_CAP_NAME     "obsidianirc/voice"
 #define VOICE_DEFAULT_SOCK "/tmp/obbyirc-voice.sock"
+
+/* Both prefixes ride the same WebRTC bridge -- the SFU distinguishes
+ * streamer vs. viewer roles internally for `$` channels. The IRCd's
+ * job here is just to gate JOIN on the cap and shovel signaling. */
+static int is_voice_or_stream_channel(const char *name)
+{
+	return name && (name[0] == VOICE_CHAN_PREFIX ||
+	                name[0] == STREAM_CHAN_PREFIX);
+}
 
 /* Configurable via env var or set::voice-bridge-socket "<path>"; in obbyircd.conf. */
 static char *cfg_bridge_socket = NULL;
@@ -212,7 +222,7 @@ static void emit_outbound_signal(const char *to, const char *payload_json)
 	}
 	escaped[ei] = '\0';
 
-	if (to[0] == VOICE_CHAN_PREFIX || to[0] == '#')
+	if (is_voice_or_stream_channel(to) || to[0] == '#')
 	{
 		/* Channel target: server-sourced TAGMSG to every member. */
 		Channel *channel = find_channel(to);
@@ -346,7 +356,7 @@ static int voice_pre_chanmsg(Client *client, Channel *channel,
 {
 	if (!MyUser(client))
 		return 0;
-	if (channel->name[0] != VOICE_CHAN_PREFIX)
+	if (!is_voice_or_stream_channel(channel->name))
 		return 0;
 	if (sendtype != SEND_TYPE_TAGMSG)
 		return 0;
@@ -377,7 +387,7 @@ static int voice_pre_chanmsg(Client *client, Channel *channel,
 static int voice_local_part(Client *client, Channel *channel,
                             MessageTag *_mtags, const char *_comment)
 {
-	if (channel->name[0] == VOICE_CHAN_PREFIX)
+	if (is_voice_or_stream_channel(channel->name))
 		bridge_forward_part(client, channel->name);
 	return 0;
 }
@@ -400,15 +410,16 @@ static int voice_rtc_mtag_is_ok(Client *_client, const char *_name,
 }
 
 /* HOOKTYPE_CAN_JOIN: only clients that negotiated the obsidianirc/voice
- * capability are allowed into ^channels.  Plain IRC clients (HexChat,
- * irssi, etc.) hitting these channels would just see an unintelligible
- * stream of voice signaling traffic, so we hide them entirely. */
+ * capability are allowed into ^ (voice) or $ (stream) channels.  Plain
+ * IRC clients (HexChat, irssi, etc.) hitting these channels would just
+ * see an unintelligible stream of voice signaling traffic, so we hide
+ * them entirely. */
 static int voice_can_join(Client *client, Channel *channel,
                            const char *_key, char **errmsg)
 {
 	static char fmt[160];
 
-	if (channel->name[0] != VOICE_CHAN_PREFIX)
+	if (!is_voice_or_stream_channel(channel->name))
 		return 0;
 	if (!MyUser(client))
 		return 0; /* trust remote servers for federated joins */

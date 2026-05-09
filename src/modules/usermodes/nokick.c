@@ -46,7 +46,7 @@ MOD_TEST()
 
 MOD_INIT()
 {
-	UmodeAdd(modinfo->handle, 'q', UMODE_GLOBAL, 1, umode_allow_unkickable_oper, &UMODE_NOKICK);
+	UmodeAdd(modinfo->handle, "obsidianirc/nokick", 'q', UMODE_GLOBAL, 1, umode_allow_unkickable_oper, &UMODE_NOKICK);
 	
 	HookAdd(modinfo->handle, HOOKTYPE_CAN_KICK, 0, nokick_can_kick);
 	

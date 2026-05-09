@@ -48,6 +48,7 @@ CmodeInfo req;
 	memset(&req, 0, sizeof(req));
 	req.paracount = 0;
 	req.letter = 'K';
+	req.name = "obsidianirc/noknock";
 	req.is_ok = noknock_mode_allow;
 	CmodeAdd(modinfo->handle, req, &EXTCMODE_NOKNOCK);
 	

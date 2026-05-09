@@ -1410,11 +1410,13 @@ struct CommandOverride {
 extern MODVAR Umode *usermodes;
 extern MODVAR Cmode *channelmodes;
 
-extern Umode *UmodeAdd(Module *module, char ch, int options, int unset_on_deoper, int (*allowed)(Client *client, int what), long *mode);
+extern Umode *UmodeAdd(Module *module, const char *name, char ch, int options, int unset_on_deoper, int (*allowed)(Client *client, int what), long *mode);
 extern void UmodeDel(Umode *umode);
+extern Umode *find_user_mode_handler_by_name(const char *name);
 
 extern Cmode *CmodeAdd(Module *reserved, CmodeInfo req, Cmode_t *mode);
 extern void CmodeDel(Cmode *cmode);
+extern Cmode *find_channel_mode_handler_by_name(const char *name);
 
 extern void moddata_init(void);
 extern ModDataInfo *ModDataAdd(Module *module, ModDataInfo req);
@@ -2508,9 +2510,19 @@ struct Ban {
 #define	ShowChannel(v,c)	(PubChannel(c) || IsMember((v),(c)))
 #define	PubChannel(x)		(!SecretChannel((x)) && !HiddenChannel((x)))
 
-/* `^` is the ObsidianIRC voice-channel prefix, alongside the
- * standard `#` text-channel prefix. */
-#define	IsChannelName(name) ((name) && ((*(name) == '#') || (*(name) == '^')))
+/* Channel-name predicate. Used by JOIN, message routing, and other
+ * call sites to decide whether a target string is a channel. Drive
+ * this from the live CHANTYPES ISUPPORT token (set in api-isupport.c)
+ * so every prefix the server advertises -- '#', '^' (voice), '$'
+ * (stream), and any future ones -- is recognised consistently with
+ * valid_channelname(). Falls back to "#" if ISupport hasn't been
+ * initialized yet (config preprocessor runs before main_isupport_set). */
+#define IsChannelName(name) \
+	((name) && (*(name)) && \
+	 (strchr( \
+		(ISupportFind("CHANTYPES") && ISupportFind("CHANTYPES")->value) \
+			? ISupportFind("CHANTYPES")->value : "#", \
+		*(name)) != NULL))
 
 #define IsMember(blah,chan) ((blah && blah->user && \
                 find_membership_link((blah->user)->channel, chan)) ? 1 : 0)

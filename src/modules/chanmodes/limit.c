@@ -64,6 +64,7 @@ MOD_INIT()
 	creq.paracount = 1;
 	creq.is_ok = cmode_limit_is_ok;
 	creq.letter = 'l';
+	creq.name = "limit";
 	creq.put_param = cmode_limit_put_param;
 	creq.get_param = cmode_limit_get_param;
 	creq.conv_param = cmode_limit_conv_param;

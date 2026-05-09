@@ -44,7 +44,7 @@ MOD_INIT()
 	ModInfo = modinfo;
 
 	MARK_AS_OFFICIAL_MODULE(modinfo);
-	UmodeAdd(modinfo->handle, 'G', UMODE_GLOBAL, 0, NULL, &UMODE_CENSOR);
+	UmodeAdd(modinfo->handle, "obsidianirc/censor", 'G', UMODE_GLOBAL, 0, NULL, &UMODE_CENSOR);
 	HookAdd(modinfo->handle, HOOKTYPE_CAN_SEND_TO_USER, 0, censor_can_send_to_user);
 	HookAdd(modinfo->handle, HOOKTYPE_STATS, 0, censor_stats_badwords_user);
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, censor_config_run);

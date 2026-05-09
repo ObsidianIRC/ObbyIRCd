@@ -116,7 +116,8 @@ typedef struct Umode Umode;
 struct Umode {
 	Umode *prev, *next;
 	long mode; /**< Mode mask */
-	char letter; /**< Mode character */
+	char letter; /**< Mode character (0 if name-only) */
+	char *name; /**< IRCv3 named-modes name (REQUIRED at registration) */
 	int unset_on_deoper; /**< When set to 1 then this user mode will be unset on de-oper */
 	int (*allowed)(Client *client, int what); /**< The 'is this user allowed to set this mode?' routine */
 	char unloaded; /**< Internal flag to indicate module is being unloaded */
@@ -222,7 +223,13 @@ typedef struct Cmode Cmode;
 struct Cmode {
 	Cmode *prev, *next;
 
-	/** mode character (like 'Z') */
+	/** Long name for IRCv3 named-modes ("op", "voice", "ban", ...).
+	 * REQUIRED at registration. May contain a vendor prefix
+	 * ("obsidianirc/foo") for non-standard modes. */
+	char		*name;
+
+	/** Mode character (like 'Z'). Optional now -- 0 means the mode
+	 * is reachable only by name (PROP), with no legacy MODE letter. */
 	char		letter;
 
 	CmodeType	type;
@@ -351,8 +358,13 @@ struct Cmode {
 
 /** The struct used to register a channel mode handler.
  * For documentation, see Cmode struct.
+ *
+ * `name` is REQUIRED for IRCv3 draft/named-modes; CmodeAdd() refuses
+ * registrations without it. `letter` is OPTIONAL (set to 0 to register
+ * a name-only mode that has no legacy MODE letter equivalent).
  */
 typedef struct {
+	const char	*name;
 	char		letter;
 	CmodeType	type;
 	char		prefix;

@@ -101,6 +101,8 @@ MODULES= \
 	account-recovery.so \
 	read-marker.so \
 	cmdslist.so \
+	named-modes.so \
+	member-roles.so \
 	voice-channels.so
 
 MODULEFLAGS=@MODULEFLAGS@

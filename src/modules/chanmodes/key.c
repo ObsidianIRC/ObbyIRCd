@@ -62,6 +62,7 @@ MOD_INIT()
 	creq.paracount = 1;
 	creq.is_ok = cmode_key_is_ok;
 	creq.letter = 'k';
+	creq.name = "key";
 	creq.unset_with_param = 1; /* yeah... +k is like this */
 	creq.put_param = cmode_key_put_param;
 	creq.get_param = cmode_key_get_param;

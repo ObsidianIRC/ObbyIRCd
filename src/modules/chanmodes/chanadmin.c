@@ -42,6 +42,7 @@ MOD_INIT()
 	creq.paracount = 1;
 	creq.is_ok = cmode_chanadmin_is_ok;
 	creq.letter = 'a';
+	creq.name = "admin";
 	creq.prefix = '&';
 	creq.sjoin_prefix = '~'; /* yeah i know, totally not confusing! */
 	creq.rank = RANK_CHANADMIN;
