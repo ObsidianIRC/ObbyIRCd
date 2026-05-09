@@ -65,6 +65,7 @@ CmodeInfo req;
 	req.paracount = 0;
 	req.is_ok = modeZ_is_ok;
 	req.letter = 'Z';
+	req.name = "obsidianirc/issecure";
 	req.local = 1; /* local channel mode */
 	CmodeAdd(modinfo->handle, req, &EXTCMODE_ISSECURE);
 	

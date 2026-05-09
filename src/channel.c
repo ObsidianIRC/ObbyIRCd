@@ -932,14 +932,24 @@ int valid_channelname(const char *cname)
 {
 	const char *p;
 
-	/* Channel name must start with a recognised prefix:
-	 *   #  -- standard text channels
-	 *   ^  -- ObsidianIRC voice channels (handled by the
-	 *         "voice-channels" module; SDP/ICE flow over
-	 *         server-mediated TAGMSG)
+	/* Channel name must start with a prefix listed in the CHANTYPES
+	 * ISUPPORT token (advertised from src/api-isupport.c). Looking it
+	 * up at runtime keeps this validator in sync with whatever the
+	 * server tells clients without needing to touch this file every
+	 * time we add a new channel type (e.g. ^ voice, $ stream).
+	 *
+	 * Fall back to "#" only when ISupport hasn't been initialized
+	 * yet -- the config preprocessor calls valid_channelname() during
+	 * boot before main_isupport_set() runs.
 	 */
-	if (*cname != '#' && *cname != '^')
-		return 0;
+	{
+		ISupport *is_chantypes = ISupportFind("CHANTYPES");
+		const char *chantypes = is_chantypes && is_chantypes->value
+		                            ? is_chantypes->value
+		                            : "#";
+		if (!strchr(chantypes, *cname))
+			return 0;
+	}
 
 	if (strlen(cname) > CHANNELLEN)
 		return 0;

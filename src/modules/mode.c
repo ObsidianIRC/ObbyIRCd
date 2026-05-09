@@ -366,9 +366,25 @@ void _do_mode(Channel *channel, Client *client, MessageTag *recv_mtags, int parc
 		}
 #endif
 
-		sendto_channel(channel, client, NULL, 0, 0, SEND_LOCAL, mtags,
-			       ":%s MODE %s %s %s",
-			       client->name, channel->name, modebuf, parabuf);
+		{
+			/* IRCv3 draft/named-modes: cap-holders MUST receive
+			 * a translated PROP message instead of MODE. The
+			 * named-modes module owns that translation via the
+			 * HOOKTYPE_LOCAL_CHANMODE hook below; here we just
+			 * filter cap-holders out of the legacy MODE
+			 * broadcast so they don't get both. ClientCapabilityBit
+			 * returns 0 if the named-modes module isn't loaded,
+			 * making this a no-op for ircds without it. */
+			long named_modes_bit =
+				ClientCapabilityBit("draft/named-modes");
+			long cap_filter = named_modes_bit
+				? (named_modes_bit | CAP_INVERT) : 0;
+			sendto_channel(channel, client, NULL, 0, cap_filter,
+				       SEND_LOCAL, mtags,
+				       ":%s MODE %s %s %s",
+				       client->name, channel->name,
+				       modebuf, parabuf);
+		}
 
 		if (IsServer(client) || IsMe(client))
 		{

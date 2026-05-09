@@ -39,7 +39,7 @@ int regonlymsg_can_send_to_user(Client *client, Client *target, const char **tex
                     
 MOD_INIT()
 {
-	UmodeAdd(modinfo->handle, 'R', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_REGONLYMSG);
+	UmodeAdd(modinfo->handle, "obsidianirc/regonlymsg", 'R', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_REGONLYMSG);
 	
 	HookAdd(modinfo->handle, HOOKTYPE_CAN_SEND_TO_USER, 0, regonlymsg_can_send_to_user);
 	

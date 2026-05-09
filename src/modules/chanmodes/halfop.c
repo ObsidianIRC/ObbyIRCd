@@ -42,6 +42,7 @@ MOD_INIT()
 	creq.paracount = 1;
 	creq.is_ok = cmode_halfop_is_ok;
 	creq.letter = 'h';
+	creq.name = "halfop";
 	creq.prefix = '%';
 	creq.sjoin_prefix = '%';
 	creq.rank = RANK_HALFOP;

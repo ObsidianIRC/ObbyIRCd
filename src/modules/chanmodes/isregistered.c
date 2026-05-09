@@ -44,6 +44,7 @@ MOD_INIT()
 	memset(&req, 0, sizeof(req));
 	req.paracount = 0;
 	req.letter = 'r';
+	req.name = "obsidianirc/isregistered";
 	req.is_ok = isregistered_chanmode_is_ok;
 	CmodeAdd(modinfo->handle, req, &EXTCMODE_REGISTERED);
 

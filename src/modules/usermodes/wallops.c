@@ -41,7 +41,7 @@ MOD_INIT()
 {
 	MARK_AS_OFFICIAL_MODULE(modinfo);
 	CommandAdd(modinfo->handle, MSG_WALLOPS, cmd_wallops, 1, CMD_USER|CMD_SERVER);
-	UmodeAdd(modinfo->handle, 'w', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_WALLOP);
+	UmodeAdd(modinfo->handle, "wallops", 'w', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_WALLOP);
 	return MOD_SUCCESS;
 }
 

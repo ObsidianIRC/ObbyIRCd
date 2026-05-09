@@ -66,16 +66,19 @@ void umode_init(void)
 {
 	memset(umode_letter_to_handler, 0, sizeof(umode_letter_to_handler));
 	/* Some built-in modes */
-	UmodeAdd(NULL, 'i', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_INVISIBLE);
-	UmodeAdd(NULL, 'o', UMODE_GLOBAL, 1, umode_allow_opers, &UMODE_OPER);
-	UmodeAdd(NULL, 'r', UMODE_GLOBAL, 0, umode_allow_none, &UMODE_REGNICK);
-	UmodeAdd(NULL, 's', UMODE_LOCAL, 0, umode_allow_all, &UMODE_SERVNOTICE);
-	UmodeAdd(NULL, 'x', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_HIDE);
-	UmodeAdd(NULL, 'z', UMODE_GLOBAL, 0, umode_allow_none, &UMODE_SECURE);
-	UmodeAdd(NULL, 'd', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_DEAF);
-	UmodeAdd(NULL, 'H', UMODE_GLOBAL, 1, umode_allow_opers, &UMODE_HIDEOPER);
-	UmodeAdd(NULL, 't', UMODE_GLOBAL, 0, umode_allow_unset, &UMODE_SETHOST);
-	UmodeAdd(NULL, 'I', UMODE_GLOBAL, 0, umode_hidle_allow, &UMODE_HIDLE);
+	/* Names taken from the IRCv3 draft/named-modes spec table where
+	 * defined; UnrealIRCd-specific modes get the obsidianirc/ vendor
+	 * prefix per our local convention. */
+	UmodeAdd(NULL, "invisible", 'i', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_INVISIBLE);
+	UmodeAdd(NULL, "oper", 'o', UMODE_GLOBAL, 1, umode_allow_opers, &UMODE_OPER);
+	UmodeAdd(NULL, "obsidianirc/regnick", 'r', UMODE_GLOBAL, 0, umode_allow_none, &UMODE_REGNICK);
+	UmodeAdd(NULL, "snomask", 's', UMODE_LOCAL, 0, umode_allow_all, &UMODE_SERVNOTICE);
+	UmodeAdd(NULL, "cloak", 'x', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_HIDE);
+	UmodeAdd(NULL, "obsidianirc/secureconn", 'z', UMODE_GLOBAL, 0, umode_allow_none, &UMODE_SECURE);
+	UmodeAdd(NULL, "obsidianirc/deaf", 'd', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_DEAF);
+	UmodeAdd(NULL, "obsidianirc/hideoper", 'H', UMODE_GLOBAL, 1, umode_allow_opers, &UMODE_HIDEOPER);
+	UmodeAdd(NULL, "obsidianirc/sethost", 't', UMODE_GLOBAL, 0, umode_allow_unset, &UMODE_SETHOST);
+	UmodeAdd(NULL, "obsidianirc/hideidle", 'I', UMODE_GLOBAL, 0, umode_hidle_allow, &UMODE_HIDLE);
 }
 
 void make_umodestr(void)
@@ -172,14 +175,41 @@ void usermode_add_sorted(Umode *n)
  * @returns The Umode pointer, or NULL on failure
  * @note Call this from MOD_INIT().
  */
-Umode *UmodeAdd(Module *module, char ch, int global, int unset_on_deoper, int (*allowed)(Client *client, int what), long *mode)
+Umode *UmodeAdd(Module *module, const char *name, char ch, int global, int unset_on_deoper, int (*allowed)(Client *client, int what), long *mode)
 {
 	Umode *um;
 	int existing = 0;
 
+	/* IRCv3 draft/named-modes: name is required, letter is optional
+	 * (0 = mode reachable only by name via PROP). Refuse missing or
+	 * empty names so we never silently advertise a mode without one. */
+	if (BadPtr(name))
+	{
+		unreal_log(ULOG_ERROR, "module", "USER_MODE_MISSING_NAME", NULL,
+			   "UmodeAdd: name is required (letter '$letter') from $module_name",
+			   log_data_char("letter", ch ? ch : '?'),
+			   log_data_string("module_name", module ? module->header->name : "<core>"));
+		if (module)
+			module->errorcode = MODERR_INVALID;
+		return NULL;
+	}
+
 	for (um=usermodes; um; um = um->next)
 	{
-		if (um->letter == ch)
+		if (ch && um->letter == ch)
+		{
+			if (um->unloaded)
+			{
+				um->unloaded = 0;
+				existing = 1;
+				break;
+			} else {
+				if (module)
+					module->errorcode = MODERR_EXISTS;
+				return NULL;
+			}
+		}
+		if (um->name && !strcmp(um->name, name))
 		{
 			if (um->unloaded)
 			{
@@ -230,6 +260,7 @@ Umode *UmodeAdd(Module *module, char ch, int global, int unset_on_deoper, int (*
 	}
 
 	um->letter = ch;
+	safe_strdup(um->name, name);
 	um->allowed = allowed;
 	um->unset_on_deoper = unset_on_deoper;
 	make_umodestr();
@@ -249,6 +280,28 @@ Umode *UmodeAdd(Module *module, char ch, int global, int unset_on_deoper, int (*
 	return um;
 }
 
+
+/** Look up a registered user mode by IRCv3 long-form name.
+ * @param name		Long name (e.g. "invisible", "wallops",
+ *			"obsidianirc/bot")
+ * @returns		The Umode handler, or NULL if no mode is
+ *			registered under that name (or it is currently
+ *			unloaded).
+ */
+Umode *find_user_mode_handler_by_name(const char *name)
+{
+	Umode *um;
+	if (BadPtr(name))
+		return NULL;
+	for (um = usermodes; um; um = um->next)
+	{
+		if (um->unloaded)
+			continue;
+		if (um->name && !strcmp(um->name, name))
+			return um;
+	}
+	return NULL;
+}
 
 /** Delete a user mode.
  * @param umode		The user mode to delete
@@ -345,6 +398,7 @@ static void unload_usermode_commit(Umode *um)
 	/* Then unload the mode */
 	umode_letter_to_handler[um->letter] = NULL;
 	DelListItem(um, usermodes);
+	safe_free(um->name);
 	safe_free(um);
 	make_umodestr(); // this sets umode_letter_to_handler[] properly if a newly loaded module took our handle over
 }

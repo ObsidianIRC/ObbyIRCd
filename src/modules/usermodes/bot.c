@@ -46,7 +46,7 @@ MOD_TEST()
 
 MOD_INIT()
 {
-	UmodeAdd(modinfo->handle, 'B', UMODE_GLOBAL, 0, NULL, &UMODE_BOT);
+	UmodeAdd(modinfo->handle, "bot", 'B', UMODE_GLOBAL, 0, NULL, &UMODE_BOT);
 	ISupportAdd(modinfo->handle, "BOT", "B");
 	
 	HookAdd(modinfo->handle, HOOKTYPE_WHOIS, 0, bot_whois);

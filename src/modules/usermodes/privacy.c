@@ -39,7 +39,7 @@ int privacy_see_channel_in_whois(Client *client, Client *target, Channel *channe
                     
 MOD_INIT()
 {
-	UmodeAdd(modinfo->handle, 'p', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_PRIVACY);
+	UmodeAdd(modinfo->handle, "hidechans", 'p', UMODE_GLOBAL, 0, umode_allow_all, &UMODE_PRIVACY);
 	
 	HookAdd(modinfo->handle, HOOKTYPE_SEE_CHANNEL_IN_WHOIS, 0, privacy_see_channel_in_whois);
 	
