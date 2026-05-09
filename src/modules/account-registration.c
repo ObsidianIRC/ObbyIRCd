@@ -620,6 +620,7 @@ extern int obsidian_open_database(const char *filename)
         "  name              TEXT NOT NULL COLLATE NOCASE,"
         "  email             TEXT,"
         "  password          TEXT,"
+        "  password_scheme   TEXT DEFAULT 'argon2id',"
         "  time_registered   INTEGER,"
         "  verified          INTEGER DEFAULT 0,"
         "  verify_code       TEXT,"
@@ -628,7 +629,13 @@ extern int obsidian_open_database(const char *filename)
         "  scram_iterations  INTEGER,"
         "  scram_stored_key  TEXT,"
         "  scram_server_key  TEXT,"
-        "  twofa_enabled     INTEGER DEFAULT 0"
+        "  twofa_enabled     INTEGER DEFAULT 0,"
+        "  vhost             TEXT,"
+        "  vhost_set_at      INTEGER,"
+        "  suspended_until   INTEGER,"
+        "  suspended_reason  TEXT,"
+        "  suspended_by      TEXT,"
+        "  flags             TEXT"
         ");"
         "CREATE TABLE IF NOT EXISTS account_2fa_credentials ("
         "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -638,6 +645,36 @@ extern int obsidian_open_database(const char *filename)
         "  secret      TEXT NOT NULL,"
         "  created_at  INTEGER NOT NULL,"
         "  FOREIGN KEY (account_id) REFERENCES accounts(id)"
+        ");"
+        /* Phase 0 (§6.1) sibling tables for SASL EXTERNAL + nick aliases.
+         * Created up-front; the migration tool will populate rows here
+         * when the source carries certfps / additional registered nicks. */
+        "CREATE TABLE IF NOT EXISTS account_certfps ("
+        "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  account_id  INTEGER NOT NULL,"
+        "  fingerprint TEXT NOT NULL,"
+        "  added_at    INTEGER NOT NULL,"
+        "  UNIQUE(account_id, fingerprint),"
+        "  FOREIGN KEY (account_id) REFERENCES accounts(id)"
+        ");"
+        "CREATE TABLE IF NOT EXISTS account_aliases ("
+        "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  account_id  INTEGER NOT NULL,"
+        "  alias       TEXT NOT NULL COLLATE NOCASE,"
+        "  UNIQUE(alias),"
+        "  FOREIGN KEY (account_id) REFERENCES accounts(id)"
+        ");"
+        /* Memos: one row per delivered memo. recipient_id keys back into
+         * accounts(id); sender is stored as the canonical account name
+         * (or '*' for system memos). read_at = 0 means unread. */
+        "CREATE TABLE IF NOT EXISTS memos ("
+        "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  recipient_id  INTEGER NOT NULL,"
+        "  sender        TEXT NOT NULL,"
+        "  body          TEXT NOT NULL,"
+        "  sent_at       INTEGER NOT NULL,"
+        "  read_at       INTEGER DEFAULT 0,"
+        "  FOREIGN KEY (recipient_id) REFERENCES accounts(id)"
         ");";
 
     errmsg = NULL;
@@ -687,6 +724,42 @@ extern int obsidian_open_database(const char *filename)
                  "ALTER TABLE accounts ADD COLUMN twofa_enabled INTEGER DEFAULT 0;",
                  NULL, NULL, &errmsg);
     if (errmsg) sqlite3_free(errmsg);
+    /* Phase 0 (§6.1) additions, idempotent. */
+    errmsg = NULL;
+    sqlite3_exec(obsidian_db,
+                 "ALTER TABLE accounts ADD COLUMN password_scheme TEXT DEFAULT 'argon2id';",
+                 NULL, NULL, &errmsg);
+    if (errmsg) sqlite3_free(errmsg);
+    errmsg = NULL;
+    sqlite3_exec(obsidian_db,
+                 "ALTER TABLE accounts ADD COLUMN vhost TEXT;",
+                 NULL, NULL, &errmsg);
+    if (errmsg) sqlite3_free(errmsg);
+    errmsg = NULL;
+    sqlite3_exec(obsidian_db,
+                 "ALTER TABLE accounts ADD COLUMN vhost_set_at INTEGER;",
+                 NULL, NULL, &errmsg);
+    if (errmsg) sqlite3_free(errmsg);
+    errmsg = NULL;
+    sqlite3_exec(obsidian_db,
+                 "ALTER TABLE accounts ADD COLUMN suspended_until INTEGER;",
+                 NULL, NULL, &errmsg);
+    if (errmsg) sqlite3_free(errmsg);
+    errmsg = NULL;
+    sqlite3_exec(obsidian_db,
+                 "ALTER TABLE accounts ADD COLUMN suspended_reason TEXT;",
+                 NULL, NULL, &errmsg);
+    if (errmsg) sqlite3_free(errmsg);
+    errmsg = NULL;
+    sqlite3_exec(obsidian_db,
+                 "ALTER TABLE accounts ADD COLUMN suspended_by TEXT;",
+                 NULL, NULL, &errmsg);
+    if (errmsg) sqlite3_free(errmsg);
+    errmsg = NULL;
+    sqlite3_exec(obsidian_db,
+                 "ALTER TABLE accounts ADD COLUMN flags TEXT;",
+                 NULL, NULL, &errmsg);
+    if (errmsg) sqlite3_free(errmsg);
 
     return SQLITE_OK;
 }
@@ -707,6 +780,7 @@ void free_account(Account *acc)
     free(acc->name);
     free(acc->email);
     free(acc->password);
+    free(acc->password_scheme);
     free(acc->verify_code);
     free(acc->scram_salt);
     free(acc->scram_stored_key);
@@ -802,6 +876,32 @@ int update_account_twofa_enabled(const Account *acc)
     return result == SQLITE_DONE ? 1 : 0;
 }
 
+/* Persist a password rehash (used by the verifier-dispatcher upgrade
+ * path: after a successful non-argon2id verify we rehash with argon2id
+ * and call this). */
+int update_account_password(const Account *acc)
+{
+    const char *sql =
+        "UPDATE accounts SET password = ?, password_scheme = ? WHERE id = ?";
+    sqlite3_stmt *stmt;
+    int result;
+
+    if (!obsidian_db)
+        return 0;
+    if (sqlite3_prepare_v2(obsidian_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_text(stmt, 1, acc->password, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2,
+                      acc->password_scheme ? acc->password_scheme : "argon2id",
+                      -1, SQLITE_STATIC);
+    sqlite3_bind_int (stmt, 3, (int)acc->id);
+
+    result = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return result == SQLITE_DONE ? 1 : 0;
+}
+
 int update_account_scram(const Account *acc)
 {
     const char *sql =
@@ -861,12 +961,12 @@ Account **read_accounts_from_db(const char *name)
     const char *sql_all = "SELECT id,name,email,password,time_registered,verified,"
                           "verify_code,verify_expires,"
                           "scram_salt,scram_iterations,scram_stored_key,scram_server_key,"
-                          "twofa_enabled"
+                          "twofa_enabled,password_scheme"
                           " FROM accounts";
     const char *sql_one = "SELECT id,name,email,password,time_registered,verified,"
                           "verify_code,verify_expires,"
                           "scram_salt,scram_iterations,scram_stored_key,scram_server_key,"
-                          "twofa_enabled"
+                          "twofa_enabled,password_scheme"
                           " FROM accounts WHERE lower(name) = lower(?) LIMIT 1";
     sqlite3_stmt *stmt;
     Account **accounts = NULL;
@@ -887,9 +987,12 @@ Account **read_accounts_from_db(const char *name)
         Account *acc = safe_alloc(sizeof(Account));
         const unsigned char *col;
         acc->id             = sqlite3_column_int(stmt, 0);
-        acc->name           = strdup((const char *)sqlite3_column_text(stmt, 1));
-        acc->email          = strdup((const char *)sqlite3_column_text(stmt, 2));
-        acc->password       = strdup((const char *)sqlite3_column_text(stmt, 3));
+        col = sqlite3_column_text(stmt, 1);
+        acc->name           = strdup(col ? (const char *)col : "");
+        col = sqlite3_column_text(stmt, 2);
+        acc->email          = strdup(col ? (const char *)col : "");
+        col = sqlite3_column_text(stmt, 3);
+        acc->password       = strdup(col ? (const char *)col : "");
         acc->time_registered= (time_t)sqlite3_column_int(stmt, 4);
         acc->verified       = sqlite3_column_int(stmt, 5);
         col = sqlite3_column_text(stmt, 6);
@@ -903,6 +1006,8 @@ Account **read_accounts_from_db(const char *name)
         col = sqlite3_column_text(stmt, 11);
         acc->scram_server_key = col ? strdup((const char *)col) : NULL;
         acc->twofa_enabled = sqlite3_column_int(stmt, 12);
+        col = sqlite3_column_text(stmt, 13);
+        acc->password_scheme = col && *col ? strdup((const char *)col) : NULL;
         acc->channels       = NULL;
         acc->metadata_head  = NULL;
         acc->members        = NULL;
@@ -1057,6 +1162,340 @@ void sat_unserialize(const char *str, ModData *m)
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
+#include <crypt.h>     /* for libcrypt's crypt_r() — bcrypt + crypt-sha256/512 */
+#include <string.h>
+
+/* ===================================================================
+ * Password-scheme verifier dispatcher (PLAN.md §6.1).
+ *
+ * Migrated accounts may carry hashes from any of:
+ *
+ *   argon2id     -- obbyircd native (default for new registrations)
+ *   bcrypt       -- $2a$/$2b$/$2y$    (Anope, Atheme bcrypt, Ergo)
+ *   pbkdf2v2     -- $z$pbkdf2-<prf>$<iter>$<salt-b64>$<hash-b64> (Atheme)
+ *   crypt-sha256 -- $5$  (Atheme crypt3-sha256)
+ *   crypt-sha512 -- $6$  (Atheme crypt3-sha512)
+ *
+ * The migration tool stamps `accounts.password_scheme`. At login,
+ * verify_password_for_scheme() picks the right verifier. argon2id is
+ * the only scheme that gets opportunistically upgraded -- when a
+ * non-argon2id verify succeeds we re-hash with argon2id and persist
+ * (best-effort; failure is non-fatal).
+ *
+ * "reset-required" is a sentinel meaning the source had a hash we
+ * can't safely verify (raw md5/sha1/plain). Logins are rejected and
+ * the user is steered toward the existing recovery flow.
+ * =================================================================== */
+
+static int crypt_verify_via_libcrypt(const char *stored, const char *password)
+{
+    struct crypt_data data;
+    char *out;
+    int eq;
+
+    memset(&data, 0, sizeof(data));
+    out = crypt_r(password, stored, &data);
+    if (!out)
+        return 0;
+    eq = (strcmp(out, stored) == 0);
+    OPENSSL_cleanse(&data, sizeof(data));
+    return eq;
+}
+
+/* base64 decoding shim using OpenSSL EVP. Returns number of decoded
+ * bytes, or -1 on failure. `out` must be at least len(in) bytes.
+ * Atheme's pbkdf2v2 module emits "url-safe" b64 with no padding for
+ * the salt, but standard b64 with padding for the hash. We try both. */
+static int b64_decode_any(const char *in, unsigned char *out, int outcap)
+{
+    int n = EVP_DecodeBlock(out, (const unsigned char *)in, strlen(in));
+    if (n <= 0 || n > outcap)
+        return -1;
+    /* EVP_DecodeBlock returns the number of bytes decoded BEFORE
+     * stripping pad nuls; figure out actual length by walking back
+     * over '=' padding in the input. */
+    int pad = 0;
+    int inlen = strlen(in);
+    if (inlen >= 1 && in[inlen-1] == '=') pad++;
+    if (inlen >= 2 && in[inlen-2] == '=') pad++;
+    return n - pad;
+}
+
+/* Verify an Atheme PBKDF2v2 hash. Two on-disk forms exist:
+ *
+ *   Old textual:     $z$pbkdf2-<prf>$<iter>$<salt-b64>$<hash-b64>
+ *                    (<prf> = "sha256" or "sha512")
+ *
+ *   Numeric (default in Atheme 7.x):
+ *     non-SCRAM:     $z$<algo>$<iter>$<salt-b64>$<hash-b64>
+ *                    algo: 3,4,5,6 = HMAC-{MD5,SHA1,SHA-256,SHA-512} raw-salt
+ *                          23,24,25,26 = same, with base64-string-as-salt
+ *     SCRAM:         $z$<algo>$<iter>$<salt-b64>$<storedkey-b64>$<serverkey-b64>
+ *                    algo: 43,44,45,46 = SCRAM-{MD5,SHA1,SHA-256,SHA-512}
+ *                          63,64,65,66 = same, with base64-string-as-salt
+ *                    (we verify by recomputing StoredKey only;
+ *                    ServerKey is unused for the password check.)
+ *
+ * Numeric algo IDs come from migration-research/atheme/include/atheme/
+ * pbkdf2.h (PBKDF2_PRF_HMAC_*, PBKDF2_PRF_SCRAM_*). Salt-as-b64-string
+ * variants (23-26, 63-66) feed the literal base64 ASCII as the salt to
+ * PBKDF2 instead of decoding first; that matches Atheme's
+ * atheme_pbkdf2v2_salt_is_b64() == true branch.
+ *
+ * Returns 1 on match, 0 on mismatch or parse error. */
+static int pbkdf2v2_verify(const char *stored, const char *password)
+{
+    char buf[768];
+    char *p, *iter_part, *salt_b64, *hash_b64, *server_b64;
+    long iterations;
+    const EVP_MD *md = NULL;
+    unsigned char salt_raw[128];
+    unsigned char hash_expect[128];
+    unsigned char hash_actual[128];
+    int salt_len, hash_len;
+    int is_scram = 0;
+    int salt_is_b64 = 0;
+    long algo = 0;
+
+    if (strncmp(stored, "$z$", 3) != 0)
+        return 0;
+    if (strlen(stored) >= sizeof(buf))
+        return 0;
+    strcpy(buf, stored);
+    p = buf + 3;
+
+    /* Tokenise. First field after $z$ is either "pbkdf2-<prf>" or a
+     * numeric algo id. */
+    char *first = p;
+    p = strchr(p, '$');
+    if (!p) return 0;
+    *p++ = 0;
+    iter_part = p;
+    p = strchr(p, '$');
+    if (!p) return 0;
+    *p++ = 0;
+    salt_b64 = p;
+    p = strchr(p, '$');
+    if (!p) return 0;
+    *p++ = 0;
+    hash_b64 = p;
+    /* Optional 5th field: server key (only for SCRAM variants). */
+    p = strchr(p, '$');
+    if (p) {
+        *p++ = 0;
+        server_b64 = p;
+    } else {
+        server_b64 = NULL;
+    }
+
+    if (!strncmp(first, "pbkdf2-", 7))
+    {
+        const char *prf = first + 7;
+        if (!strcmp(prf, "sha256"))      md = EVP_sha256();
+        else if (!strcmp(prf, "sha512")) md = EVP_sha512();
+        else                             return 0;
+        salt_is_b64 = 0;
+    }
+    else
+    {
+        /* Numeric algo id. */
+        char *endp = NULL;
+        algo = strtol(first, &endp, 10);
+        if (!endp || *endp != 0) return 0;
+        switch (algo)
+        {
+            case  4: md = EVP_sha1();   salt_is_b64 = 0; break;
+            case  5: md = EVP_sha256(); salt_is_b64 = 0; break;
+            case  6: md = EVP_sha512(); salt_is_b64 = 0; break;
+            case 24: md = EVP_sha1();   salt_is_b64 = 1; break;
+            case 25: md = EVP_sha256(); salt_is_b64 = 1; break;
+            case 26: md = EVP_sha512(); salt_is_b64 = 1; break;
+            case 44: md = EVP_sha1();   salt_is_b64 = 0; is_scram = 1; break;
+            case 45: md = EVP_sha256(); salt_is_b64 = 0; is_scram = 1; break;
+            case 46: md = EVP_sha512(); salt_is_b64 = 0; is_scram = 1; break;
+            case 64: md = EVP_sha1();   salt_is_b64 = 1; is_scram = 1; break;
+            case 65: md = EVP_sha256(); salt_is_b64 = 1; is_scram = 1; break;
+            case 66: md = EVP_sha512(); salt_is_b64 = 1; is_scram = 1; break;
+            default: return 0;  /* MD5 variants intentionally unsupported */
+        }
+        if (is_scram && !server_b64) return 0;  /* SCRAM needs 2 hash fields */
+    }
+    (void)server_b64;  /* we don't need ServerKey for verifying a password */
+
+    iterations = strtol(iter_part, NULL, 10);
+    if (iterations <= 0 || iterations > 10000000)
+        return 0;
+
+    /* Salt: either the literal base64 ASCII string (S64 variants) or
+     * the decoded raw bytes. */
+    const unsigned char *salt_p;
+    int salt_used_len;
+    if (salt_is_b64)
+    {
+        salt_p = (const unsigned char *)salt_b64;
+        salt_used_len = (int)strlen(salt_b64);
+    }
+    else
+    {
+        salt_len = b64_decode_any(salt_b64, salt_raw, sizeof(salt_raw));
+        if (salt_len <= 0) return 0;
+        salt_p = salt_raw;
+        salt_used_len = salt_len;
+    }
+
+    hash_len = b64_decode_any(hash_b64, hash_expect, sizeof(hash_expect));
+    if (hash_len <= 0 || hash_len > (int)sizeof(hash_actual)) return 0;
+
+    /* PBKDF2 derives a key the size of the digest output. */
+    int dlen = EVP_MD_size(md);
+    unsigned char salted_password[64];
+    if (dlen <= 0 || dlen > (int)sizeof(salted_password)) return 0;
+
+    if (PKCS5_PBKDF2_HMAC(password, strlen(password),
+                          salt_p, salt_used_len,
+                          (int)iterations, md,
+                          dlen, salted_password) != 1)
+        return 0;
+
+    if (!is_scram)
+    {
+        /* Plain HMAC PBKDF2: the stored hash IS the PBKDF2 output. */
+        if (hash_len != dlen) return 0;
+        int ok = (CRYPTO_memcmp(hash_expect, salted_password, dlen) == 0);
+        OPENSSL_cleanse(salted_password, sizeof(salted_password));
+        OPENSSL_cleanse(salt_raw, sizeof(salt_raw));
+        return ok;
+    }
+
+    /* SCRAM: stored hash is StoredKey = H(HMAC(SaltedPassword, "Client Key")). */
+    unsigned int hmac_len = 0;
+    unsigned char client_key[64];
+    static const unsigned char ck_label[] = "Client Key";
+    if (!HMAC(md, salted_password, dlen, ck_label, sizeof(ck_label) - 1,
+              client_key, &hmac_len) || (int)hmac_len != dlen)
+    {
+        OPENSSL_cleanse(salted_password, sizeof(salted_password));
+        return 0;
+    }
+    unsigned char stored_key_actual[64];
+    unsigned int sk_len = 0;
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx ||
+        EVP_DigestInit_ex(mdctx, md, NULL) != 1 ||
+        EVP_DigestUpdate(mdctx, client_key, dlen) != 1 ||
+        EVP_DigestFinal_ex(mdctx, stored_key_actual, &sk_len) != 1 ||
+        (int)sk_len != dlen ||
+        hash_len != dlen)
+    {
+        if (mdctx) EVP_MD_CTX_free(mdctx);
+        OPENSSL_cleanse(salted_password, sizeof(salted_password));
+        OPENSSL_cleanse(client_key, sizeof(client_key));
+        return 0;
+    }
+    EVP_MD_CTX_free(mdctx);
+
+    int ok = (CRYPTO_memcmp(hash_expect, stored_key_actual, dlen) == 0);
+    OPENSSL_cleanse(salted_password, sizeof(salted_password));
+    OPENSSL_cleanse(client_key, sizeof(client_key));
+    OPENSSL_cleanse(stored_key_actual, sizeof(stored_key_actual));
+    OPENSSL_cleanse(salt_raw, sizeof(salt_raw));
+    return ok;
+}
+
+/* Verify an Anope hmac-{sha256,sha512} hash. The stored value (after
+ * scheme stripping by splitAnopePassword in the migration tool) is
+ *   <hex-of-HMAC-output>:<hex-of-key>
+ * matching modules/encryption/enc_sha2.cpp:
+ *   enc = Hex(HMAC(key, password)) + ":" + Hex(key)
+ * Verifier: hex-decode key, compute HMAC(key, password), hex-encode,
+ * constant-time-compare to the first part. */
+static int anope_hmac_verify(const char *stored, const char *password,
+                             const EVP_MD *md)
+{
+    const char *colon = strchr(stored, ':');
+    if (!colon || colon == stored) return 0;
+
+    int hash_hex_len = (int)(colon - stored);
+    const char *key_hex = colon + 1;
+    int key_hex_len = (int)strlen(key_hex);
+    if (hash_hex_len & 1 || key_hex_len & 1) return 0;
+    if (hash_hex_len > 256 || key_hex_len > 256) return 0;
+
+    unsigned char key[128];
+    int key_len = key_hex_len / 2;
+    for (int i = 0; i < key_len; i++)
+    {
+        if (sscanf(key_hex + 2*i, "%2hhx", &key[i]) != 1) return 0;
+    }
+
+    unsigned char hmac_out[EVP_MAX_MD_SIZE];
+    unsigned int hmac_len = 0;
+    if (!HMAC(md, key, key_len,
+              (const unsigned char *)password, strlen(password),
+              hmac_out, &hmac_len))
+    {
+        OPENSSL_cleanse(key, sizeof(key));
+        return 0;
+    }
+    if ((int)(hmac_len * 2) != hash_hex_len)
+    {
+        OPENSSL_cleanse(key, sizeof(key));
+        OPENSSL_cleanse(hmac_out, sizeof(hmac_out));
+        return 0;
+    }
+    char actual_hex[2 * EVP_MAX_MD_SIZE + 1];
+    for (unsigned int i = 0; i < hmac_len; i++)
+        snprintf(actual_hex + 2*i, 3, "%02x", hmac_out[i]);
+    actual_hex[hmac_len * 2] = 0;
+
+    int ok = (CRYPTO_memcmp(stored, actual_hex, hash_hex_len) == 0);
+    OPENSSL_cleanse(key, sizeof(key));
+    OPENSSL_cleanse(hmac_out, sizeof(hmac_out));
+    OPENSSL_cleanse(actual_hex, sizeof(actual_hex));
+    return ok;
+}
+
+/* Single entry point. Inspects scheme + the hash format; falls back
+ * gracefully when scheme is NULL/empty (legacy rows pre-Phase 0 are
+ * always argon2id). Returns 1 on match, 0 on mismatch or unknown. */
+static int verify_password_for_scheme(const char *scheme,
+                                      const char *stored,
+                                      const char *password)
+{
+    if (!stored || !password)
+        return 0;
+
+    /* Heuristic when scheme isn't set: try argon2id first (legacy
+     * accounts), fall through to libcrypt for $2a/$5/$6 hashes. */
+    if (!scheme || !*scheme || !strcmp(scheme, "argon2id"))
+    {
+        if (argon2_verify(stored, password, strlen(password), Argon2_id) == ARGON2_OK)
+            return 1;
+        /* If argon2_verify failed AND the hash *looks* like a
+         * non-argon2 format the migration tool didn't flag, try the
+         * fallback chain. This protects against a rehash loop where
+         * the column wasn't set during a partial migration. */
+        if (stored[0] == '$' && (stored[1] == '2' || stored[1] == '5' || stored[1] == '6'))
+            return crypt_verify_via_libcrypt(stored, password);
+        if (!strncmp(stored, "$z$pbkdf2-", 10))
+            return pbkdf2v2_verify(stored, password);
+        return 0;
+    }
+    if (!strcmp(scheme, "bcrypt"))
+        return crypt_verify_via_libcrypt(stored, password);
+    if (!strcmp(scheme, "pbkdf2v2"))
+        return pbkdf2v2_verify(stored, password);
+    if (!strcmp(scheme, "crypt-sha256") || !strcmp(scheme, "crypt-sha512"))
+        return crypt_verify_via_libcrypt(stored, password);
+    if (!strcmp(scheme, "hmac-sha256"))
+        return anope_hmac_verify(stored, password, EVP_sha256());
+    if (!strcmp(scheme, "hmac-sha512"))
+        return anope_hmac_verify(stored, password, EVP_sha512());
+    if (!strcmp(scheme, "reset-required"))
+        return 0;  /* user must reset via /RECOVER */
+    /* Unknown scheme — try argon2id as a last resort. */
+    return argon2_verify(stored, password, strlen(password), Argon2_id) == ARGON2_OK;
+}
 
 struct ScramState_
 {
@@ -1842,8 +2281,8 @@ static int authenticate_attempt(Client *client, int first, const char *param)
 
         Account *account = find_account(username);
         if (account &&
-            argon2_verify(account->password, password, strlen(password),
-                          Argon2_id) == ARGON2_OK)
+            verify_password_for_scheme(account->password_scheme,
+                                       account->password, password))
         {
             /* Opportunistic SCRAM credentials backfill: pre-existing accounts
              * have no scram_* columns; we have plaintext now, so populate. */
@@ -1851,6 +2290,21 @@ static int authenticate_attempt(Client *client, int first, const char *param)
             {
                 if (scram_make_credentials(account, password))
                     update_account_scram(account);
+            }
+            /* Migrated non-argon2id accounts get rolled forward on first
+             * successful login: rehash with argon2id and persist. Best
+             * effort -- failure is logged but doesn't abort login. */
+            if (account->password_scheme && strcmp(account->password_scheme, "argon2id"))
+            {
+                const char *new_hash = Auth_Hash(AUTHTYPE_ARGON2, password);
+                if (new_hash)
+                {
+                    free(account->password);
+                    account->password = strdup(new_hash);
+                    free(account->password_scheme);
+                    account->password_scheme = strdup("argon2id");
+                    update_account_password(account);
+                }
             }
 
             /* If 2FA is enforced, withhold the success reply and ask the
@@ -4427,12 +4881,25 @@ CMD_FUNC(cmd_identify)
         return;
     }
 
-    if (argon2_verify(acc->password, password, strlen(password), Argon2_id) == ARGON2_OK)
+    if (verify_password_for_scheme(acc->password_scheme, acc->password, password))
     {
         if (!acc->scram_salt || !acc->scram_stored_key)
         {
             if (scram_make_credentials(acc, password))
                 update_account_scram(acc);
+        }
+        /* Roll forward migrated non-argon2id accounts. */
+        if (acc->password_scheme && strcmp(acc->password_scheme, "argon2id"))
+        {
+            const char *new_hash = Auth_Hash(AUTHTYPE_ARGON2, password);
+            if (new_hash)
+            {
+                free(acc->password);
+                acc->password = strdup(new_hash);
+                free(acc->password_scheme);
+                acc->password_scheme = strdup("argon2id");
+                update_account_password(acc);
+            }
         }
 
         sendto_one(client, NULL,
