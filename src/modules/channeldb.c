@@ -2,20 +2,42 @@
  * Stores channel settings for +P channels in a .db file
  * (C) Copyright 2019 Syzop, Gottem and the UnrealIRCd team
  * License: GPLv2 or later
+ *
+ * obbyircd extension: persists channel-registration metadata
+ * (registered_by account name, registered_at timestamp) alongside the
+ * standard +P state. The metadata is owned by a MODDATATYPE_CHANNEL
+ * ModData named "obsidianirc/channel-registration"; member-roles writes
+ * to it via findmoddata_byname() when CREGISTER fires, and channeldb
+ * persists it on disk. Schema version was bumped from 100 -> 101 to
+ * carry the two new fields.
  */
 
 #include "unrealircd.h"
 
 ModuleHeader MOD_HEADER = {
 	"channeldb",
-	"1.0",
-	"Stores and retrieves channel settings for persistent (+P) channels",
-	"UnrealIRCd Team",
+	"1.1",
+	"Stores and retrieves channel settings for persistent (+P) channels (with obbyircd registration metadata)",
+	"UnrealIRCd Team & ObbyIRCd Team",
 	"unrealircd-6",
 };
 
-/* Database version */
-#define CHANNELDB_VERSION 100
+/* Database version. v101 adds the two channel-registration fields after
+ * mode_lock; older databases (v100) still load fine and simply have the
+ * registration left empty. */
+#define CHANNELDB_VERSION 101
+
+/* obbyircd channel-registration ModData — see file header. */
+typedef struct ChannelRegistration {
+	char *registered_by;   /* services account name of the registering user */
+	time_t registered_at;  /* unix epoch seconds */
+} ChannelRegistration;
+
+ModDataInfo *channel_registration_md = NULL;
+
+void channel_registration_free(ModData *md);
+const char *channel_registration_serialize(ModData *md);
+void channel_registration_unserialize(const char *str, ModData *md);
 /* Save channels to file every <this> seconds */
 #define CHANNELDB_SAVE_EVERY 300
 /* The very first save after boot, apply this delta, this
@@ -91,6 +113,8 @@ MOD_TEST()
 
 MOD_INIT()
 {
+	ModDataInfo mreq;
+
 	MARK_AS_OFFICIAL_MODULE(modinfo);
 	/* We must unload early, when all channel modes and such are still in place: */
 	ModuleSetOptions(modinfo->handle, MOD_OPT_PRIORITY, -99999999);
@@ -98,6 +122,19 @@ MOD_INIT()
 	LoadPersistentLong(modinfo, channeldb_next_event);
 
 	setcfg(&cfg);
+
+	/* obbyircd: register channel-registration ModData. Other modules
+	 * (e.g. third/member-roles' CREGISTER) write into it via
+	 * findmoddata_byname(); we persist it across restarts here. */
+	memset(&mreq, 0, sizeof(mreq));
+	mreq.name = "obsidianirc/channel-registration";
+	mreq.type = MODDATATYPE_CHANNEL;
+	mreq.free = channel_registration_free;
+	mreq.serialize = channel_registration_serialize;
+	mreq.unserialize = channel_registration_unserialize;
+	mreq.sync = MODDATA_SYNC_EARLY;
+	channel_registration_md = ModDataAdd(modinfo->handle, mreq);
+	IsMDErr(channel_registration_md, "channel_registration", modinfo);
 
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, channeldb_config_run);
 	return MOD_SUCCESS;
@@ -142,6 +179,53 @@ void channeldb_moddata_free(ModData *md)
 {
 	if (md->i)
 		md->i = 0;
+}
+
+/* obbyircd channel-registration ModData callbacks. */
+
+void channel_registration_free(ModData *md)
+{
+	ChannelRegistration *reg = (ChannelRegistration *)md->ptr;
+	if (!reg)
+		return;
+	safe_free(reg->registered_by);
+	safe_free(reg);
+	md->ptr = NULL;
+}
+
+/* Serialize as "<account>:<unix_ts>". Empty string == not registered. */
+const char *channel_registration_serialize(ModData *md)
+{
+	static char buf[NICKLEN + 32];
+	ChannelRegistration *reg;
+
+	if (!md || !md->ptr)
+		return NULL;
+	reg = (ChannelRegistration *)md->ptr;
+	if (!reg->registered_by)
+		return NULL;
+	snprintf(buf, sizeof(buf), "%s:%lld", reg->registered_by, (long long)reg->registered_at);
+	return buf;
+}
+
+void channel_registration_unserialize(const char *str, ModData *md)
+{
+	const char *colon;
+	ChannelRegistration *reg;
+
+	if (md->ptr)
+		channel_registration_free(md);
+	if (!str || !*str)
+		return;
+	colon = strrchr(str, ':');
+	if (!colon || colon == str)
+		return;
+	reg = safe_alloc(sizeof(ChannelRegistration));
+	reg->registered_by = safe_alloc((colon - str) + 1);
+	memcpy(reg->registered_by, str, colon - str);
+	reg->registered_by[colon - str] = '\0';
+	reg->registered_at = (time_t)atoll(colon + 1);
+	md->ptr = reg;
 }
 
 void setcfg(struct cfgstruct *cfg)
@@ -348,6 +432,24 @@ int write_channel_entry(UnrealDB *db, const char *tmpfname, Channel *channel)
 	W_SAFE(unrealdb_write_str(db, parabuf));
 	/* Mode lock */
 	W_SAFE(unrealdb_write_str(db, channel->mode_lock));
+	/* obbyircd v101: channel registration metadata. Always written;
+	 * empty registered_by == channel was set +P without registration. */
+	{
+		ChannelRegistration *reg = NULL;
+		const char *reg_by = "";
+		int64_t reg_at = 0;
+		if (channel_registration_md)
+		{
+			reg = (ChannelRegistration *)moddata_channel(channel, channel_registration_md).ptr;
+			if (reg && reg->registered_by)
+			{
+				reg_by = reg->registered_by;
+				reg_at = (int64_t)reg->registered_at;
+			}
+		}
+		W_SAFE(unrealdb_write_str(db, reg_by));
+		W_SAFE(unrealdb_write_int64(db, (uint64_t)reg_at));
+	}
 	/* List modes (bans, exempts, invex) */
 	if (!write_listmode(db, tmpfname, channel->banlist))
 		return 0;
@@ -428,6 +530,7 @@ int read_listmode(UnrealDB *db, Channel *channel, ExtbanType ban_type, Ban **lst
 		safe_free(modes1); \
 		safe_free(modes2); \
 		safe_free(mode_lock); \
+		safe_free(registered_by); \
 	} while(0)
 
 #define R_SAFE(x) \
@@ -458,6 +561,8 @@ int read_channeldb(void)
 	char *modes1 = NULL;
 	char *modes2 = NULL;
 	char *mode_lock = NULL;
+	char *registered_by = NULL;
+	uint64_t registered_at = 0;
 #ifdef BENCHMARK
 	struct timeval tv_alpha, tv_beta;
 
@@ -511,7 +616,9 @@ int read_channeldb(void)
 		modes1 = NULL;
 		modes2 = NULL;
 		mode_lock = NULL;
-		
+		registered_by = NULL;
+		registered_at = 0;
+
 		Channel *channel;
 		R_SAFE(unrealdb_read_int32(db, &magic));
 		if (magic != MAGIC_CHANNEL_START)
@@ -527,6 +634,13 @@ int read_channeldb(void)
 		R_SAFE(unrealdb_read_str(db, &modes1));
 		R_SAFE(unrealdb_read_str(db, &modes2));
 		R_SAFE(unrealdb_read_str(db, &mode_lock));
+		/* obbyircd v101+: channel registration metadata. v100 dbs lack
+		 * these fields, so we only read them when the file declares 101+. */
+		if (version >= 101)
+		{
+			R_SAFE(unrealdb_read_str(db, &registered_by));
+			R_SAFE(unrealdb_read_int64(db, &registered_at));
+		}
 		/* If we got this far, we can create/initialize the channel with the above */
 		channel = make_channel(chname);
 		if (IsInvalidChannelTS(creationtime))
@@ -538,6 +652,16 @@ int read_channeldb(void)
 		channel->topic_time = topic_time;
 		safe_strdup(channel->mode_lock, mode_lock);
 		set_channel_mode(channel, NULL, modes1, modes2);
+		/* Apply registration ModData. Only populate if a non-empty
+		 * registered_by was read; an empty string means "+P channel
+		 * but never CREGISTERed". */
+		if (channel_registration_md && registered_by && *registered_by)
+		{
+			ChannelRegistration *reg = safe_alloc(sizeof(ChannelRegistration));
+			safe_strdup(reg->registered_by, registered_by);
+			reg->registered_at = (time_t)registered_at;
+			moddata_channel(channel, channel_registration_md).ptr = reg;
+		}
 		R_SAFE(read_listmode(db, channel, EXBTYPE_BAN, &channel->banlist));
 		R_SAFE(read_listmode(db, channel, EXBTYPE_EXCEPT, &channel->exlist));
 		R_SAFE(read_listmode(db, channel, EXBTYPE_INVEX, &channel->invexlist));
