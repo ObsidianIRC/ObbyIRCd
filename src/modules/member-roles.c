@@ -112,10 +112,10 @@ static struct MemberRolePermissions *get_effective_permissions(Client *client, C
 
 ModuleHeader MOD_HEADER =
 {
-	"third/member-roles",
+	"member-roles",
 	"1.0",
 	"Custom channel member roles and permissions",
-	"Valware",
+	"Valware & ObbyIRCd Team",
 	"unrealircd-6",
 };
 
