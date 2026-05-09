@@ -103,6 +103,7 @@ MODULES= \
 	cmdslist.so \
 	named-modes.so \
 	member-roles.so \
+	memo.so \
 	voice-channels.so
 
 MODULEFLAGS=@MODULEFLAGS@
@@ -143,15 +144,21 @@ geoip_mmdb.so: geoip_mmdb.c $(INCLUDES)
 	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
 		-o geoip_mmdb.so geoip_mmdb.c mmdb.c
 
-# account-registration needs sqlite3
+# account-registration needs sqlite3 and libcrypt (for bcrypt /
+# crypt-sha256 / crypt-sha512 verifiers used on migrated accounts).
 account-registration.so: account-registration.c $(INCLUDES)
 	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
-		-o account-registration.so account-registration.c -lsqlite3
+		-o account-registration.so account-registration.c -lsqlite3 -lcrypt
 
 # account-recovery talks to the same sqlite db as account-registration
 account-recovery.so: account-recovery.c $(INCLUDES)
 	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
 		-o account-recovery.so account-recovery.c -lsqlite3
+
+# memo lives in the same obsidian.db as accounts
+memo.so: memo.c $(INCLUDES)
+	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
+		-o memo.so memo.c -lsqlite3
 
 # read-marker also lives in obsidian.db
 read-marker.so: read-marker.c $(INCLUDES)

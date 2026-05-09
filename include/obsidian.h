@@ -120,7 +120,8 @@ typedef struct Account {
     long int id;            /**< Auto-incremented DB primary key */
     char *name;             /**< Account name */
     char *email;            /**< Email address */
-    char *password;         /**< Argon2id hash */
+    char *password;         /**< Password hash (family per password_scheme) */
+    char *password_scheme;  /**< argon2id|bcrypt|pbkdf2v2|crypt-sha256|crypt-sha512|reset-required */
     time_t time_registered;
     int verified;
     char *verify_code;      /**< Pending verification code (NULL once verified or if no verification was requested) */
