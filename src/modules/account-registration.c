@@ -94,6 +94,11 @@ typedef struct TwoFAStepup_
 {
     int active;
     char account[ACCOUNTLEN + 1];
+    /* Credential type used for primary auth ("password", "oauth",
+     * "external"). The step-up handler refuses any mech whose factor
+     * type matches this -- you can't satisfy both factors with the
+     * same proof. */
+    char primary_factor[16];
 } TwoFAStepup;
 static ModDataInfo *twofa_enroll_md;
 static ModDataInfo *twofa_stepup_md;
@@ -4618,6 +4623,8 @@ static int twofa_maybe_start_stepup(Client *client, Account *acc,
     TwoFAStepup *s = safe_alloc(sizeof(*s));
     s->active = 1;
     strlcpy(s->account, acc->name, sizeof(s->account));
+    strlcpy(s->primary_factor, primary_factor ? primary_factor : "",
+            sizeof(s->primary_factor));
     TwoFAStepupSet(client, s);
 
     sendto_one(client, NULL, ":%s AUTHENTICATE 2FA-REQUIRED", me.name);
@@ -4749,8 +4756,24 @@ static int twofa_handle_stepup_authenticate(Client *client, const char *param)
      * Server validates the bearer (locally for jwt, async-userinfo for
      * opaque) and only accepts it if the resulting (provider, subject)
      * matches a credential row already bound to s->account. */
-    if (!strcasecmp(param, "2FA-OAUTH"))
+    /* Step-up via the real IRCV3BEARER SASL mech. Wire format is the
+     * same as primary; the server routes here based on TwoFAStepup
+     * state. (OAUTHBEARER uses GS2 framing and isn't accepted as a
+     * step-up factor right now -- IRCV3BEARER's [authzid]\0type\0token
+     * is what every client we ship sends.) */
+    if (!strcasecmp(param, "IRCV3BEARER"))
     {
+        /* Refuse to "satisfy" 2FA with the same proof type that just
+         * verified primary auth. Otherwise an attacker (or a confused
+         * client) could replay the same OAuth bearer for both factors. */
+        if (!strcasecmp(s->primary_factor, "oauth"))
+        {
+            twofa_clear_stepup(client);
+            DelSaslType(client);
+            add_fake_lag(client, 2000);
+            sendnumeric(client, ERR_SASLFAIL);
+            return 1;
+        }
         SetSaslType(client, SASL_TYPE_OAUTH_STEPUP);
         oauth_sasl_clear(client);
         sendto_one(client, NULL, ":%s AUTHENTICATE +", me.name);
@@ -4828,7 +4851,13 @@ static int twofa_handle_stepup_authenticate(Client *client, const char *param)
 /* CAP value provider for draft/account-2fa */
 static const char *twofa_capability_parameter(Client *client)
 {
-    return "totp,webauthn";
+    /* Credential types this server supports for the second factor.
+     * `oauth` is added so clients (e.g. ObsidianIRC's TwoFactorSettingsModal)
+     * know to surface "Link with <provider>" enrolment + AUTHENTICATE
+     * 2FA-OAUTH step-up. Step-up only accepts a factor type that
+     * differs from the one used for primary auth -- see
+     * twofa_maybe_start_stepup() for the policy. */
+    return "totp,webauthn,oauth";
 }
 
 /* CAP value provider for draft/webauthn-rp-id */
