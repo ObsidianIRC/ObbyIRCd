@@ -99,7 +99,8 @@ static ModDataInfo *twofa_enroll_md;
 static ModDataInfo *twofa_stepup_md;
 static void twofa_enroll_md_free(ModData *m);
 static void twofa_stepup_md_free(ModData *m);
-static int  twofa_maybe_start_stepup(Client *client, Account *acc);
+static int  twofa_maybe_start_stepup(Client *client, Account *acc,
+                                     const char *primary_factor);
 static int  twofa_handle_stepup_authenticate(Client *client, const char *param);
 static const char *twofa_capability_parameter(Client *client);
 static int  twofa_capability_visible(Client *client);
@@ -222,6 +223,7 @@ static void        oauth_sasl_clear(Client *client);
  * they don't collide with the existing ones in obsidian.h. */
 #define SASL_TYPE_OAUTHBEARER       9
 #define SASL_TYPE_IRCV3BEARER       10
+#define SASL_TYPE_OAUTH_STEPUP      11   /* second-factor OAuth after PLAIN/SCRAM/EXTERNAL */
 
 /* ===================================================================
  * Module lifecycle
@@ -1757,7 +1759,7 @@ static int oauth_complete_login(Client *client, OAuthProvider *prov,
         sendnumeric(client, ERR_SASLFAIL);
         return 0;
     }
-    if (twofa_maybe_start_stepup(client, acc))
+    if (twofa_maybe_start_stepup(client, acc, "oauth"))
     {
         DelSaslType(client);
         unreal_log(ULOG_INFO, "account", "OAUTH_SASL_2FA_STEPUP", client,
@@ -1818,7 +1820,11 @@ static int oauth_login_by_token(Client *client, const char *token)
  * disconnect) so the callback can safely re-resolve the Client* and
  * bail if the user gave up first.
  * ============================================================ */
-typedef enum { OAUTH_OP_LOGIN, OAUTH_OP_ENROLL } OAuthOpaqueOp;
+typedef enum {
+    OAUTH_OP_LOGIN,   /* primary IRCV3BEARER/OAUTHBEARER */
+    OAUTH_OP_ENROLL,  /* /2FA ADD oauth from a logged-in user */
+    OAUTH_OP_STEPUP,  /* AUTHENTICATE 2FA-OAUTH after PLAIN/SCRAM/EXTERNAL */
+} OAuthOpaqueOp;
 
 typedef struct {
     OAuthOpaqueOp op;
@@ -1827,6 +1833,8 @@ typedef struct {
     /* enroll-only: */
     long  account_id;
     char *credential_name;
+    /* stepup-only: must match the account that primary auth verified */
+    char *stepup_account;
 } OAuthOpaquePending;
 
 static void oauth_opaque_free(OAuthOpaquePending *p)
@@ -1835,6 +1843,7 @@ static void oauth_opaque_free(OAuthOpaquePending *p)
     safe_free(p->session_id);
     safe_free(p->provider_name);
     safe_free(p->credential_name);
+    safe_free(p->stepup_account);
     safe_free(p);
 }
 
@@ -1898,7 +1907,7 @@ static void oauth_userinfo_callback(OutgoingWebRequest *request,
     }
     if (!subject || !*subject) {
         json_decref(body);
-        if (pending->op == OAUTH_OP_LOGIN)
+        if (pending->op == OAUTH_OP_LOGIN || pending->op == OAUTH_OP_STEPUP)
             sendnumeric(client, ERR_SASLFAIL);
         else
             twofa_fail(client, "INVALID_CREDENTIAL_DATA", NULL,
@@ -1908,6 +1917,35 @@ static void oauth_userinfo_callback(OutgoingWebRequest *request,
     }
     if (pending->op == OAUTH_OP_LOGIN) {
         oauth_complete_login(client, prov, subject);
+    } else if (pending->op == OAUTH_OP_STEPUP) {
+        /* The bearer must resolve to a (provider, subject) credential
+         * already bound to the account that primary auth verified. */
+        long bound = oauth_lookup_account_by_credential(prov->name, subject);
+        Account *acc = pending->stepup_account
+                       ? find_account(pending->stepup_account)
+                       : NULL;
+        int ok = acc && bound == acc->id;
+        if (!ok) {
+            sendnumeric(client, ERR_SASLFAIL);
+            twofa_clear_stepup(client);
+            DelSaslType(client);
+        } else {
+            strlcpy(client->user->account, acc->name,
+                    sizeof(client->user->account));
+            user_account_login(NULL, client);
+            if (!IsDead(client)) {
+                client->local->sasl_complete = 1;
+                sendnumeric(client, RPL_SASLSUCCESS);
+            }
+            DelSaslType(client);
+            twofa_clear_stepup(client);
+            unreal_log(ULOG_INFO, "account", "SASL_LOGIN", client,
+                       "SASL+2FA-OAUTH login for $client.details "
+                       "[account: $account] [provider: $provider]",
+                       log_data_string("account", acc->name),
+                       log_data_string("provider", prov->name));
+        }
+        if (acc) free_account(acc);
     } else {
         /* Enrollment path: store the credential row and tell the user. */
         char *cred = oauth_make_cred_secret(prov->name, subject);
@@ -2011,6 +2049,26 @@ static int oauth_enroll_opaque_async(Client *client, OAuthProvider *prov,
     safe_strdup(pending->session_id, client->id);
     safe_strdup(pending->provider_name, prov->name);
     safe_strdup(pending->credential_name, credential_name);
+    oauth_userinfo_request(prov, token, pending);
+    return 1;
+}
+
+/* AUTHENTICATE 2FA-OAUTH path: validate the bearer (sync for JWT, async
+ * for opaque) and only complete login if the resulting (provider,
+ * subject) is bound to the account that primary auth proved. */
+static int oauth_stepup_opaque_async(Client *client, OAuthProvider *prov,
+                                     const char *token,
+                                     const char *expected_account)
+{
+    if (!prov->userinfo_url || !*prov->userinfo_url) {
+        sendnumeric(client, ERR_SASLFAIL);
+        return 0;
+    }
+    OAuthOpaquePending *pending = safe_alloc(sizeof(*pending));
+    pending->op = OAUTH_OP_STEPUP;
+    safe_strdup(pending->session_id, client->id);
+    safe_strdup(pending->provider_name, prov->name);
+    safe_strdup(pending->stepup_account, expected_account);
     oauth_userinfo_request(prov, token, pending);
     return 1;
 }
@@ -3036,7 +3094,7 @@ static void scram_handle_client_final(Client *client, const char *msg, size_t ms
     /* If 2FA is enforced, swap into step-up mode instead of completing
      * login.  Save the account name (twofa_maybe_start_stepup makes a copy)
      * BEFORE scram_clear() destroys st->account. */
-    if (twofa_maybe_start_stepup(client, acc))
+    if (twofa_maybe_start_stepup(client, acc, "password"))
     {
         DelSaslType(client);
         scram_clear(client);
@@ -3294,7 +3352,7 @@ static int authenticate_attempt(Client *client, int first, const char *param)
         /* If 2FA is enforced, withhold success and start the step-up.
          * EXTERNAL alone is one factor; the cert match doesn't double
          * as the second factor when twofa_enabled is on. */
-        if (twofa_maybe_start_stepup(client, account))
+        if (twofa_maybe_start_stepup(client, account, "external"))
         {
             free_account(account);
             return 0;
@@ -3400,7 +3458,7 @@ static int authenticate_attempt(Client *client, int first, const char *param)
 
             /* If 2FA is enforced, withhold the success reply and ask the
              * client to do a second-factor SASL exchange. */
-            if (twofa_maybe_start_stepup(client, account))
+            if (twofa_maybe_start_stepup(client, account, "password"))
             {
                 /* Keep SaslType set so subsequent AUTHENTICATE messages
                  * keep flowing through this hook; the step-up handler
@@ -3695,6 +3753,29 @@ int twofa_count_credentials(long int account_id)
     if (sqlite3_prepare_v2(obsidian_db, sql, -1, &stmt, NULL) != SQLITE_OK)
         return -1;
     sqlite3_bind_int(stmt, 1, (int)account_id);
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        n = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return n;
+}
+
+/* Count 2FA credentials excluding a given type. Used by the step-up
+ * planner to answer "are there any factors I can demand that aren't the
+ * one the user just used as primary?". `exclude` may be NULL or "" to
+ * count everything. */
+static int twofa_count_credentials_excluding(long int account_id,
+                                             const char *exclude)
+{
+    const char *sql =
+        "SELECT COUNT(*) FROM account_2fa_credentials"
+        " WHERE account_id = ? AND type != ?";
+    sqlite3_stmt *stmt;
+    int n = 0;
+    if (!obsidian_db) return 0;
+    if (sqlite3_prepare_v2(obsidian_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)account_id);
+    sqlite3_bind_text(stmt, 2, exclude ? exclude : "", -1, SQLITE_STATIC);
     if (sqlite3_step(stmt) == SQLITE_ROW)
         n = sqlite3_column_int(stmt, 0);
     sqlite3_finalize(stmt);
@@ -4497,20 +4578,41 @@ CMD_FUNC(cmd_2fa)
 
 /* ----- SASL step-up integration ----- */
 
-/** Called after a first-factor SASL exchange has verified a password.
- *  If 2FA is enforced on the account, withholds 900/903 and emits
- *  AUTHENTICATE 2FA-REQUIRED instead.  Returns 1 if step-up was started
+/** Called after a first-factor SASL exchange has verified the user.
+ *  `primary_factor` names the credential type that just verified (so we
+ *  can exclude it when shopping for a step-up factor):
+ *
+ *    - "password" -- PLAIN/SCRAM authenticated.  All 2FA factor types
+ *                    are eligible step-up candidates (TOTP, WebAuthn,
+ *                    OAuth, external/cert).
+ *    - "oauth"    -- IRCV3BEARER / OAUTHBEARER authenticated; the
+ *                    bound oauth credential row IS what just verified
+ *                    primary.  Step-up still happens if the account
+ *                    has a non-oauth factor (TOTP/WebAuthn) -- the
+ *                    user explicitly enabled 2FA so they want belt-
+ *                    and-suspenders.  But if the only factor is OAuth
+ *                    itself, accept the primary as both factors and
+ *                    skip step-up; otherwise the user is locked out.
+ *    - "external" -- SASL EXTERNAL cert fingerprint matched.  Step-up
+ *                    via any non-external factor.
+ *
+ *  If 2FA is enforced AND a non-primary factor exists, withholds
+ *  900/903 and emits AUTHENTICATE 2FA-REQUIRED. Returns 1 in that case
  *  (caller MUST NOT log the user in or send 900/903), 0 otherwise. */
-static int twofa_maybe_start_stepup(Client *client, Account *acc)
+static int twofa_maybe_start_stepup(Client *client, Account *acc,
+                                    const char *primary_factor)
 {
     if (!acc || !acc->twofa_enabled)
         return 0;
+    /* Total cred count is 0: 2FA flagged on but DB-edited away. Degrade
+     * to first-factor only rather than permanently lock the user out. */
     if (twofa_count_credentials(acc->id) <= 0)
-    {
-        /* 2FA flagged on but no creds left: degrade to first-factor only.
-         * Avoids permanently locking the user out after manual DB edits. */
         return 0;
-    }
+    /* No factor of a type other than what we just used? Then the
+     * primary already proved the strongest thing the user has -- demanding
+     * the same proof again would only lock them out. */
+    if (twofa_count_credentials_excluding(acc->id, primary_factor) <= 0)
+        return 0;
 
     twofa_clear_stepup(client);
     TwoFAStepup *s = safe_alloc(sizeof(*s));
@@ -4520,6 +4622,101 @@ static int twofa_maybe_start_stepup(Client *client, Account *acc)
 
     sendto_one(client, NULL, ":%s AUTHENTICATE 2FA-REQUIRED", me.name);
     return 1;
+}
+
+/* Decode the buffered base64 SASL payload from an AUTHENTICATE 2FA-OAUTH
+ * exchange and either complete login (JWT path, sync) or kick off an
+ * async userinfo round-trip (opaque path). The (provider, subject) the
+ * bearer resolves to must be bound to s->account; otherwise SASL fails. */
+static void twofa_handle_stepup_oauth(Client *client, const char *full_b64)
+{
+    TwoFAStepup *s = TwoFAStepupGet(client);
+    if (!s || !s->active) {
+        sendnumeric(client, ERR_SASLFAIL);
+        DelSaslType(client);
+        return;
+    }
+    unsigned char buf[8192] = {0};
+    int n = EVP_DecodeBlock(buf, (const unsigned char *)full_b64,
+                            strlen(full_b64));
+    if (n <= 0) { sendnumeric(client, ERR_SASLFAIL); DelSaslType(client);
+                  twofa_clear_stepup(client); return; }
+    size_t plen = strlen(full_b64);
+    int real_pad = 0;
+    if (plen >= 1 && full_b64[plen - 1] == '=') real_pad++;
+    if (plen >= 2 && full_b64[plen - 2] == '=') real_pad++;
+    n -= real_pad;
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        sendnumeric(client, ERR_SASLFAIL); DelSaslType(client);
+        twofa_clear_stepup(client); return;
+    }
+    buf[n] = 0;
+
+    int nul1 = -1, nul2 = -1;
+    for (int i = 0; i < n; i++) {
+        if (buf[i] == 0) {
+            if (nul1 < 0) nul1 = i;
+            else if (nul2 < 0) { nul2 = i; break; }
+        }
+    }
+    if (nul1 < 0 || nul2 < 0 || nul2 + 1 >= n) {
+        sendnumeric(client, ERR_SASLFAIL); DelSaslType(client);
+        twofa_clear_stepup(client); return;
+    }
+    const char *authzid = (const char *)buf;
+    const char *type    = (const char *)(buf + nul1 + 1);
+    const char *token   = (const char *)(buf + nul2 + 1);
+
+    if (!strcmp(type, "opaque")) {
+        if (!*authzid) {
+            sendnumeric(client, ERR_SASLFAIL); DelSaslType(client);
+            twofa_clear_stepup(client); return;
+        }
+        OAuthProvider *prov = oauth_find_provider(authzid);
+        if (!prov || !prov->loaded || !prov->userinfo_url) {
+            sendnumeric(client, ERR_SASLFAIL); DelSaslType(client);
+            twofa_clear_stepup(client); return;
+        }
+        oauth_stepup_opaque_async(client, prov, token, s->account);
+        /* deliberate: TwoFAStepup state stays alive until callback fires */
+        return;
+    }
+    if (strcmp(type, "oauth2") && strcmp(type, "jwt")) {
+        sendnumeric(client, ERR_SASLFAIL); DelSaslType(client);
+        twofa_clear_stepup(client); return;
+    }
+    /* JWT path -- validate locally against JWKS, check the resulting
+     * (provider, subject) is bound to s->account. */
+    OAuthProvider *prov = NULL;
+    char *subject = oauth_validate_jwt(token, &prov);
+    if (!subject) {
+        sendnumeric(client, ERR_SASLFAIL); DelSaslType(client);
+        twofa_clear_stepup(client); return;
+    }
+    long bound = oauth_lookup_account_by_credential(prov->name, subject);
+    Account *acc = find_account(s->account);
+    int ok = acc && bound == acc->id;
+    if (!ok) {
+        safe_free(subject);
+        if (acc) free_account(acc);
+        sendnumeric(client, ERR_SASLFAIL); DelSaslType(client);
+        twofa_clear_stepup(client); return;
+    }
+    strlcpy(client->user->account, acc->name, sizeof(client->user->account));
+    user_account_login(NULL, client);
+    if (!IsDead(client)) {
+        client->local->sasl_complete = 1;
+        sendnumeric(client, RPL_SASLSUCCESS);
+    }
+    DelSaslType(client);
+    twofa_clear_stepup(client);
+    unreal_log(ULOG_INFO, "account", "SASL_LOGIN", client,
+               "SASL+2FA-OAUTH login for $client.details "
+               "[account: $account] [provider: $provider]",
+               log_data_string("account", acc->name),
+               log_data_string("provider", prov->name));
+    free_account(acc);
+    safe_free(subject);
 }
 
 /** Handle an AUTHENTICATE message in the TOTP step-up phase.
@@ -4544,6 +4741,27 @@ static int twofa_handle_stepup_authenticate(Client *client, const char *param)
     {
         SetSaslType(client, SASL_TYPE_TOTP_STEPUP);
         sendto_one(client, NULL, ":%s AUTHENTICATE +", me.name);
+        return 1;
+    }
+    /* Mechanism selection: client sends "AUTHENTICATE 2FA-OAUTH" --
+     * the second-factor variant of OAUTHBEARER/IRCV3BEARER. Wire format
+     * mirrors IRCV3BEARER: [authzid]\0<token_type>\0<token>, chunked.
+     * Server validates the bearer (locally for jwt, async-userinfo for
+     * opaque) and only accepts it if the resulting (provider, subject)
+     * matches a credential row already bound to s->account. */
+    if (!strcasecmp(param, "2FA-OAUTH"))
+    {
+        SetSaslType(client, SASL_TYPE_OAUTH_STEPUP);
+        oauth_sasl_clear(client);
+        sendto_one(client, NULL, ":%s AUTHENTICATE +", me.name);
+        return 1;
+    }
+    if (GetSaslType(client) == SASL_TYPE_OAUTH_STEPUP)
+    {
+        const char *full = oauth_sasl_accumulate(client, param);
+        if (!full) return 1;       /* still chunking */
+        twofa_handle_stepup_oauth(client, full);
+        oauth_sasl_clear(client);
         return 1;
     }
 
