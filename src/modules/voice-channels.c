@@ -485,6 +485,8 @@ MOD_TEST()
 
 MOD_INIT()
 {
+	MARK_AS_OFFICIAL_MODULE(modinfo);
+
 	const char *env = getenv("VOICE_BRIDGE_SOCKET");
 	if (env && *env && !cfg_bridge_socket)
 		safe_strdup(cfg_bridge_socket, env);

@@ -60,6 +60,8 @@ MOD_INIT()
 {
 	ClientCapabilityInfo cap;
 
+	MARK_AS_OFFICIAL_MODULE(modinfo);
+
 	memset(&cap, 0, sizeof(cap));
 	cap.name = NAMED_MODES_CAP;
 	ClientCapabilityAdd(modinfo->handle, &cap, &CAP_NAMED_MODES);

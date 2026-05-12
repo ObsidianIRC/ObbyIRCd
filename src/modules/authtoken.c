@@ -1196,6 +1196,8 @@ MOD_INIT()
 {
 	ClientCapabilityInfo cap;
 
+	MARK_AS_OFFICIAL_MODULE(modinfo);
+
 	memset(&cap, 0, sizeof(cap));
 	cap.name = "draft/authtoken";
 	ClientCapabilityAdd(modinfo->handle, &cap, &CAP_AUTHTOKEN);

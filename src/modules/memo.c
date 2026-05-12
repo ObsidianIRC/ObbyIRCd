@@ -52,6 +52,8 @@ CMD_FUNC(cmd_memo);
 
 MOD_INIT()
 {
+    MARK_AS_OFFICIAL_MODULE(modinfo);
+
     if (sqlite3_open(OBSIDIAN_DB, &memo_db) != SQLITE_OK)
     {
         config_error("memo: could not open obsidian.db at %s", OBSIDIAN_DB);

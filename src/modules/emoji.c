@@ -64,6 +64,7 @@ MOD_TEST()
 
 MOD_INIT()
 {
+	MARK_AS_OFFICIAL_MODULE(modinfo);
 	emoji_modhandle = modinfo->handle;
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, emoji_configrun);
 	return MOD_SUCCESS;
