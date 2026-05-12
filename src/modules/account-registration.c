@@ -110,6 +110,14 @@ static int  twofa_handle_stepup_authenticate(Client *client, const char *param);
 static const char *twofa_capability_parameter(Client *client);
 static int  twofa_capability_visible(Client *client);
 static void twofa_clear_stepup(Client *c);
+/* Registration-timeout extension: when SASL is mid-flight (especially
+ * during a 2FA step-up where the user is fishing their phone out of
+ * a pocket or completing an OAuth consent screen) the default 40s
+ * handshake timeout fires before they can finish. The sasl_timeout
+ * event (now 300s default) is the real ceiling; this hook just stops
+ * the handshake_timeout event from racing it. */
+static int  accreg_pre_local_handshake_timeout(Client *client,
+                                               const char **comment);
 
 /* WebAuthn forward decls (impl in webauthn section below) */
 typedef struct WebAuthnSaslState_
@@ -397,6 +405,11 @@ MOD_INIT()
     /* Built-in SASL hooks */
     HookAddConstString(modinfo->handle, HOOKTYPE_SASL_MECHS, 0, saslmechs);
     HookAdd(modinfo->handle, HOOKTYPE_SASL_AUTHENTICATE, 0, authenticate_attempt);
+
+    /* Veto the handshake timeout for clients mid-SASL (2FA, OAuth, etc.)
+     * so they don't get killed for being slow on a multi-step auth. */
+    HookAdd(modinfo->handle, HOOKTYPE_PRE_LOCAL_HANDSHAKE_TIMEOUT, 0,
+            accreg_pre_local_handshake_timeout);
 
     /* Async HTTP callback for opaque-token (userinfo) validation. */
     RegisterApiCallbackWebResponse(modinfo->handle,
@@ -3887,6 +3900,35 @@ static void twofa_clear_stepup(Client *c)
         safe_free(s);
         TwoFAStepupSet(c, NULL);
     }
+}
+
+/* HOOKTYPE_PRE_LOCAL_HANDSHAKE_TIMEOUT.
+ *
+ * The handshake timeout (set::handshake-timeout, default 40s) races the
+ * SASL timeout (set::sasl-timeout, default 300s) when the user is in
+ * the middle of an interactive auth step -- 2FA TOTP prompt, WebAuthn
+ * gesture, OAuth consent flow. We tell ircd to skip the registration
+ * kill while a SASL session is in flight; sasl_timeout remains the
+ * real ceiling so we don't leak a stalled handshake forever.
+ *
+ * We also extend during an active 2FA step-up even after the primary
+ * SASL frame succeeded -- on UnrealIRCd's model that's a separate
+ * AUTHENTICATE round-trip and the user is the one slowing things down. */
+static int accreg_pre_local_handshake_timeout(Client *client,
+                                              const char **comment)
+{
+    int saslType = GetSaslType(client);
+    TwoFAStepup *stepup = TwoFAStepupGet(client);
+
+    if ((saslType && saslType != SASL_TYPE_NONE) ||
+        (stepup && stepup->active))
+    {
+        if (comment)
+            *comment = "Authentication in progress";
+        return HOOK_ALLOW;
+    }
+
+    return HOOK_CONTINUE;
 }
 
 /* ----- Helpers ----- */
