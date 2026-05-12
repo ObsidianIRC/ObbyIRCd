@@ -78,7 +78,6 @@ MOD_TEST()
 MOD_INIT()
 {
 	MARK_AS_OFFICIAL_MODULE(modinfo);
-	MARK_AS_GLOBAL_MODULE(modinfo);
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, reqmods_configrun);
 	HookAdd(modinfo->handle, HOOKTYPE_SERVER_CONNECT, 0, reqmods_hook_serverconnect);
 	CommandAdd(modinfo->handle, MSG_SMOD, cmd_smod, MAXPARA, CMD_SERVER);
