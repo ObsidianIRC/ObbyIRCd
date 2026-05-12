@@ -87,6 +87,8 @@ MOD_INIT()
 {
 	MessageTagHandlerInfo mtag;
 
+	MARK_AS_OFFICIAL_MODULE(modinfo);
+
 	RegisterApiCallbackWebResponse(modinfo->handle, "link_preview_download_complete", link_preview_download_complete);
 	RegisterApiCallbackWebResponse(modinfo->handle, "image_upload_complete", image_upload_complete);
 	HookAdd(modinfo->handle, HOOKTYPE_CHANMSG, 0, link_preview_chanmsg);

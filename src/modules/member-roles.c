@@ -123,6 +123,7 @@ MOD_INIT()
 {
 	ExtbanInfo extban_req;
 
+	MARK_AS_OFFICIAL_MODULE(modinfo);
 	MARK_AS_GLOBAL_MODULE(modinfo);
 	member_roles_modhandle = modinfo->handle;
 	
