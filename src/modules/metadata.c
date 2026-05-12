@@ -409,7 +409,6 @@ MOD_INIT() {
 	ModDataInfo mreq;
 	
 	MARK_AS_OFFICIAL_MODULE(modinfo);
-	MARK_AS_GLOBAL_MODULE(modinfo);
 
 	memset(&cap, 0, sizeof(cap));
 	cap.name = "draft/metadata-2";
