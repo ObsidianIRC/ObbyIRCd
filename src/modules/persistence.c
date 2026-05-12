@@ -112,6 +112,7 @@ static int persist_db_dirty = 0;
 /* Command overrides for session clients */
 static CommandOverride *ovr_privmsg = NULL;
 static CommandOverride *ovr_notice = NULL;
+static CommandOverride *ovr_tagmsg = NULL;
 static CommandOverride *ovr_join = NULL;
 static CommandOverride *ovr_part = NULL;
 static CommandOverride *ovr_away = NULL;
@@ -262,6 +263,12 @@ MOD_LOAD()
 	/* Command overrides: proxy session client commands through canonical */
 	ovr_privmsg = CommandOverrideAdd(modinfo->handle, "PRIVMSG", 0, session_msg_override);
 	ovr_notice = CommandOverrideAdd(modinfo->handle, "NOTICE", 0, session_msg_override);
+	/* TAGMSG goes through its own handler (not PRIVMSG), so it needs its
+	 * own override; otherwise a session client's TAGMSG to a channel the
+	 * canonical is in trips ERR_CANNOTSENDTOCHAN. The most visible
+	 * symptom is the voice-channels rtc TAGMSG hitting +n on ^/$
+	 * channels for any authenticated user. */
+	ovr_tagmsg = CommandOverrideAdd(modinfo->handle, "TAGMSG", 0, session_msg_override);
 	ovr_join = CommandOverrideAdd(modinfo->handle, "JOIN", 0, session_join_override);
 	ovr_part = CommandOverrideAdd(modinfo->handle, "PART", 0, session_part_override);
 	ovr_away = CommandOverrideAdd(modinfo->handle, "AWAY", 0, session_away_override);
