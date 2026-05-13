@@ -1851,6 +1851,17 @@ CMD_FUNC(cmd_cregister)
 		do_mode(channel, &me, NULL, 2, modeargs, 0, 0);
 	}
 
+	/* Set +r so the channel advertises itself as registered to clients
+	 * and other servers. We set it as &me so the server-only enforcement
+	 * (services-only mode) doesn't reject the change. */
+	if (!has_channel_mode(channel, 'r'))
+	{
+		const char *modeargs[3];
+		modeargs[0] = "+r";
+		modeargs[1] = NULL;
+		do_mode(channel, &me, NULL, 2, modeargs, 0, 0);
+	}
+
 	/* Persist the registration. */
 	reg = safe_alloc(sizeof(ChannelRegistration));
 	safe_strdup(reg->registered_by, account);
