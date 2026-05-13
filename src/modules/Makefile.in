@@ -104,7 +104,10 @@ MODULES= \
 	named-modes.so \
 	member-roles.so \
 	memo.so \
-	voice-channels.so
+	voice-channels.so \
+	redact.so \
+	react.so \
+	channel-rename.so
 
 MODULEFLAGS=@MODULEFLAGS@
 RM=@RM@
