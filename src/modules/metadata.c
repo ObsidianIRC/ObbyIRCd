@@ -213,7 +213,7 @@ struct metadata_settings_s {
 } metadata_settings;
 
 ModuleHeader MOD_HEADER = {
-	"third/metadata-2",
+	"metadata",
 	"6.0",
 	"draft/metadata-2 and draft/metadata-notify-2 cap",
 	"k4be",
