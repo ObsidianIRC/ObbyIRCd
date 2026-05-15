@@ -448,7 +448,7 @@ typedef enum ClientStatus {
 #define CLIENT_FLAG_IPV6			0x800000000	/**< client is using IPv6 */
 /** @} */
 
-#define OPER_SNOMASKS "+bBcdfkqsSoO"
+#define OPER_SNOMASKS "+bBcdfxkqsSoO"
 
 #define SEND_UMODES (SendUmodes)
 #define ALL_UMODES (AllUmodes)
@@ -1808,7 +1808,6 @@ struct ConfigItem_allow {
 	int port;
 	ConfigItem_class *class;
 	ConfigFlag_allow flags;
-	int ipv6_clone_mask;
 };
 
 struct OperClassACLPath

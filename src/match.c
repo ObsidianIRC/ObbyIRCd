@@ -879,3 +879,123 @@ void badword_config_free(ConfigItem_badword *e)
 		pcre2_code_free(e->pcre2_expr);
 	safe_free(e);
 }
+
+/** Mask the lower bits of an IPv6 raw address.
+ *
+ * Bits past 'prefix' are zeroed, leaving only the upper 'prefix' bits set
+ * to whatever they were in 'src'.
+ *
+ * @param src    16-byte source raw IPv6 address.
+ * @param prefix Prefix length in bits (0-128).
+ * @param dst    16-byte destination buffer (may alias src).
+ */
+void mask_ipv6_rawip(const char *src, int prefix, char *dst)
+{
+	int full_bytes, leftover_bits;
+
+	if (prefix < 0)
+		prefix = 0;
+	else if (prefix > 128)
+		prefix = 128;
+
+	full_bytes = prefix / 8;
+	leftover_bits = prefix % 8;
+
+	if (src != dst)
+		memcpy(dst, src, 16);
+
+	if (leftover_bits > 0 && full_bytes < 16)
+	{
+		unsigned char mask = (unsigned char)(0xFF << (8 - leftover_bits));
+		dst[full_bytes] = (char)((unsigned char)src[full_bytes] & mask);
+		full_bytes++;
+	}
+
+	if (full_bytes < 16)
+		memset(dst + full_bytes, 0, 16 - full_bytes);
+}
+
+/** Get the IP address string of a client, masked according to
+ * set::default-ipv6-clone-mask.
+ *
+ * For IPv4 clients: returns client->ip unchanged (no masking applies).
+ * For IPv6 clients: returns the canonical form with bits past
+ *   iConf.default_ipv6_clone_mask zeroed (e.g., "2001:db8:1:2::" for /64).
+ *
+ * Useful for any per-host bookkeeping that should treat all addresses
+ * within a /N as a single "host" — maxperip, connect-flood, reputation, etc.
+ *
+ * @param client The client.
+ * @param buf    Output buffer.
+ * @param buflen Length of buf (recommended: HOSTLEN+1 or larger).
+ * @return       Pointer to buf on success, or NULL on failure.
+ */
+const char *get_clone_mask_ipstr(Client *client, char *buf, size_t buflen)
+{
+	char masked[16];
+
+	if (!client || !client->ip || !buf || buflen == 0)
+		return NULL;
+
+	if (!IsIPV6(client))
+	{
+		strlcpy(buf, client->ip, buflen);
+		return buf;
+	}
+
+	mask_ipv6_rawip(client->rawip, iConf.default_ipv6_clone_mask, masked);
+	return inetntop(AF_INET6, masked, buf, buflen);
+}
+
+/** Format a user-facing reject message for an IPv6 prefix-aware rejection.
+ *
+ * Substitutes $prefix_addr (compressed IPv6 form, e.g. "2001:db8::") and
+ * $prefix_len (decimal) into the supplied template via buildvarstring.
+ *
+ * Used by both maxperip (for /N clone-cap rejections) and connthrottle
+ * (for /56/48/32 wider-prefix rejections).
+ *
+ * Returns a pointer to internal static storage, overwritten on each call.
+ *
+ * @param template     The message template (typically iConf.reject_message_*).
+ * @param masked_rawip 16-byte masked raw IPv6 address.
+ * @param prefix       Prefix length in bits.
+ * @return             Formatted message in static buffer.
+ */
+const char *format_ipv6_prefix_reject_message(const char *template,
+                                              const char *masked_rawip,
+                                              int prefix)
+{
+	static char buf[512];
+	char prefix_len_str[16];
+	char addr_str[128]; /* generously oversized; longest IPv6 string form is ~46 chars */
+	const char *vars[3], *values[3];
+
+	if (!inet_ntop(AF_INET6, masked_rawip, addr_str, sizeof(addr_str)))
+		strlcpy(addr_str, "?", sizeof(addr_str));
+	ircsnprintf(prefix_len_str, sizeof(prefix_len_str), "%d", prefix);
+	vars[0] = "prefix_addr";
+	values[0] = addr_str;
+	vars[1] = "prefix_len";
+	values[1] = prefix_len_str;
+	vars[2] = NULL;
+	values[2] = NULL;
+	buildvarstring(template, buf, sizeof(buf), vars, values);
+	return buf;
+}
+
+/** Format an IPv6 raw address as a compressed string (e.g. "2001:db8::").
+ *
+ * Returns a pointer to internal static storage, overwritten on each call.
+ *
+ * @param rawip 16-byte raw IPv6 address.
+ * @return      inet_ntop result, or "?" on failure.
+ */
+const char *format_ipv6_addr(const char *rawip)
+{
+	static char buf[128]; /* generously oversized; longest IPv6 string form is ~46 chars */
+
+	if (!inet_ntop(AF_INET6, rawip, buf, sizeof(buf)))
+		strlcpy(buf, "?", sizeof(buf));
+	return buf;
+}

@@ -1783,6 +1783,8 @@ void free_iConf(Configuration *i)
 	safe_free_security_group(i->spamfilter_except);
 	safe_free(i->spamexcept_line);
 	safe_free(i->reject_message_too_many_connections);
+	safe_free(i->reject_message_too_many_connections_ipv6_range);
+	safe_free(i->reject_message_too_many_new_connections_ipv6_range);
 	safe_free(i->reject_message_server_full);
 	safe_free(i->reject_message_unauthorized);
 	safe_free(i->reject_message_kline);
@@ -1808,6 +1810,9 @@ void free_iConf(Configuration *i)
 		free_floodsettings(f);
 	}
 	i->floodsettings = NULL;
+
+	free_log_throttle_config(i->log_throttle);
+	i->log_throttle = NULL;
 
 	/* And zero out everything, too easy to make a mistake above. */
 	memset(i, 0, sizeof(Configuration));
@@ -1893,6 +1898,15 @@ void config_setdefaultsettings(Configuration *i)
 	config_parse_flood_generic("90:1000", i, "unknown-users", FLD_LAG_PENALTY); /* 90 bytes / 1000 msec */
 	config_parse_flood_generic("7:1500", i, "unknown-users", FLD_MULTILINE); /* max-lines=7, max-bytes=1500 */
 
+	add_log_throttle_config(&i->log_throttle, "CONNTHROTTLE_IPV6_LIMIT", 100, 60, 0);
+	add_log_throttle_config(&i->log_throttle, "MAXPERIP_LIMIT", 100, 60, 0);
+	add_log_throttle_config(&i->log_throttle, "BUG_CT_CHECK_DRIFT", 5, 60, 0);
+	add_log_throttle_config(&i->log_throttle, "BUG_CT_CHECK_NO_BUCKET", 5, 60, 0);
+	add_log_throttle_config(&i->log_throttle, "BUG_CT_CHECK_NO_IP", 5, 60, 0);
+	add_log_throttle_config(&i->log_throttle, "BUG_CT_BUCKET_MISSING", 5, 60, 0);
+	add_log_throttle_config(&i->log_throttle, "BUG_CT_NEGATIVE_COUNTER", 5, 60, 0);
+	add_log_throttle_config(&i->log_throttle, "BUG_DECREASE_IPUSERS_BUCKET", 5, 60, 0);
+
 	/* TLS options */
 	i->tls_options = safe_alloc(sizeof(TLSOptions));
 	snprintf(tmp, sizeof(tmp), "%s/tls/curl-ca-bundle.crt", CONFDIR);
@@ -1915,7 +1929,9 @@ void config_setdefaultsettings(Configuration *i)
 	i->outdated_tls_policy_oper = POLICY_DENY;
 	i->outdated_tls_policy_server = POLICY_DENY;
 
-	safe_strdup(i->reject_message_too_many_connections, "Too many connections from your IP");
+	safe_strdup(i->reject_message_too_many_connections, "Too many connections from your IP [maxperip]");
+	safe_strdup(i->reject_message_too_many_connections_ipv6_range, "Too many connections from your IPv6 range ($prefix_addr/$prefix_len) [maxperip]");
+	safe_strdup(i->reject_message_too_many_new_connections_ipv6_range, "Too many new connections from this IPv6 range ($prefix_addr/$prefix_len) [connthrottle]");
 	safe_strdup(i->reject_message_server_full, "This server is full");
 	safe_strdup(i->reject_message_unauthorized, "You are not authorized to connect to this server");
 	safe_strdup(i->reject_message_kline, "You are not welcome on this server. $bantype: $banreason. Email $klineaddr for more information.");
@@ -2917,6 +2933,7 @@ void config_switchover(void)
 	memcpy(&iConf, &tempiConf, sizeof(iConf));
 	memset(&tempiConf, 0, sizeof(tempiConf));
 	log_blocks_switchover();
+	log_throttle_rehash();
 }
 
 /** Priority of config blocks during CONFIG_TEST stage */
@@ -6036,7 +6053,6 @@ int	_conf_allow(ConfigFile *conf, ConfigEntry *ce)
 		}
 	}
 	allow = safe_alloc(sizeof(ConfigItem_allow));
-	allow->ipv6_clone_mask = tempiConf.default_ipv6_clone_mask;
 	allow->match = safe_alloc(sizeof(SecurityGroup));
 
 	for (cep = ce->items; cep; cep = cep->next)
@@ -6063,15 +6079,6 @@ int	_conf_allow(ConfigFile *conf, ConfigEntry *ce)
 			safe_strdup(allow->server, cep->value);
 		else if (!strcmp(cep->name, "redirect-port"))
 			allow->port = atoi(cep->value);
-		else if (!strcmp(cep->name, "ipv6-clone-mask"))
-		{
-			/*
-			 * If this item isn't set explicitly by the
-			 * user, the value will temporarily be
-			 * zero. Defaults are applied in config_run_blocks().
-			 */
-			allow->ipv6_clone_mask = atoi(cep->value);
-		}
 		else if (!strcmp(cep->name, "options"))
 		{
 			for (cepp = cep->items; cepp; cepp = cepp->next)
@@ -6228,27 +6235,10 @@ int	_test_allow(ConfigFile *conf, ConfigEntry *ce)
 		}
 		else if (!strcmp(cep->name, "ipv6-clone-mask"))
 		{
-			/* keep this in sync with _test_set() */
-			int ipv6mask;
-			ipv6mask = atoi(cep->value);
-			if (ipv6mask == 0)
-			{
-				config_error("%s:%d: allow::ipv6-clone-mask given a value of zero. This cannnot be correct, as it would treat all IPv6 hosts as one host.",
-					     cep->file->filename, cep->line_number);
-				errors++;
-			}
-			if (ipv6mask > 128)
-			{
-				config_error("%s:%d: set::default-ipv6-clone-mask was set to %d. The maximum value is 128.",
-					     cep->file->filename, cep->line_number,
-					     ipv6mask);
-				errors++;
-			}
-			if (ipv6mask <= 32)
-			{
-				config_warn("%s:%d: allow::ipv6-clone-mask was given a very small value.",
-					    cep->file->filename, cep->line_number);
-			}
+			config_error("%s:%d: allow::ipv6-clone-mask has no effect. "
+			             "Use the global set::default-ipv6-clone-mask setting instead.",
+			             cep->file->filename, cep->line_number);
+			errors++;
 		}
 		else if (!strcmp(cep->name, "password"))
 		{
@@ -8169,6 +8159,23 @@ int	_conf_set(ConfigFile *conf, ConfigEntry *ce)
 				}
 			}
 		}
+		else if (!strcmp(cep->name, "log-throttle"))
+		{
+			for (cepp = cep->items; cepp; cepp = cepp->next)
+			{
+				if (!cepp->name || !cepp->value)
+					continue;
+				if (!strcmp(cepp->value, "unlimited") || !strcmp(cepp->value, "max"))
+				{
+					add_log_throttle_config(&tempiConf.log_throttle, cepp->name, 0, 0, 1);
+				} else
+				{
+					int cnt = 0, period = 0;
+					config_parse_flood(cepp->value, &cnt, &period);
+					add_log_throttle_config(&tempiConf.log_throttle, cepp->name, cnt, period, 0);
+				}
+			}
+		}
 		else if (!strcmp(cep->name, "options")) {
 			for (cepp = cep->items; cepp; cepp = cepp->next) {
 				if (!strcmp(cepp->name, "hide-ulines")) {
@@ -8422,6 +8429,10 @@ int	_conf_set(ConfigFile *conf, ConfigEntry *ce)
 			{
 				if (!strcmp(cepp->name, "too-many-connections"))
 					safe_strdup(tempiConf.reject_message_too_many_connections, cepp->value);
+				else if (!strcmp(cepp->name, "too-many-connections-ipv6-range"))
+					safe_strdup(tempiConf.reject_message_too_many_connections_ipv6_range, cepp->value);
+				else if (!strcmp(cepp->name, "too-many-new-connections-ipv6-range"))
+					safe_strdup(tempiConf.reject_message_too_many_new_connections_ipv6_range, cepp->value);
 				else if (!strcmp(cepp->name, "server-full"))
 					safe_strdup(tempiConf.reject_message_server_full, cepp->value);
 				else if (!strcmp(cepp->name, "unauthorized"))
@@ -9354,6 +9365,40 @@ int	_test_set(ConfigFile *conf, ConfigEntry *ce)
 				            "https://www.unrealircd.org/docs/Anti-flood_settings");
 			}
 		}
+		else if (!strcmp(cep->name, "log-throttle"))
+		{
+			for (cepp = cep->items; cepp; cepp = cepp->next)
+			{
+				int cnt = 0, period = 0;
+				if (!cepp->name)
+					continue;
+				if (!cepp->value)
+				{
+					config_error("%s:%i: set::log-throttle::%s: missing value "
+					             "(need 'count:period' or 'unlimited')",
+						cepp->file->filename, cepp->line_number, cepp->name);
+					errors++;
+					continue;
+				}
+				if (!valid_event_id(cepp->name))
+				{
+					config_error("%s:%i: set::log-throttle::%s: invalid event_id name "
+					             "(must contain only uppercase A-Z, 0-9 and underscores)",
+						cepp->file->filename, cepp->line_number, cepp->name);
+					errors++;
+					continue;
+				}
+				if (!strcmp(cepp->value, "unlimited") || !strcmp(cepp->value, "max"))
+					continue;
+				if (!config_parse_flood(cepp->value, &cnt, &period) || (cnt < 1) || (period < 1))
+				{
+					config_error("%s:%i: set::log-throttle::%s: invalid value '%s'. "
+					             "Syntax is '<count>:<period>' (eg 100:60), or 'unlimited'",
+						cepp->file->filename, cepp->line_number, cepp->name, cepp->value);
+					errors++;
+				}
+			}
+		}
 		else if (!strcmp(cep->name, "options")) {
 			for (cepp = cep->items; cepp; cepp = cepp->next) {
 				if (!strcmp(cepp->name, "hide-ulines"))
@@ -9938,6 +9983,10 @@ int	_test_set(ConfigFile *conf, ConfigEntry *ce)
 				if (!strcmp(cepp->name, "password-mismatch"))
 					;
 				else if (!strcmp(cepp->name, "too-many-connections"))
+					;
+				else if (!strcmp(cepp->name, "too-many-connections-ipv6-range"))
+					;
+				else if (!strcmp(cepp->name, "too-many-new-connections-ipv6-range"))
 					;
 				else if (!strcmp(cepp->name, "server-full"))
 					;
