@@ -1212,8 +1212,102 @@ MOD_INIT()
 	return MOD_SUCCESS;
 }
 
+/* ===================================================================
+ * authtoken.validate JSON-RPC method
+ *
+ * Mirrors the in-band TOKEN VALIDATE command for HTTP backends that
+ * already talk JSON-RPC to obbyircd (hosted-backend's filehost
+ * uploader). Single-use: the token is consumed on validate, identical
+ * to the IRC path.
+ *
+ * Input params:
+ *   service  string  (required)
+ *   url      string  (required)
+ *   token    string  (required)
+ *
+ * Success response:
+ *   { service, url, claims: { account?, nick?, scope?,
+ *                             member_of?, operator_of? } }
+ *
+ * Errors:
+ *   -32602 INVALID_PARAMS  missing required field
+ *   -32602 INVALID_PARAMS  "token rejected" (covers wrong service,
+ *                          wrong url, unknown token, expired)
+ *   -32602 INVALID_PARAMS  "service not configured"
+ * =================================================================== */
+static void rpc_authtoken_validate(Client *client, json_t *request, json_t *params)
+{
+	const char *service_name = NULL;
+	const char *url = NULL;
+	const char *token_str = NULL;
+	AuthService *svc;
+	AuthToken *tok;
+	json_t *result;
+	json_t *claims;
+
+	REQUIRE_PARAM_STRING("service", service_name);
+	REQUIRE_PARAM_STRING("url", url);
+	REQUIRE_PARAM_STRING("token", token_str);
+
+	svc = find_authservice(service_name);
+	if (!svc)
+	{
+		rpc_error(client, request, JSON_RPC_ERROR_INVALID_PARAMS,
+		          "service not configured");
+		return;
+	}
+
+	if (strcmp(svc->url, url) != 0)
+	{
+		rpc_error(client, request, JSON_RPC_ERROR_INVALID_PARAMS,
+		          "token rejected");
+		return;
+	}
+
+	tok = find_and_unlink_token(token_str);
+	if (!tok)
+	{
+		rpc_error(client, request, JSON_RPC_ERROR_INVALID_PARAMS,
+		          "token rejected");
+		return;
+	}
+
+	if (strcasecmp(tok->service_key, service_name) != 0 ||
+	    strcmp(tok->service_url, url) != 0)
+	{
+		/* Token belonged to a different service. Already unlinked
+		 * (single-use is single-use); just refuse. */
+		free_token(tok);
+		rpc_error(client, request, JSON_RPC_ERROR_INVALID_PARAMS,
+		          "token rejected");
+		return;
+	}
+
+	result = json_object();
+	json_object_set_new(result, "service", json_string(tok->service_key));
+	json_object_set_new(result, "url", json_string(tok->service_url));
+	claims = json_object();
+	if (tok->account && *tok->account)
+		json_object_set_new(claims, "account", json_string(tok->account));
+	if (tok->nick && *tok->nick)
+		json_object_set_new(claims, "nick", json_string(tok->nick));
+	if (tok->scope && *tok->scope)
+		json_object_set_new(claims, "scope", json_string(tok->scope));
+	if (tok->member_of && *tok->member_of)
+		json_object_set_new(claims, "member_of", json_string(tok->member_of));
+	if (tok->operator_of && *tok->operator_of)
+		json_object_set_new(claims, "operator_of", json_string(tok->operator_of));
+	json_object_set_new(result, "claims", claims);
+
+	rpc_response(client, request, result);
+	json_decref(result);
+	free_token(tok);
+}
+
 MOD_LOAD()
 {
+	RPCHandlerInfo r;
+
 	/* draft/AUTHTOKEN ISUPPORT (no value per spec) */
 	ISupportAdd(modinfo->handle, "draft/AUTHTOKEN", NULL);
 
@@ -1233,6 +1327,17 @@ MOD_LOAD()
 	EventAdd(modinfo->handle, "authtoken_cleanup",
 	         authtoken_cleanup_event, NULL,
 	         AT_CLEANUP_INTERVAL_MS, 0);
+
+	memset(&r, 0, sizeof(r));
+	r.method = "authtoken.validate";
+	r.loglevel = ULOG_DEBUG;
+	r.call = rpc_authtoken_validate;
+	if (!RPCHandlerAdd(modinfo->handle, &r))
+	{
+		config_error("[authtoken] Could not register "
+		             "authtoken.validate RPC handler");
+		return MOD_FAILED;
+	}
 
 	return MOD_SUCCESS;
 }

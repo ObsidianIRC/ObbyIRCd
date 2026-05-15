@@ -659,12 +659,9 @@ int history_chanmsg(Client *client, Channel *channel, int sendflags, const char 
 	if (!HistoryEnabled(channel))
 		return 0;
 
-	/* Filter out CTCP / CTCP REPLY */
-	if ((*text == '\001') && strncmp(text+1, "ACTION", 6))
-		return 0;
-
-	/* Filter out TAGMSG */
-	if (sendtype == SEND_TYPE_TAGMSG)
+	/* Filter out CTCP / CTCP REPLY (but allow ACTION).  TAGMSGs
+	 * carry no text, so guard the dereference. */
+	if (text && (*text == '\001') && strncmp(text+1, "ACTION", 6))
 		return 0;
 
 	/* Lazy: if any prefix is addressed (eg: @#channel) then don't record it.
@@ -678,11 +675,22 @@ int history_chanmsg(Client *client, Channel *channel, int sendflags, const char 
 	else
 		strlcpy(source, client->name, sizeof(source));
 
-	snprintf(buf, sizeof(buf), ":%s %s %s :%s",
-		source,
-		sendtype_to_cmd(sendtype),
-		channel->name,
-		text);
+	/* TAGMSGs have no message body; recording them as
+	 * `:source TAGMSG #chan :` produces a stray empty trailing param
+	 * on playback, so format them bodyless to match the on-wire form. */
+	if (sendtype == SEND_TYPE_TAGMSG)
+	{
+		snprintf(buf, sizeof(buf), ":%s TAGMSG %s",
+			source, channel->name);
+	}
+	else
+	{
+		snprintf(buf, sizeof(buf), ":%s %s %s :%s",
+			source,
+			sendtype_to_cmd(sendtype),
+			channel->name,
+			text ? text : "");
+	}
 
 	history_add(channel->name, mtags, buf);
 
@@ -741,6 +749,38 @@ int history_join(Client *client, Channel *channel, MessageTag *mtags)
 		r = history_request(channel->name, &filter);
 		if (r)
 		{
+			/* Strip TAGMSGs from the +H playback list.  Stored
+			 * TAGMSGs replay through CHATHISTORY (cap-negotiated
+			 * clients) but legacy clients getting join-history
+			 * shouldn't see the bare `:source TAGMSG #chan` line
+			 * -- it'd render as cruft if their client even shows
+			 * it. */
+			HistoryLogLine *l = r->log;
+			HistoryLogLine *prev = NULL;
+			while (l)
+			{
+				HistoryLogLine *next = l->next;
+				const char *p = strchr(l->line, ' ');
+				int is_tagmsg = p && !strncmp(p + 1, "TAGMSG ", 7);
+				if (is_tagmsg)
+				{
+					if (prev)
+						prev->next = next;
+					else
+						r->log = next;
+					if (l == r->log_tail)
+						r->log_tail = prev;
+					r->num_lines--;
+					r->num_bytes -= l->num_bytes;
+					free_message_tags(l->mtags);
+					safe_free(l);
+				}
+				else
+				{
+					prev = l;
+				}
+				l = next;
+			}
 			history_send_result(client, r);
 			free_history_result(r);
 		}
