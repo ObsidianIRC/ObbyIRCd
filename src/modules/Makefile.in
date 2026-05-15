@@ -94,6 +94,7 @@ MODULES= \
 	guest-nicks.so \
 	obbyscript.so \
 	metadata.so \
+	metadata-db.so \
 	filehost.so \
 	authtoken.so \
 	smtp.so \
@@ -107,7 +108,8 @@ MODULES= \
 	voice-channels.so \
 	redact.so \
 	react.so \
-	channel-rename.so
+	channel-rename.so \
+	draft-ai-tools.so
 
 MODULEFLAGS=@MODULEFLAGS@
 RM=@RM@
