@@ -1,17 +1,103 @@
-UnrealIRCd 6.2.5-git
-=====================
+UnrealIRCd 6.2.5
+=================
 
-This is the git version (development version) for future UnrealIRCd 6.2.5.
-This is work in progress and may not always be a stable version.
+This UnrealIRCd 6.2.5 release is mostly about improving IPv6 clone
+detection. If your IRC network has IPv6 connectivity then hot-patching
+without restart (see below), or upgrading, is highly recommended.
+If you don't have IPv6 then this release is less important.
+
+Without this, a user with IPv6 connectivity (e.g. a typical
+residential connection) can connect thousands of clones using
+their /64 prefix, bypassing per-host limits like `allow::maxperip`
+and `connect-flood`.
+
+If you run UnrealIRCd 6.2.x then you also have the option of using our
+**hot-patch**, which allows updating the server **without a restart**.  
+To do so, run: `./unrealircd hot-patch ipv6-clones`  
+For UnrealIRCd 6.2.3 and 6.2.4 this gives you nearly the same IPv6 clones
+protection as this 6.2.5 release. For UnrealIRCd 6.2.0/6.2.1/6.2.2 it will
+hot-patch only the maxperip /64 issue and not add the new connthrottle
+functionality.
+
+This release has been tested on a couple of networks with hundreds of users,
+without an impact on regular users, but it is still good to know these new
+limits.
 
 ### Enhancements:
+* [allow::maxperip](https://www.unrealircd.org/docs/Allow_block#maxperip)
+  and [connect-flood](https://www.unrealircd.org/docs/Anti-flood_settings#connect-flood)
+  now treat an IPv6 /64 as a single host
+  ([set::default-ipv6-clone-mask](https://www.unrealircd.org/docs/Set_block#set::default-ipv6-clone-mask)).
+  Since end users are typically allocated a whole /64, per-/128 counting
+  offered no real clone protection. We previously claimed to be doing this
+  already in the documentation, but in practice the setting was ignored.
+  A related unused option allow::ipv6-clone-mask has been removed and will
+  now raise an error.
+* [ConnThrottle](https://www.unrealircd.org/docs/Connthrottle) now has a
+  set::connthrottle::ipv6-unknown-users-limit (enabled by default).
+  This reduces the effect of an attacker launching many IPv6 clones at
+  a server. Users in the "known-users" security-group are exempt (by
+  default: identified to services, or
+  [reputation](https://www.unrealircd.org/docs/Reputation_score) of 25 or more).
+  Also exempt are users matching set::connthrottle::except or an
+  except ban with type maxperip.
+  * Difference from maxperip: maxperip counts everyone per /64. This counts
+    only unknown users and works on wider IPv6 prefixes (/56, /48 and /32).
+    So known users can connect while cloners are limited.
+* New [set::known-cloud-services](https://www.unrealircd.org/docs/Set_block#set::known-cloud-services)
+  (enabled by default) exempts large IRC platforms with stable
+  published IP ranges from [allow::maxperip](https://www.unrealircd.org/docs/Allow_block#maxperip)
+  and [connect-flood](https://www.unrealircd.org/docs/Anti-flood_settings#connect-flood).
+  Currently only IRCCloud qualifies. This is more reliable than the
+  `except ban { mask *.irccloud.com; ... }` block that `example.conf`
+  has shipped since 2023, as DNS can fail during outages or restarts.
+  The new maxperip and connthrottle limits make this even more important.
+  To disable, use: `set { known-cloud-services no; }`.
+* New [snomask](https://www.unrealircd.org/docs/Snomasks) `+x` for rejections
+  from [allow::maxperip](https://www.unrealircd.org/docs/Allow_block#maxperip)
+  and [ConnThrottle](https://www.unrealircd.org/docs/Connthrottle).
+  Included in the default oper snomask (unless overridden in
+  [set::snomask-on-oper](https://www.unrealircd.org/docs/Set_block#set::snomask-on-oper)
+  or [oper::snomask](https://www.unrealircd.org/docs/Oper_block#snomask)).
+* New [set::log-throttle](https://www.unrealircd.org/docs/Set_block#set::log-throttle):
+  suppresses high-rate events. This is on by default for the new `+x` rejections.
+* [ConnThrottle](https://www.unrealircd.org/docs/Connthrottle) now
+  also exempts users with an except ban of type `connect-flood` from
+  the new-users rate limit.
 
 ### Changes:
+* The maxperip and connthrottle rejection messages were changed to give
+  more information about the IPv6 range limitation and now include the
+  text `[maxperip]` or `[connthrottle]` so you can see which limit is hit.
 * Update shipped libs: Sodium (1.0.22)
+* The event names `CONNTHROTLE_*` were renamed to `CONNTHROTTLE_*` as the
+  former was a typo.
+* `link::verify-certificate` is now deprecated and a config warning is
+  shown when set. It verified the peer certificate against CA trust.
+  However, newly issued certs from CAs (such as Let's Encrypt) tend to
+  no longer have the Client Authentication EKU, so linking with
+  `verify-certificate` often fails nowadays. Admins should switch to
+  `spkifp` for server linking, like everyone else.
 
 ### Fixes:
+* [set::connthrottle::disabled-when::reputation-gathering](https://www.unrealircd.org/docs/Connthrottle)
+  has been set to 1 week in example.conf since 2019, but if you did
+  not have that item it defaulted to 0 (no delay). Now 1 week.
+* OOB write if a URL callback returns a response that is more than
+  2GB. This only affects memory-backed callbacks: centralblocklist,
+  spamreport and log with destination webhook. In practice these
+  are likely all trusted servers.
+* [WEBIRC](https://www.unrealircd.org/docs/WebIRC_block):
+  if you had an `except ban` block with type `connect-flood` for the
+  gateway then we were accidentally also exempting the end-users
+  behind it, rendering connect-flood useless.
 
 ### Developers and protocol:
+* `OutgoingWebRequest` has a new `max_size` field (in bytes) that caps
+  the response size for memory-backed downloads. It defaults to
+  `DOWNLOAD_MAX_SIZE` (1MB). Ignored for file-backed downloads. This
+  protects against rogue or misbehaving webservers sending huge
+  responses that could otherwise fill server memory.
 
 UnrealIRCd 6.2.4
 =================
