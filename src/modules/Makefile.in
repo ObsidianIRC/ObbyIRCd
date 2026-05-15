@@ -93,6 +93,7 @@ MODULES= \
 	account-registration.so \
 	guest-nicks.so \
 	obbyscript.so \
+	obbypy.so \
 	metadata.so \
 	metadata-db.so \
 	filehost.so \
@@ -181,3 +182,13 @@ voice-channels.so: voice-channels.c $(INCLUDES)
 obbyscript.so: obbyscript.c duktape.c ../include/duktape.h ../include/duk_config.h $(INCLUDES)
 	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
 		-o obbyscript.so obbyscript.c -lm
+
+# obbypy embeds CPython via libpython3.  Use python3-embed pkg-config so
+# the resulting .so links libpython properly (Py_Initialize requires
+# the embedding-flavour linkage).  Falls back to python3 pkg-config on
+# distros that don't ship the -embed pc file.
+PYTHON_EMBED_CFLAGS := $(shell pkg-config --cflags python3-embed 2>/dev/null || pkg-config --cflags python3)
+PYTHON_EMBED_LIBS   := $(shell pkg-config --libs   python3-embed 2>/dev/null || pkg-config --libs   python3)
+obbypy.so: obbypy.c $(INCLUDES)
+	$(CC) $(CFLAGS) $(PYTHON_EMBED_CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
+		-o obbypy.so obbypy.c $(PYTHON_EMBED_LIBS)
