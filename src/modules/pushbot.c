@@ -37,6 +37,7 @@
 #define PB_GATEWAY_PATH "/pushbot/v1/gateway"
 
 /* WS close codes (Discord-style). */
+#define PB_CLOSE_GOING_AWAY 1001 /* RFC 6455: endpoint is going away */
 #define PB_CLOSE_AUTH_FAILED 4004
 #define PB_CLOSE_INVALID_SESSION 4006
 #define PB_CLOSE_TIMEOUT 4009
@@ -509,6 +510,18 @@ MOD_LOAD()
 MOD_UNLOAD()
 {
 	PbBot *b, *n;
+	/* Send a clean WebSocket Close to every live gateway session
+	 * before tearing anything down.  Without this the bot client's
+	 * TCP socket lingers after /REHASH -- the bot thinks it's still
+	 * connected, the freshly-loaded pushbot module has no record of
+	 * the session, and the bot becomes a silent zombie until its
+	 * systemd unit gets bounced.  Sending a Close frame here forces
+	 * the bot's read loop to disconnect and reconnect cleanly. */
+	for (b = bots; b; b = b->next) {
+		if (b->session && b->session->client && !IsDead(b->session->client))
+			pb_close_ws(b->session->client, PB_CLOSE_GOING_AWAY,
+			            "pushbot module reloading");
+	}
 	/* Sever session<->bot back-pointers before we free any bot.
 	 * After MOD_UNLOAD returns, UnrealIRCd sweeps every client with
 	 * our pushbot_session moddata and fires pb_moddata_session_free;
