@@ -78,7 +78,7 @@ bot = PushBot.from_env()
 @bot.command(
     name="help",
     description="Show help on an obbyircd topic",
-    visibility="public",
+    visibility="private",
     scopes=["channel", "dm"],
     options=[
         {
