@@ -17,8 +17,7 @@
  * dead-letter queue) so we don't have to do a migration every time
  * we land a phase.
  *
- * Spec: doc/pushbot-spec.md (intentionally local-only, see the
- * private notes for the canonical version).
+ * Spec: doc/specs/pushbot-spec.md and doc/specs/pushbot-architecture.md.
  *
  * (C) 2026 Valerie / ObbyIRCd Team
  * License: GPLv3 or later
