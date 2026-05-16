@@ -3400,6 +3400,25 @@ static void pb_rpc_status_change(Client *client, json_t *request, json_t *params
 		Client *g = b->ghost; b->ghost = NULL;
 		exit_client(g, NULL, "Bot deactivated by RPC");
 	}
+	/* Persist to DB or the next restart will reload the row as
+	 * its previous status -- this is why pushbot.delete used to
+	 * appear to work then come back. */
+	{
+		const char *str =
+		    new_status == PB_STATUS_ACTIVE ? "active" :
+		    new_status == PB_STATUS_SUSPENDED ? "suspended" :
+		    new_status == PB_STATUS_DELETED ? "deleted" : "pending";
+		sqlite3_stmt *st = NULL;
+		if (sqlite3_prepare_v2(db,
+		    "UPDATE pushbots SET status=? WHERE bot_id=?",
+		    -1, &st, NULL) == SQLITE_OK)
+		{
+			sqlite3_bind_text(st, 1, str, -1, SQLITE_STATIC);
+			sqlite3_bind_text(st, 2, b->bot_id, -1, SQLITE_STATIC);
+			sqlite3_step(st);
+			sqlite3_finalize(st);
+		}
+	}
 	pb_broadcast_bot_event(b, new_status == PB_STATUS_DELETED ? "remove" : "update");
 	json_t *result = json_object();
 	json_object_set_new(result, "ok", json_true());

@@ -499,6 +499,12 @@ static void do_create_ghost(PersistEntry *e)
 		safe_strdup(ghost->ip, e->ip);
 
 	make_user(ghost);
+	/* user->server is the source-server name pointer.  Periodic IRCd
+	 * paths (WHO, STATS, idle scans) format this field via ircvsnprintf
+	 * without a NULL check, so a NULL here SEGVs the whole server on
+	 * the next /WHO * 0.  Match the local-user path in src/modules/user.c
+	 * which sets it to me_hash (the pooled string for our own name). */
+	ghost->user->server = me_hash;
 
 	strlcpy(ghost->ident, e->ident, sizeof(ghost->ident));
 	strlcpy(ghost->info, e->realname, sizeof(ghost->info));
