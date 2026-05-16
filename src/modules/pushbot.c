@@ -640,6 +640,14 @@ static Client *pb_spawn_ghost(PbBot *b)
 	strlcpy(ghost->local->sockhost, "bot.obby.world", sizeof(ghost->local->sockhost));
 
 	make_user(ghost);
+	/* user->server is the source-server name for the user record.
+	 * For local users, src/modules/user.c sets it to me_hash (the
+	 * pooled string for our own server name).  Persistence's
+	 * ghost-revival code happens to dodge crashes because the field
+	 * is overwritten when the real user reconnects, but for a ghost
+	 * that NEVER becomes real (PushBot), leaving this NULL crashes
+	 * /WHO * 0 (RPL_WHOREPLY formats acptr->user->server unchecked). */
+	ghost->user->server = me_hash;
 	strlcpy(ghost->ident, b->nick, sizeof(ghost->ident));
 	strlcpy(ghost->info, b->realname, sizeof(ghost->info));
 	strlcpy(ghost->user->username, b->nick, sizeof(ghost->user->username));
