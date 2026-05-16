@@ -88,6 +88,23 @@ typedef enum {
 struct PbSession;
 typedef struct PbSession PbSession;
 
+/* One serialized event waiting in a bot's outbound queue.  Kept in
+ * memory for 60s (resume TTL); replayed on a successful RESUME. */
+typedef struct PbQueuedEvent PbQueuedEvent;
+struct PbQueuedEvent {
+	PbQueuedEvent *prev, *next;
+	long long seq;
+	char *json;          /* serialized DISPATCH frame ready to send */
+	time_t expires_at;   /* drop after this time */
+};
+
+/* Maximum queue depth per bot.  Exceeding this disconnects the slow
+ * bot with PB_CLOSE_QUEUE_OVERFLOW; RESUME-fresh-IDENTIFY catches up
+ * from the live state. */
+#define PB_QUEUE_MAX 1024
+/* Queued events outlive a disconnected session for this long. */
+#define PB_RESUME_TTL_SEC 60
+
 /* In-memory record for a bot.  Mirrors the SQLite row but with
  * resolved pointers and the live ghost client. */
 typedef struct PbBot PbBot;
@@ -106,17 +123,24 @@ struct PbBot {
 	int from_config;       /* 1 = defined in obbyircd.conf this run */
 	Client *ghost;         /* the virtual client, NULL when not materialised */
 	PbSession *session;    /* current gateway session, NULL if not connected */
+
+	/* Outbound event queue (for backpressure + RESUME). */
+	PbQueuedEvent *queue_head, *queue_tail;
+	int queue_count;
+	long long next_seq;       /* next sequence number to assign */
+	long long last_acked_seq; /* highest seq the bot has acked */
+	char *resume_session_id;  /* id valid for RESUME (matches IDENTIFY result) */
+	time_t resume_expires_at; /* when the resume window closes (0 = active) */
 };
 
 /* One gateway connection.  Created on WS upgrade, hung off the
  * connecting client via moddata.  Becomes "bound" to a PbBot once
- * IDENTIFY succeeds. */
+ * IDENTIFY succeeds.  Sequence numbers + queue live on the bot,
+ * not here, so they survive reconnects within the resume window. */
 struct PbSession {
 	Client *client;        /* the websocket-bearing client */
 	PbBot *bot;            /* NULL until IDENTIFY succeeds */
 	int identified;
-	long long seq;          /* monotonic dispatch sequence (server-side) */
-	long long last_acked_seq; /* last seq the bot heartbeat-acked */
 	Event *heartbeat_ev;
 	time_t last_heartbeat;
 };
@@ -198,6 +222,7 @@ static void pb_send_op(Client *client, json_t *frame);
 static void pb_send_hello(Client *client);
 static void pb_send_dispatch(Client *client, const char *event_name, json_t *data);
 static void pb_handle_identify(Client *client, json_t *frame);
+static void pb_handle_resume(Client *client, json_t *frame);
 static void pb_handle_heartbeat(Client *client, json_t *frame);
 static void pb_close_ws(Client *client, int code, const char *reason);
 static void pb_session_free(PbSession *s);
@@ -847,6 +872,13 @@ static PbBot *pb_find_bot_by_nick(const char *nick)
 static void pb_free_bot(PbBot *b)
 {
 	if (!b) return;
+	while (b->queue_head) {
+		PbQueuedEvent *e = b->queue_head;
+		safe_free(e->json);
+		DelListItem(e, b->queue_head);
+		safe_free(e);
+	}
+	safe_free(b->resume_session_id);
 	safe_free(b->bot_id);
 	safe_free(b->nick);
 	safe_free(b->account);
@@ -1143,7 +1175,6 @@ static int pb_handle_webrequest(Client *client, WebRequest *web)
 		PbSession *s = safe_alloc(sizeof(PbSession));
 		s->client = client;
 		s->bot = NULL; /* attached on IDENTIFY, not here */
-		s->seq = 0;
 		s->last_heartbeat = TStime();
 		moddata_client(client, pb_session_md).ptr = s;
 
@@ -1186,6 +1217,10 @@ static int pb_ws_handshake_send(Client *client)
 static int pb_handle_webrequest_data(Client *client, WebRequest *web, const char *buf, int len)
 {
 	WebSocketUser *wsu = pb_websocket_md ? moddata_client(client, pb_websocket_md).ptr : NULL;
+	unreal_log(ULOG_INFO, "pushbot", "WS_DATA", NULL,
+	           "incoming bytes=$len wsu=$wsu",
+	           log_data_integer("len", len),
+	           log_data_integer("wsu", wsu ? 1 : 0));
 	if (wsu)
 		return pb_handle_body_websocket(client, web, buf, len);
 	/* TODO phase 4: REST body handling. */
@@ -1236,22 +1271,114 @@ static void pb_send_hello(Client *client)
 	json_decref(frame);
 }
 
-static void pb_send_dispatch(Client *client, const char *event_name, json_t *data)
+/* Drop everything in the queue with seq <= ack. */
+static void pb_queue_ack(PbBot *b, long long ack)
 {
-	PbSession *s = PB_SESS(client);
-	if (!s) return;
-	s->seq++;
+	if (!b) return;
+	PbQueuedEvent *e = b->queue_head;
+	while (e && e->seq <= ack) {
+		PbQueuedEvent *next = e->next;
+		safe_free(e->json);
+		DelListItem(e, b->queue_head);
+		if (e == b->queue_tail) b->queue_tail = NULL;
+		safe_free(e);
+		b->queue_count--;
+		e = next;
+	}
+	if (ack > b->last_acked_seq) b->last_acked_seq = ack;
+}
+
+/* Walk the queue and drop entries past their TTL. */
+static void pb_queue_expire(PbBot *b)
+{
+	if (!b) return;
+	time_t now = TStime();
+	PbQueuedEvent *e = b->queue_head;
+	while (e) {
+		PbQueuedEvent *next = e->next;
+		if (e->expires_at && e->expires_at < now) {
+			safe_free(e->json);
+			DelListItem(e, b->queue_head);
+			if (e == b->queue_tail) b->queue_tail = NULL;
+			safe_free(e);
+			b->queue_count--;
+		}
+		e = next;
+	}
+}
+
+/* Stash a serialized DISPATCH frame in the bot's queue with the given
+ * seq.  Used both for new events and for resumption replay (which
+ * already has the JSON). */
+static int pb_queue_push(PbBot *b, long long seq, const char *json)
+{
+	if (!b || !json) return -1;
+	if (b->queue_count >= PB_QUEUE_MAX) {
+		unreal_log(ULOG_WARNING, "pushbot", "QUEUE_OVERFLOW", NULL,
+		           "Bot $nick queue overflowed; disconnecting",
+		           log_data_string("nick", b->nick));
+		if (b->session && b->session->client)
+			pb_close_ws(b->session->client, PB_CLOSE_QUEUE_OVERFLOW,
+			            "Outbound queue overflowed");
+		return -1;
+	}
+	PbQueuedEvent *e = safe_alloc(sizeof(*e));
+	e->seq = seq;
+	e->json = strdup(json);
+	e->expires_at = TStime() + PB_RESUME_TTL_SEC;
+	AppendListItem(e, b->queue_head);
+	b->queue_tail = e;
+	b->queue_count++;
+	return 0;
+}
+
+/* Send a DISPATCH frame to the bot's current session AND record it
+ * in the per-bot queue for resume.  Called by event-routing code in
+ * later phases (CHANMSG handler, slash-command dispatch, etc.). */
+static void pb_dispatch_event(PbBot *b, const char *event_name, json_t *data)
+{
+	if (!b) { if (data) json_decref(data); return; }
+
+	long long seq = ++b->next_seq;
 	json_t *frame = json_object();
 	json_object_set_new(frame, "op", json_integer(PB_OP_DISPATCH));
 	json_object_set_new(frame, "t", json_string(event_name));
-	json_object_set_new(frame, "s", json_integer(s->seq));
+	json_object_set_new(frame, "s", json_integer(seq));
 	json_object_set_new(frame, "d", data ? data : json_object());
-	pb_send_op(client, frame);
+
+	char *body = json_dumps(frame, JSON_COMPACT);
 	json_decref(frame);
+	if (!body) return;
+
+	pb_queue_push(b, seq, body);
+
+	if (b->session && b->session->client &&
+	    !IsDead(b->session->client) && b->session->client->local &&
+	    b->session->identified) {
+		int len = strlen(body);
+		char *out = body;
+		if (websocket_create_packet(WSOP_TEXT, &out, &len) >= 0) {
+			dbuf_put(&b->session->client->local->sendQ, out, len);
+			send_queued(b->session->client);
+		}
+	}
+	free(body);
+}
+
+/* Compat shim while older code paths still call the old per-session
+ * sender.  Internally just defers to pb_dispatch_event. */
+static void pb_send_dispatch(Client *client, const char *event_name, json_t *data)
+{
+	PbSession *s = PB_SESS(client);
+	if (!s || !s->bot) { if (data) json_decref(data); return; }
+	pb_dispatch_event(s->bot, event_name, data);
 }
 
 static void pb_handle_ws_message(Client *client, char *msg, int len)
 {
+	unreal_log(ULOG_INFO, "pushbot", "WS_MSG", NULL, "msg len=$len: $msg",
+	           log_data_integer("len", len),
+	           log_data_string("msg", msg));
 	json_error_t err;
 	json_t *frame = json_loadb(msg, len, 0, &err);
 	if (!frame || !json_is_object(frame)) {
@@ -1269,11 +1396,7 @@ static void pb_handle_ws_message(Client *client, char *msg, int len)
 	switch (op) {
 	case PB_OP_IDENTIFY:   pb_handle_identify(client, frame); break;
 	case PB_OP_HEARTBEAT:  pb_handle_heartbeat(client, frame); break;
-	case PB_OP_RESUME:
-		/* TODO phase 2d: replay from buffer. For now reject. */
-		pb_close_ws(client, PB_CLOSE_INVALID_SESSION,
-		            "RESUME not implemented yet -- IDENTIFY fresh");
-		break;
+	case PB_OP_RESUME:   pb_handle_resume(client, frame); break;
 	default:
 		unreal_log(ULOG_DEBUG, "pushbot", "WS_UNKNOWN_OP", client,
 		           "Received unknown opcode $op",
@@ -1306,6 +1429,26 @@ static void pb_handle_identify(Client *client, json_t *frame)
 		return;
 	}
 
+	/* IDENTIFY (vs RESUME) explicitly starts a fresh session.  Any
+	 * previous resume window is closed and queued events tossed. */
+	while (s->bot->queue_head) {
+		PbQueuedEvent *e = s->bot->queue_head;
+		safe_free(e->json);
+		DelListItem(e, s->bot->queue_head);
+		safe_free(e);
+		s->bot->queue_count--;
+	}
+	s->bot->queue_tail = NULL;
+	s->bot->next_seq = 0;
+	s->bot->last_acked_seq = 0;
+	s->bot->resume_expires_at = 0;
+
+	/* Mint a fresh resume session id. */
+	char rid[64];
+	snprintf(rid, sizeof(rid), "%s.%lx.%lx",
+	         s->bot->bot_id, (unsigned long)TStime(), (unsigned long)getpid());
+	safe_strdup(s->bot->resume_session_id, rid);
+
 	s->identified = 1;
 	s->bot->session = s;
 	s->last_heartbeat = TStime();
@@ -1318,7 +1461,7 @@ static void pb_handle_identify(Client *client, json_t *frame)
 
 	/* READY dispatch. */
 	json_t *ready_d = json_object();
-	json_object_set_new(ready_d, "session_id", json_string(s->bot->bot_id));
+	json_object_set_new(ready_d, "session_id", json_string(s->bot->resume_session_id));
 	json_object_set_new(ready_d, "bot_nick", json_string(s->bot->nick));
 	json_object_set_new(ready_d, "scope", json_string(pb_scope_str(s->bot->scope)));
 	json_t *channels = json_array();
@@ -1338,14 +1481,97 @@ static void pb_handle_heartbeat(Client *client, json_t *frame)
 {
 	PbSession *s = PB_SESS(client);
 	if (!s) return;
+	/* d carries the last seq the bot has seen; we use it to release
+	 * everything in the queue at or below that watermark. */
 	json_t *d = json_object_get(frame, "d");
-	if (json_is_integer(d))
-		s->last_acked_seq = json_integer_value(d);
+	if (json_is_integer(d) && s->bot)
+		pb_queue_ack(s->bot, json_integer_value(d));
 	s->last_heartbeat = TStime();
 	json_t *ack = json_object();
 	json_object_set_new(ack, "op", json_integer(PB_OP_HEARTBEAT_ACK));
 	pb_send_op(client, ack);
 	json_decref(ack);
+}
+
+/* RESUME: bot reconnected within the TTL window and wants to replay
+ * missed events. */
+static void pb_handle_resume(Client *client, json_t *frame)
+{
+	PbSession *s = PB_SESS(client);
+	if (!s || !s->bot) {
+		pb_close_ws(client, PB_CLOSE_INVALID_SESSION, "No session context for resume");
+		return;
+	}
+	PbBot *b = s->bot;
+
+	json_t *d = json_object_get(frame, "d");
+	if (!json_is_object(d)) {
+		pb_close_ws(client, PB_CLOSE_INVALID_SESSION, "RESUME.d must be object");
+		return;
+	}
+	json_t *sidj = json_object_get(d, "session_id");
+	json_t *seqj = json_object_get(d, "seq");
+	json_t *tokj = json_object_get(d, "token");
+	if (!json_is_string(sidj) || !json_is_integer(seqj) || !json_is_string(tokj)) {
+		pb_close_ws(client, PB_CLOSE_INVALID_SESSION,
+		            "RESUME requires session_id, seq, token");
+		return;
+	}
+	const char *sid = json_string_value(sidj);
+	long long seq = (long long)json_integer_value(seqj);
+	const char *tok = json_string_value(tokj);
+
+	/* Validate everything before touching state. */
+	if (!b->config_token || strcmp(tok, b->config_token)) {
+		pb_close_ws(client, PB_CLOSE_AUTH_FAILED, "RESUME token mismatch");
+		return;
+	}
+	if (!b->resume_session_id || strcmp(sid, b->resume_session_id)) {
+		pb_close_ws(client, PB_CLOSE_INVALID_SESSION, "Unknown session_id");
+		return;
+	}
+	pb_queue_expire(b);
+	/* If the queue is empty AND seq < next_seq, we lost events that
+	 * fell off the TTL window.  Reject; bot must IDENTIFY fresh. */
+	if (b->queue_count == 0 && seq < b->next_seq) {
+		pb_close_ws(client, PB_CLOSE_INVALID_SESSION,
+		            "Resume window expired -- IDENTIFY fresh");
+		return;
+	}
+	if (seq > b->next_seq) {
+		pb_close_ws(client, PB_CLOSE_INVALID_SESSION,
+		            "seq ahead of server -- IDENTIFY fresh");
+		return;
+	}
+
+	/* Attach to the bot.  Acknowledge what they have and replay
+	 * everything beyond it.  We don't INCREMENT next_seq while
+	 * replaying -- the seqs are already baked into each event. */
+	pb_queue_ack(b, seq);
+	b->session = s;
+	b->resume_expires_at = 0;
+	s->identified = 1;
+	s->last_heartbeat = TStime();
+
+	for (PbQueuedEvent *e = b->queue_head; e; e = e->next) {
+		int len = strlen(e->json);
+		char *out = e->json;
+		if (websocket_create_packet(WSOP_TEXT, &out, &len) >= 0) {
+			dbuf_put(&client->local->sendQ, out, len);
+		}
+	}
+	send_queued(client);
+
+	/* Final RESUMED dispatch so the bot knows the replay is done. */
+	json_t *resumed_d = json_object();
+	json_object_set_new(resumed_d, "replayed",
+	                    json_integer(b->queue_count));
+	pb_dispatch_event(b, "RESUMED", resumed_d);
+
+	unreal_log(ULOG_INFO, "pushbot", "BOT_RESUMED", NULL,
+	           "Bot $nick resumed session, replayed $count event(s)",
+	           log_data_string("nick", b->nick),
+	           log_data_integer("count", b->queue_count));
 }
 
 static void pb_close_ws(Client *client, int code, const char *reason)
@@ -1372,11 +1598,15 @@ static void pb_session_free(PbSession *s)
 {
 	if (!s) return;
 	if (s->bot && s->bot->session == s) {
-		s->bot->session = NULL;
-		/* Set the bot away again until reconnect. */
-		if (s->bot->ghost && !s->bot->ghost->user->away) {
-			safe_strdup(s->bot->ghost->user->away, "bot offline");
-			s->bot->ghost->user->away_since = TStime();
+		PbBot *b = s->bot;
+		b->session = NULL;
+		/* Open a resume window: keep queued events + session id
+		 * around for PB_RESUME_TTL_SEC.  pb_heartbeat_check garbage-
+		 * collects expired windows. */
+		b->resume_expires_at = TStime() + PB_RESUME_TTL_SEC;
+		if (b->ghost && !b->ghost->user->away) {
+			safe_strdup(b->ghost->user->away, "bot offline");
+			b->ghost->user->away_since = TStime();
 		}
 	}
 	if (s->heartbeat_ev) { EventDel(s->heartbeat_ev); s->heartbeat_ev = NULL; }
@@ -1394,14 +1624,37 @@ EVENT(pb_heartbeat_check)
 {
 	time_t now = TStime();
 	for (PbBot *b = bots; b; b = b->next) {
+		/* Live session: check heartbeat.  Guard against half-dead
+		 * clients -- moddata free may not have run yet between
+		 * dead_socket() and the actual teardown, so b->session can
+		 * still point to an IsDead client that we MUST NOT touch. */
 		PbSession *s = b->session;
-		if (!s || !s->client) continue;
-		if (!s->identified) continue;
-		if ((now - s->last_heartbeat) * 1000 > PB_HEARTBEAT_GRACE_MS) {
-			unreal_log(ULOG_INFO, "pushbot", "HEARTBEAT_TIMEOUT", NULL,
-			           "Bot $nick gateway timed out, closing",
-			           log_data_string("nick", b->nick));
-			pb_close_ws(s->client, PB_CLOSE_TIMEOUT, "Heartbeat missed");
+		if (s && s->client && !IsDead(s->client) && s->client->local && s->identified) {
+			if ((now - s->last_heartbeat) * 1000 > PB_HEARTBEAT_GRACE_MS) {
+				unreal_log(ULOG_INFO, "pushbot", "HEARTBEAT_TIMEOUT", NULL,
+				           "Bot $nick gateway timed out, closing",
+				           log_data_string("nick", b->nick));
+				pb_close_ws(s->client, PB_CLOSE_TIMEOUT, "Heartbeat missed");
+			}
+		}
+
+		/* Detached resume window: expire queue + clear session id
+		 * if the bot didn't come back in time. */
+		if (!b->session && b->resume_expires_at && b->resume_expires_at < now) {
+			pb_queue_expire(b);
+			/* If everything's gone or expired, drop the resume id
+			 * so the next IDENTIFY is treated as fresh. */
+			if (b->queue_count == 0) {
+				safe_free(b->resume_session_id);
+				b->resume_session_id = NULL;
+				b->next_seq = 0;
+				b->last_acked_seq = 0;
+				b->resume_expires_at = 0;
+			}
+		} else if (!b->session && b->queue_head) {
+			/* Still inside the window -- just expire individual
+			 * entries that timed out. */
+			pb_queue_expire(b);
 		}
 	}
 }
