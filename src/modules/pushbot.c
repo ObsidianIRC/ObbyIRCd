@@ -509,6 +509,19 @@ MOD_LOAD()
 MOD_UNLOAD()
 {
 	PbBot *b, *n;
+	/* Sever session<->bot back-pointers before we free any bot.
+	 * After MOD_UNLOAD returns, UnrealIRCd sweeps every client with
+	 * our pushbot_session moddata and fires pb_moddata_session_free;
+	 * that calls pb_session_free which dereferences s->bot.  If we
+	 * leave the back-pointer pointing at freed memory we crash
+	 * during the framework's teardown, not in our code -- which is
+	 * exactly what the 17:55 /REHASH SEGV looked like. */
+	for (b = bots; b; b = b->next) {
+		if (b->session) {
+			b->session->bot = NULL;
+			b->session = NULL;
+		}
+	}
 	for (b = bots; b; b = n) {
 		n = b->next;
 		pb_destroy_ghost(b, "pushbot module unloaded");
