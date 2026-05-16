@@ -26,14 +26,39 @@
 
 #include "unrealircd.h"
 #include <sqlite3.h>
+#include <jansson.h>
 
 #define MYCONF "pushbot"
 #define DEFAULT_DB "pushbot.db"
 
+/* Gateway URL path. */
+#define PB_GATEWAY_PATH "/pushbot/v1/gateway"
+
+/* WS close codes (Discord-style). */
+#define PB_CLOSE_AUTH_FAILED 4004
+#define PB_CLOSE_INVALID_SESSION 4006
+#define PB_CLOSE_TIMEOUT 4009
+#define PB_CLOSE_QUEUE_OVERFLOW 4011
+
+/* Default heartbeat interval (ms). */
+#define PB_HEARTBEAT_INTERVAL_MS 30000
+/* Two missed heartbeats -> session timeout. */
+#define PB_HEARTBEAT_GRACE_MS (PB_HEARTBEAT_INTERVAL_MS * 2 + 5000)
+
+/* Opcodes per spec §4.3. */
+#define PB_OP_DISPATCH       0
+#define PB_OP_HEARTBEAT      1
+#define PB_OP_IDENTIFY       2
+#define PB_OP_RESUME         6
+#define PB_OP_RECONNECT      7
+#define PB_OP_INVALID_SESSION 9
+#define PB_OP_HELLO          10
+#define PB_OP_HEARTBEAT_ACK  11
+
 ModuleHeader MOD_HEADER = {
 	"pushbot",
-	"0.1",
-	"Discord-style out-of-process bots (skeleton, phase 1)",
+	"0.2",
+	"Discord-style out-of-process bots (phase 1+2: skeleton + gateway)",
 	"ObbyIRCd Team",
 	"unrealircd-6"
 };
@@ -60,6 +85,9 @@ typedef enum {
 	PB_STATUS_DELETED   = 3,
 } PbStatus;
 
+struct PbSession;
+typedef struct PbSession PbSession;
+
 /* In-memory record for a bot.  Mirrors the SQLite row but with
  * resolved pointers and the live ghost client. */
 typedef struct PbBot PbBot;
@@ -77,6 +105,20 @@ struct PbBot {
 	NameList *auto_join;   /* channels to auto-join after ghost creation */
 	int from_config;       /* 1 = defined in obbyircd.conf this run */
 	Client *ghost;         /* the virtual client, NULL when not materialised */
+	PbSession *session;    /* current gateway session, NULL if not connected */
+};
+
+/* One gateway connection.  Created on WS upgrade, hung off the
+ * connecting client via moddata.  Becomes "bound" to a PbBot once
+ * IDENTIFY succeeds. */
+struct PbSession {
+	Client *client;        /* the websocket-bearing client */
+	PbBot *bot;            /* NULL until IDENTIFY succeeds */
+	int identified;
+	long long seq;          /* monotonic dispatch sequence (server-side) */
+	long long last_acked_seq; /* last seq the bot heartbeat-acked */
+	Event *heartbeat_ev;
+	time_t last_heartbeat;
 };
 
 /* Pending config: collected during configrun, applied at MOD_LOAD. */
@@ -103,6 +145,16 @@ static PbCfg cfg;
 static sqlite3 *db = NULL;
 static PbBot *bots = NULL;
 static ModuleInfo *modinfo_ref = NULL;
+
+/* Gateway moddata: per-client session pointer. */
+static ModDataInfo *pb_session_md = NULL;
+/* websocket_common's moddata, for inheriting WSU(). */
+static ModDataInfo *pb_websocket_md = NULL;
+/* webserver's moddata, for accessing WebRequest from client. */
+static ModDataInfo *pb_webserver_md = NULL;
+
+#define PB_SESS(c) ((PbSession *)moddata_client(c, pb_session_md).ptr)
+#define PB_WEB(c)  ((WebRequest *)moddata_local_client(c, pb_webserver_md).ptr)
 
 /* ===================================================================
  * Forward declarations
@@ -131,6 +183,27 @@ static void pb_generate_id(char *out, size_t outlen);
 
 CMD_FUNC(cmd_pushbot);
 
+/* Gateway -- forward decls */
+static int pb_config_test_listen(ConfigFile *cf, ConfigEntry *ce, int type, int *errs);
+static int pb_config_run_ex_listen(ConfigFile *cf, ConfigEntry *ce, int type, void *ptr);
+static int pb_config_listener(ConfigItem_listen *l);
+static void pb_client_handshake(Client *client);
+static int pb_handle_webrequest(Client *client, WebRequest *web);
+static int pb_handle_webrequest_data(Client *client, WebRequest *web, const char *buf, int len);
+static int pb_ws_handshake_send(Client *client);
+static int pb_packet_in_websocket(Client *client, char *buf, int len);
+static int pb_handle_body_websocket(Client *client, WebRequest *web, const char *buf, int len);
+static void pb_handle_ws_message(Client *client, char *msg, int len);
+static void pb_send_op(Client *client, json_t *frame);
+static void pb_send_hello(Client *client);
+static void pb_send_dispatch(Client *client, const char *event_name, json_t *data);
+static void pb_handle_identify(Client *client, json_t *frame);
+static void pb_handle_heartbeat(Client *client, json_t *frame);
+static void pb_close_ws(Client *client, int code, const char *reason);
+static void pb_session_free(PbSession *s);
+static void pb_moddata_session_free(ModData *md);
+EVENT(pb_heartbeat_check);
+
 /* ===================================================================
  * Module lifecycle
  * =================================================================== */
@@ -142,17 +215,40 @@ MOD_TEST()
 	safe_strdup(cfg.registration_mode, "admin");
 	cfg.webhook_failure_suspend_after = 86400;
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGTEST, 0, pb_configtest);
-	unreal_log(ULOG_DEBUG, "pushbot", "MOD_TEST", NULL,
-	           "pushbot MOD_TEST ran, CONFIGTEST hook registered");
+	HookAdd(modinfo->handle, HOOKTYPE_CONFIGTEST, 0, pb_config_test_listen);
 	return MOD_SUCCESS;
 }
 
 MOD_INIT()
 {
+	ModDataInfo mreq;
+
 	modinfo_ref = modinfo;
 	MARK_AS_OFFICIAL_MODULE(modinfo);
+
+	/* Register our per-client session moddata. */
+	memset(&mreq, 0, sizeof(mreq));
+	mreq.name = "pushbot_session";
+	mreq.type = MODDATATYPE_LOCAL_CLIENT;
+	mreq.free = pb_moddata_session_free;
+	pb_session_md = ModDataAdd(modinfo->handle, mreq);
+	if (!pb_session_md) {
+		config_error("[pushbot] ModDataAdd(pushbot_session) failed: %s",
+		             ModuleGetErrorStr(modinfo->handle));
+		return MOD_FAILED;
+	}
+
+	/* Borrow websocket_common's moddata for WSU(). */
+	pb_websocket_md = findmoddata_byname("websocket", MODDATATYPE_CLIENT);
+	pb_webserver_md = findmoddata_byname("web", MODDATATYPE_LOCAL_CLIENT);
+
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, pb_configrun);
+	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN_EX, 0, pb_config_run_ex_listen);
+	HookAdd(modinfo->handle, HOOKTYPE_CONFIG_LISTENER, 0, pb_config_listener);
 	CommandAdd(modinfo->handle, "PUSHBOT", cmd_pushbot, MAXPARA, CMD_USER);
+
+	/* Heartbeat watchdog: every 5s, kick sessions that missed too many. */
+	EventAdd(modinfo->handle, "pb_heartbeat_check", pb_heartbeat_check, NULL, 5000, 0);
 	return MOD_SUCCESS;
 }
 
@@ -882,4 +978,430 @@ CMD_FUNC(cmd_pushbot)
 		return;
 	}
 	sendnotice(client, "Unknown PUSHBOT subcommand: %s", sub);
+}
+
+/* ===================================================================
+ * Gateway -- Phase 2
+ *
+ * Listener registration:  listen { options { pushbot; }; } turns the
+ * listener into a webserver-mode endpoint with our handlers attached.
+ *
+ * Path routing inside pb_handle_webrequest:
+ *   GET /pushbot/v1/gateway  -> WebSocket upgrade (this phase)
+ *   anything else            -> 404 for now (REST API: phase 4)
+ *
+ * On WS upgrade we:
+ *   - require an Authorization: Bearer <token> header
+ *   - allocate a PbSession and attach it to moddata
+ *   - send op=10 HELLO with the heartbeat interval
+ *
+ * After upgrade the bot sends:
+ *   - op=2 IDENTIFY  -> we look up the bot, attach session, send READY
+ *   - op=1 HEARTBEAT -> we ack with op=11
+ * =================================================================== */
+
+static int pb_config_test_listen(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
+{
+	if (type != CONFIG_LISTEN_OPTIONS)
+		return 0;
+	if (!ce || !ce->name || strcmp(ce->name, "pushbot"))
+		return 0;
+	/* No sub-keys yet; this just claims the directive so the parser
+	 * doesn't warn about an unknown listen option. */
+	return 1;
+}
+
+static int pb_config_run_ex_listen(ConfigFile *cf, ConfigEntry *ce, int type, void *ptr)
+{
+	ConfigItem_listen *l;
+	if (type != CONFIG_LISTEN_OPTIONS) return 0;
+	if (!ce || !ce->name || strcmp(ce->name, "pushbot")) return 0;
+	l = (ConfigItem_listen *)ptr;
+	l->options |= LISTENER_NO_CHECK_CONNECT_FLOOD;
+	l->options |= LISTENER_NO_CHECK_ZLINED;
+	/* Stash via reusing rpc_options? We can't -- it's RPC-specific.
+	 * We'll detect in pb_config_listener by walking listen->config. */
+	l->rpc_options = 0; /* unrelated; ensures we don't accidentally flip rpc */
+	/* We need a distinguishing flag. Hijack a spare bit in listener
+	 * options for pushbot. */
+	l->options |= 0x800000; /* PUSHBOT marker -- unused upstream bit */
+	return 1;
+}
+
+static int pb_is_pushbot_listener(ConfigItem_listen *l)
+{
+	return (l && (l->options & 0x800000)) ? 1 : 0;
+}
+
+static int pb_config_listener(ConfigItem_listen *l)
+{
+	if (!pb_is_pushbot_listener(l)) return 0;
+	if (l->socket_type == SOCKET_TYPE_UNIX) {
+		/* Not supported -- pushbot wants real TCP+TLS for external bots. */
+		config_warn("[pushbot] Unix-socket pushbot listeners are not supported (yet).");
+		return 0;
+	}
+	l->options |= LISTENER_TLS;
+	/* Need a custom start_handshake so the default doesn't spam
+	 * "*** Looking up your hostname..." NOTICEs into the connection
+	 * BEFORE we discover it's an HTTP/WS request -- those bytes
+	 * corrupt the WS upgrade response. */
+	l->start_handshake = pb_client_handshake;
+	l->webserver = safe_alloc(sizeof(WebServer));
+	l->webserver->handle_request = pb_handle_webrequest;
+	l->webserver->handle_body = pb_handle_webrequest_data;
+	return 1;
+}
+
+/* Called on accept().  Replaces the default IRC handshake (which
+ * would send "*** Looking up your hostname..." NOTICEs that
+ * corrupt the WS handshake response).  We still need the bare
+ * minimum: reset client status post-TLS and run HOOKTYPE_HANDSHAKE
+ * so other modules (TLS cipher info, etc.) get notified.  Skip the
+ * DNS lookup -- bots authenticate by Bearer, not by hostmask. */
+static void pb_client_handshake(Client *client)
+{
+	client->status = CLIENT_STATUS_UNKNOWN;
+	RunHook(HOOKTYPE_HANDSHAKE, client);
+	if (!IsDead(client))
+		fd_setselect(client->local->fd, FD_SELECT_READ, read_packet, client);
+}
+
+static int pb_check_bearer(const char *auth, char *token_out, size_t tlen)
+{
+	if (!auth) return 0;
+	while (*auth == ' ') auth++;
+	if (strncasecmp(auth, "Bearer ", 7)) return 0;
+	auth += 7;
+	while (*auth == ' ') auth++;
+	strlcpy(token_out, auth, tlen);
+	/* Strip trailing whitespace just in case. */
+	size_t n = strlen(token_out);
+	while (n > 0 && (token_out[n-1] == ' ' || token_out[n-1] == '\r' || token_out[n-1] == '\t'))
+		token_out[--n] = '\0';
+	return token_out[0] ? 1 : 0;
+}
+
+/* Look up a bot by plaintext bearer.  Returns NULL on no-match.
+ * Phase 1 stashed config-tokens in PbBot->config_token; that's what
+ * we compare here.  Self-registered bots will get hashed tokens; we'll
+ * compare via the hash in a later phase. */
+static PbBot *pb_find_bot_by_token(const char *token)
+{
+	if (!token || !*token) return NULL;
+	for (PbBot *b = bots; b; b = b->next) {
+		if (b->status != PB_STATUS_ACTIVE) continue;
+		if (!b->config_token) continue;
+		if (!strcmp(b->config_token, token))
+			return b;
+	}
+	return NULL;
+}
+
+static int pb_handle_webrequest(Client *client, WebRequest *web)
+{
+	const char *auth = get_nvplist(web->headers, "Authorization");
+	char token[512];
+	if (!pb_check_bearer(auth, token, sizeof(token))) {
+		webserver_send_response(client, 401, "Bearer token required\n");
+		return 0;
+	}
+
+	/* Need to keep token around until the upgrade is complete so we
+	 * can hand it to the session.  Stash on the WebSocketUser-equiv
+	 * for now (we'll create our session below). */
+
+	if (!strcmp(web->uri, PB_GATEWAY_PATH) &&
+	    get_nvplist(web->headers, "Sec-WebSocket-Key")) {
+		/* WebSocket upgrade path. */
+		if (!pb_websocket_md) {
+			webserver_send_response(client, 405,
+			    "WebSocket support not loaded (websocket_common module missing).\n");
+			return 0;
+		}
+		/* Look up bot by token BEFORE upgrading -- saves us a roundtrip
+		 * on bad creds. */
+		PbBot *b = pb_find_bot_by_token(token);
+		if (!b) {
+			webserver_send_response(client, 401, "Invalid bearer token\n");
+			return 0;
+		}
+
+		/* Allocate WebSocketUser so websocket_common's frame parser
+		 * picks up our connection. */
+		moddata_client(client, pb_websocket_md).ptr = safe_alloc(sizeof(WebSocketUser));
+		((WebSocketUser *)moddata_client(client, pb_websocket_md).ptr)->type = WEBSOCKET_TYPE_TEXT;
+
+		const char *ws_key = get_nvplist(web->headers, "Sec-WebSocket-Key");
+		if (strchr(ws_key, ':')) {
+			webserver_send_response(client, 400, "Invalid Sec-WebSocket-Key\n");
+			return 0;
+		}
+		safe_strdup(((WebSocketUser *)moddata_client(client, pb_websocket_md).ptr)->handshake_key, ws_key);
+
+		/* Allocate our session, link to the bot. */
+		PbSession *s = safe_alloc(sizeof(PbSession));
+		s->client = client;
+		s->bot = NULL; /* attached on IDENTIFY, not here */
+		s->seq = 0;
+		s->last_heartbeat = TStime();
+		moddata_client(client, pb_session_md).ptr = s;
+
+		/* Stash the bot we resolved so IDENTIFY can verify the token
+		 * matches what was sent. We do this by storing bot_id in the
+		 * client's local extended info -- simplest: set the session's
+		 * `bot` field tentatively, but mark identified=0 so dispatch
+		 * doesn't fire yet. */
+		s->bot = b;
+
+		pb_ws_handshake_send(client);
+		pb_send_hello(client);
+		return 1; /* accept */
+	}
+
+	/* TODO phase 4: REST routes here. */
+	webserver_send_response(client, 404, "PushBot REST API not implemented yet (phase 4).\n");
+	return 0;
+}
+
+static int pb_ws_handshake_send(Client *client)
+{
+	char buf[512], hashbuf[64], sha1out[20];
+	WebSocketUser *wsu = moddata_client(client, pb_websocket_md).ptr;
+	wsu->handshake_completed = 1;
+	snprintf(buf, sizeof(buf), "%s%s", wsu->handshake_key, WEBSOCKET_MAGIC_KEY);
+	sha1hash_binary(sha1out, buf, strlen(buf));
+	b64_encode(sha1out, sizeof(sha1out), hashbuf, sizeof(hashbuf));
+	snprintf(buf, sizeof(buf),
+	         "HTTP/1.1 101 Switching Protocols\r\n"
+	         "Upgrade: websocket\r\n"
+	         "Connection: Upgrade\r\n"
+	         "Sec-WebSocket-Accept: %s\r\n\r\n",
+	         hashbuf);
+	dbuf_put(&client->local->sendQ, buf, strlen(buf));
+	send_queued(client);
+	return 0;
+}
+
+static int pb_handle_webrequest_data(Client *client, WebRequest *web, const char *buf, int len)
+{
+	WebSocketUser *wsu = pb_websocket_md ? moddata_client(client, pb_websocket_md).ptr : NULL;
+	if (wsu)
+		return pb_handle_body_websocket(client, web, buf, len);
+	/* TODO phase 4: REST body handling. */
+	webserver_send_response(client, 404, "Page not found.\n");
+	return 0;
+}
+
+static int pb_handle_body_websocket(Client *client, WebRequest *web, const char *buf, int len)
+{
+	WebSocketUser *wsu = moddata_client(client, pb_websocket_md).ptr;
+	if (!wsu || !wsu->handshake_completed)
+		return 0;
+	return websocket_handle_websocket(client, web, buf, len, pb_packet_in_websocket);
+}
+
+static int pb_packet_in_websocket(Client *client, char *buf, int len)
+{
+	/* Each call is one fully-reassembled WS frame.  We expect text
+	 * frames carrying a single JSON object per spec §4.2. */
+	if (len <= 0) return 0;
+	pb_handle_ws_message(client, buf, len);
+	return 0;
+}
+
+static void pb_send_op(Client *client, json_t *frame)
+{
+	char *body = json_dumps(frame, JSON_COMPACT);
+	if (!body) return;
+	int len = strlen(body);
+	char *out = body;
+	if (websocket_create_packet(WSOP_TEXT, &out, &len) < 0) {
+		free(body);
+		return;
+	}
+	dbuf_put(&client->local->sendQ, out, len);
+	send_queued(client);
+	free(body);
+}
+
+static void pb_send_hello(Client *client)
+{
+	json_t *frame = json_object();
+	json_t *d = json_object();
+	json_object_set_new(d, "heartbeat_interval", json_integer(PB_HEARTBEAT_INTERVAL_MS));
+	json_object_set_new(frame, "op", json_integer(PB_OP_HELLO));
+	json_object_set_new(frame, "d", d);
+	pb_send_op(client, frame);
+	json_decref(frame);
+}
+
+static void pb_send_dispatch(Client *client, const char *event_name, json_t *data)
+{
+	PbSession *s = PB_SESS(client);
+	if (!s) return;
+	s->seq++;
+	json_t *frame = json_object();
+	json_object_set_new(frame, "op", json_integer(PB_OP_DISPATCH));
+	json_object_set_new(frame, "t", json_string(event_name));
+	json_object_set_new(frame, "s", json_integer(s->seq));
+	json_object_set_new(frame, "d", data ? data : json_object());
+	pb_send_op(client, frame);
+	json_decref(frame);
+}
+
+static void pb_handle_ws_message(Client *client, char *msg, int len)
+{
+	json_error_t err;
+	json_t *frame = json_loadb(msg, len, 0, &err);
+	if (!frame || !json_is_object(frame)) {
+		pb_close_ws(client, PB_CLOSE_INVALID_SESSION, "Frame is not a JSON object");
+		if (frame) json_decref(frame);
+		return;
+	}
+	json_t *opj = json_object_get(frame, "op");
+	if (!json_is_integer(opj)) {
+		pb_close_ws(client, PB_CLOSE_INVALID_SESSION, "Frame missing op");
+		json_decref(frame);
+		return;
+	}
+	int op = (int)json_integer_value(opj);
+	switch (op) {
+	case PB_OP_IDENTIFY:   pb_handle_identify(client, frame); break;
+	case PB_OP_HEARTBEAT:  pb_handle_heartbeat(client, frame); break;
+	case PB_OP_RESUME:
+		/* TODO phase 2d: replay from buffer. For now reject. */
+		pb_close_ws(client, PB_CLOSE_INVALID_SESSION,
+		            "RESUME not implemented yet -- IDENTIFY fresh");
+		break;
+	default:
+		unreal_log(ULOG_DEBUG, "pushbot", "WS_UNKNOWN_OP", client,
+		           "Received unknown opcode $op",
+		           log_data_integer("op", op));
+		break;
+	}
+	json_decref(frame);
+}
+
+static void pb_handle_identify(Client *client, json_t *frame)
+{
+	PbSession *s = PB_SESS(client);
+	if (!s || !s->bot) {
+		pb_close_ws(client, PB_CLOSE_AUTH_FAILED, "No session context");
+		return;
+	}
+
+	json_t *d = json_object_get(frame, "d");
+	if (!json_is_object(d)) {
+		pb_close_ws(client, PB_CLOSE_AUTH_FAILED, "IDENTIFY.d must be an object");
+		return;
+	}
+	/* Verify token in IDENTIFY matches what authenticated the upgrade. */
+	json_t *tokj = json_object_get(d, "token");
+	if (!json_is_string(tokj) ||
+	    !s->bot->config_token ||
+	    strcmp(json_string_value(tokj), s->bot->config_token)) {
+		pb_close_ws(client, PB_CLOSE_AUTH_FAILED,
+		            "IDENTIFY token mismatch");
+		return;
+	}
+
+	s->identified = 1;
+	s->bot->session = s;
+	s->last_heartbeat = TStime();
+
+	/* Update the ghost's away to "online" (drop the away flag). */
+	if (s->bot->ghost && s->bot->ghost->user->away) {
+		safe_free(s->bot->ghost->user->away);
+		s->bot->ghost->user->away = NULL;
+	}
+
+	/* READY dispatch. */
+	json_t *ready_d = json_object();
+	json_object_set_new(ready_d, "session_id", json_string(s->bot->bot_id));
+	json_object_set_new(ready_d, "bot_nick", json_string(s->bot->nick));
+	json_object_set_new(ready_d, "scope", json_string(pb_scope_str(s->bot->scope)));
+	json_t *channels = json_array();
+	if (s->bot->ghost) {
+		for (Membership *m = s->bot->ghost->user->channel; m; m = m->next)
+			json_array_append_new(channels, json_string(m->channel->name));
+	}
+	json_object_set_new(ready_d, "channels", channels);
+	pb_send_dispatch(client, "READY", ready_d);
+
+	unreal_log(ULOG_INFO, "pushbot", "BOT_ONLINE", NULL,
+	           "Bot $nick is now online on gateway",
+	           log_data_string("nick", s->bot->nick));
+}
+
+static void pb_handle_heartbeat(Client *client, json_t *frame)
+{
+	PbSession *s = PB_SESS(client);
+	if (!s) return;
+	json_t *d = json_object_get(frame, "d");
+	if (json_is_integer(d))
+		s->last_acked_seq = json_integer_value(d);
+	s->last_heartbeat = TStime();
+	json_t *ack = json_object();
+	json_object_set_new(ack, "op", json_integer(PB_OP_HEARTBEAT_ACK));
+	pb_send_op(client, ack);
+	json_decref(ack);
+}
+
+static void pb_close_ws(Client *client, int code, const char *reason)
+{
+	/* Send a WebSocket Close frame (opcode 0x08), then mark the
+	 * connection dead.  Frame body is a 2-byte close code in network
+	 * byte order optionally followed by a UTF-8 reason. */
+	char buf[256];
+	int rlen = reason ? strlen(reason) : 0;
+	if (rlen > 250) rlen = 250;
+	buf[0] = (code >> 8) & 0xff;
+	buf[1] = code & 0xff;
+	if (rlen) memcpy(buf + 2, reason, rlen);
+	char *payload = buf;
+	int total = 2 + rlen;
+	if (websocket_create_packet(0x08 /* WSOP_CLOSE */, &payload, &total) >= 0) {
+		dbuf_put(&client->local->sendQ, payload, total);
+		send_queued(client);
+	}
+	dead_socket(client, reason ? reason : "Gateway closed");
+}
+
+static void pb_session_free(PbSession *s)
+{
+	if (!s) return;
+	if (s->bot && s->bot->session == s) {
+		s->bot->session = NULL;
+		/* Set the bot away again until reconnect. */
+		if (s->bot->ghost && !s->bot->ghost->user->away) {
+			safe_strdup(s->bot->ghost->user->away, "bot offline");
+			s->bot->ghost->user->away_since = TStime();
+		}
+	}
+	if (s->heartbeat_ev) { EventDel(s->heartbeat_ev); s->heartbeat_ev = NULL; }
+	safe_free(s);
+}
+
+static void pb_moddata_session_free(ModData *md)
+{
+	if (!md || !md->ptr) return;
+	pb_session_free((PbSession *)md->ptr);
+	md->ptr = NULL;
+}
+
+EVENT(pb_heartbeat_check)
+{
+	time_t now = TStime();
+	for (PbBot *b = bots; b; b = b->next) {
+		PbSession *s = b->session;
+		if (!s || !s->client) continue;
+		if (!s->identified) continue;
+		if ((now - s->last_heartbeat) * 1000 > PB_HEARTBEAT_GRACE_MS) {
+			unreal_log(ULOG_INFO, "pushbot", "HEARTBEAT_TIMEOUT", NULL,
+			           "Bot $nick gateway timed out, closing",
+			           log_data_string("nick", b->nick));
+			pb_close_ws(s->client, PB_CLOSE_TIMEOUT, "Heartbeat missed");
+		}
+	}
 }
