@@ -156,12 +156,23 @@ void unload_all_unused_history_backends(void)
 	}
 }
 
+/* During /REHASH, HistoryBackendDel leaves entries in the list with
+ * unloaded=1 (their .so is dlclose'd, function pointers are dangling)
+ * until unload_all_unused_history_backends() commits the cleanup or a
+ * fresh HistoryBackendAdd resurrects them.  Every iteration below MUST
+ * skip those entries -- calling through hb->history_destroy on an
+ * unloaded entry SEGVs (caught in the wild during a /REHASH that
+ * triggered a pushbot ghost teardown -> channel-destroy hook ->
+ * history_destroy chain).
+ */
+
 int history_add(const char *object, MessageTag *mtags, const char *line)
 {
 	HistoryBackend *hb;
 
 	for (hb = historybackends; hb; hb=hb->next)
-		hb->history_add(object, mtags, line);
+		if (!hb->unloaded)
+			hb->history_add(object, mtags, line);
 
 	return 1;
 }
@@ -172,7 +183,7 @@ int history_add_multiline(const char *object, MessageTag *mtags, const char *sou
 
 	for (hb = historybackends; hb; hb = hb->next)
 	{
-		if (hb->history_add_multiline)
+		if (!hb->unloaded && hb->history_add_multiline)
 			hb->history_add_multiline(object, mtags, source, cmd, target, lines);
 	}
 
@@ -190,7 +201,7 @@ HistoryResult *history_request(const char *object, HistoryFilter *filter)
 
 	/* Right now we return whenever the first backend has a result. */
 	for (hb = historybackends; hb; hb = hb->next)
-		if ((r = hb->history_request(object, filter)))
+		if (!hb->unloaded && (r = hb->history_request(object, filter)))
 			return r;
 
 	return NULL;
@@ -209,6 +220,8 @@ int history_delete(const char *object, HistoryFilter *filter, int *rejected_dele
 	 * can simply be computed as the maximum */
 	for (hb = historybackends; hb; hb = hb->next)
 	{
+		if (hb->unloaded)
+			continue;
 		deleted = hb->history_delete(object, filter, &rejected);
 		if (deleted > max_deleted)
 			max_deleted = deleted;
@@ -227,7 +240,8 @@ int history_destroy(const char *object)
 	HistoryBackend *hb;
 
 	for (hb = historybackends; hb; hb=hb->next)
-		hb->history_destroy(object);
+		if (!hb->unloaded)
+			hb->history_destroy(object);
 
 	return 1;
 }
@@ -237,7 +251,8 @@ int history_set_limit(const char *object, int max_lines, long max_t)
 	HistoryBackend *hb;
 
 	for (hb = historybackends; hb; hb=hb->next)
-		hb->history_set_limit(object, max_lines, max_t);
+		if (!hb->unloaded)
+			hb->history_set_limit(object, max_lines, max_t);
 
 	return 1;
 }
