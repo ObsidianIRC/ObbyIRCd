@@ -320,6 +320,7 @@ static int  pb_mtag_botcmd_is_ok(Client *c, const char *n, const char *v);
 static int  pb_mtag_botcmds_query_is_ok(Client *c, const char *n, const char *v);
 static int  pb_mtag_botcmds_is_ok(Client *c, const char *n, const char *v);
 static int  pb_mtag_botcmds_changed_is_ok(Client *c, const char *n, const char *v);
+static void pb_send_botcmds_to(Client *client, PbBot *b);
 static void pb_mtag_forward(Client *sender, MessageTag *recv_mtags,
                             MessageTag **mtag_list, const char *signature);
 static void pb_handle_command_register(Client *client, json_t *frame);
@@ -2022,6 +2023,33 @@ static int pb_mtag_botcmds_changed_is_ok(Client *c, const char *n, const char *v
 	return 1;
 }
 
+/* Reply to a +draft/bot-cmds-query TAGMSG with the bot's command
+ * schema, base64-encoded, addressed back to the querying client. */
+static void pb_send_botcmds_to(Client *client, PbBot *b)
+{
+	if (!client || !b || !b->ghost) return;
+	json_t *body = json_object();
+	json_object_set_new(body, "version", json_integer(1));
+	json_object_set_new(body, "commands",
+	    b->commands ? json_incref(b->commands) : json_array());
+	char *json_str = json_dumps(body, JSON_COMPACT);
+	json_decref(body);
+	if (!json_str) return;
+	int jlen = strlen(json_str);
+	int b64_max = ((jlen + 2) / 3) * 4 + 1;
+	char *b64 = safe_alloc(b64_max);
+	b64_encode(json_str, jlen, b64, b64_max);
+	free(json_str);
+
+	MessageTag *tag = safe_alloc(sizeof(*tag));
+	safe_strdup(tag->name, "+draft/bot-cmds");
+	safe_strdup(tag->value, b64);
+	sendto_one(client, tag, ":%s TAGMSG %s",
+	           b->ghost->name, client->name);
+	free_message_tags(tag);
+	safe_free(b64);
+}
+
 /* Copy our client-prefixed tags from the incoming message into the
  * outgoing tag list, so HOOKTYPE_CHANMSG/USERMSG can see them. */
 static void pb_mtag_forward(Client *sender, MessageTag *recv_mtags,
@@ -2703,18 +2731,29 @@ static int pb_hook_usermsg(Client *client, Client *to, MessageTag *mtags,
 	if (!to || !text) return 0;
 
 	/* Phase 5: a TAGMSG to a bot's ghost with +draft/bot-cmd is a
-	 * slash invocation in DM (or private-visibility channel context). */
+	 * slash invocation in DM (or private-visibility channel context).
+	 * +draft/bot-cmds-query is the discovery counterpart. */
 	if (sendtype == SEND_TYPE_TAGMSG) {
 		const char *botcmd_b64 = NULL;
 		const char *channel_ctx = NULL;
+		int is_query = 0;
 		for (MessageTag *m = mtags; m; m = m->next) {
 			if (m->name && !strcmp(m->name, "+draft/bot-cmd"))
 				botcmd_b64 = m->value;
 			else if (m->name && !strcmp(m->name, "+draft/channel-context"))
 				channel_ctx = m->value;
+			else if (m->name && !strcmp(m->name, "+draft/bot-cmds-query"))
+				is_query = 1;
 		}
 		if (botcmd_b64)
 			return pb_route_botcmd_user(client, to, mtags, botcmd_b64, channel_ctx);
+		if (is_query) {
+			PbBot *b = NULL;
+			for (PbBot *bb = bots; bb; bb = bb->next)
+				if (bb->ghost == to) { b = bb; break; }
+			if (b) pb_send_botcmds_to(client, b);
+			return 0;
+		}
 	}
 
 	for (PbBot *b = bots; b; b = b->next) {
