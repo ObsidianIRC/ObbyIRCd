@@ -99,6 +99,15 @@ def ws_connect(host: str, port: int, path: str, token: str) -> ssl.SSLSocket:
     return sock
 
 
+class WebSocketClose(ConnectionError):
+    """Server sent a Close frame.  Carries the 2-byte status code."""
+
+    def __init__(self, code: int, reason: str) -> None:
+        super().__init__(f"WS close {code}: {reason}")
+        self.code = code
+        self.reason = reason
+
+
 def recv_frame(sock: ssl.SSLSocket) -> Optional[bytes]:
     try:
         head = _read_n(sock, 2)
@@ -114,7 +123,9 @@ def recv_frame(sock: ssl.SSLSocket) -> Optional[bytes]:
         plen = int.from_bytes(_read_n(sock, 8), "big")
     data = _read_n(sock, plen)
     if opcode == 0x8:
-        raise ConnectionError(f"server sent CLOSE: {data!r}")
+        code = int.from_bytes(data[:2], "big") if len(data) >= 2 else 0
+        reason = data[2:].decode("utf-8", errors="replace")
+        raise WebSocketClose(code, reason)
     if opcode == 0x9:  # PING -> auto PONG
         send_frame(sock, 0xA, data or b"")
         return recv_frame(sock)
@@ -407,6 +418,15 @@ def main() -> None:
         except KeyboardInterrupt:
             log.info("interrupted; exiting")
             return
+        except WebSocketClose as e:
+            log.warning("connection lost: %s", e)
+            # Close codes that signal the server forgot our session ->
+            # drop the resume id so the next attempt IDENTIFYs fresh.
+            # 4001 AUTH_FAILED (session displaced), 4006 INVALID_SESSION.
+            if e.code in (4001, 4006):
+                state.session_id = None
+                state.last_seq = 0
+                backoff = 1.0
         except Exception as e:
             log.warning("connection lost: %s", e)
         log.info("reconnecting in %.1f s", backoff)
