@@ -192,6 +192,7 @@ struct PbConfigBot {
 typedef struct {
 	char *database_path;
 	char *registration_mode;     /* "admin" | "approval" | "open" */
+	char *registration_secret;   /* shared secret for POST /bots; NULL = disabled */
 	int webhook_failure_suspend_after;
 	PbConfigBot *pending_bots;   /* head of list */
 } PbCfg;
@@ -301,6 +302,19 @@ EVENT(pb_heartbeat_check);
 static void pb_webhook_dispatch(PbBot *b, const char *event_name, const char *body_json);
 static void pb_webhook_response(OutgoingWebRequest *req, OutgoingWebResponse *resp);
 
+/* Phase 8: self-registration REST endpoints */
+static void pb_rest_register_bot(Client *client, WebRequest *web);
+static void pb_rest_list_bots(Client *client, WebRequest *web);
+
+/* Phase 9: JSON-RPC parity */
+RPC_CALL_FUNC(pb_rpc_list);
+RPC_CALL_FUNC(pb_rpc_get);
+RPC_CALL_FUNC(pb_rpc_register);
+RPC_CALL_FUNC(pb_rpc_approve);
+RPC_CALL_FUNC(pb_rpc_suspend);
+RPC_CALL_FUNC(pb_rpc_unsuspend);
+RPC_CALL_FUNC(pb_rpc_delete);
+
 /* Phase 5: slash commands */
 static int  pb_mtag_botcmd_is_ok(Client *c, const char *n, const char *v);
 static int  pb_mtag_botcmds_query_is_ok(Client *c, const char *n, const char *v);
@@ -399,6 +413,20 @@ MOD_INIT()
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_PART, 0, pb_hook_local_part);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_KICK, 0, pb_hook_local_kick);
 	CommandAdd(modinfo->handle, "PUSHBOT", cmd_pushbot, MAXPARA, CMD_USER);
+
+	/* Phase 9: JSON-RPC parity */
+	{
+		RPCHandlerInfo r;
+		memset(&r, 0, sizeof(r));
+		r.loglevel = ULOG_DEBUG;
+		r.method = "pushbot.list";    r.call = pb_rpc_list;       RPCHandlerAdd(modinfo->handle, &r);
+		r.method = "pushbot.get";     r.call = pb_rpc_get;        RPCHandlerAdd(modinfo->handle, &r);
+		r.method = "pushbot.register";r.call = pb_rpc_register;   RPCHandlerAdd(modinfo->handle, &r);
+		r.method = "pushbot.approve"; r.call = pb_rpc_approve;    RPCHandlerAdd(modinfo->handle, &r);
+		r.method = "pushbot.suspend"; r.call = pb_rpc_suspend;    RPCHandlerAdd(modinfo->handle, &r);
+		r.method = "pushbot.unsuspend"; r.call = pb_rpc_unsuspend;RPCHandlerAdd(modinfo->handle, &r);
+		r.method = "pushbot.delete";  r.call = pb_rpc_delete;     RPCHandlerAdd(modinfo->handle, &r);
+	}
 
 	/* Heartbeat watchdog: every 5s, kick sessions that missed too many. */
 	EventAdd(modinfo->handle, "pb_heartbeat_check", pb_heartbeat_check, NULL, 5000, 0);
@@ -543,6 +571,15 @@ static int pb_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 			}
 		} else if (!strcmp(cep->name, "default-permissions")) {
 			/* Reserved for later phases. */
+		} else if (!strcmp(cep->name, "registration-secret")) {
+			if (!cep->value || !*cep->value) {
+				config_error("%s:%d: pushbot::registration-secret cannot be empty",
+				             cep->file->filename, cep->line_number);
+				errors++;
+			} else if (strlen(cep->value) < 16) {
+				config_warn("%s:%d: pushbot::registration-secret is shorter than 16 chars; use a longer secret",
+				             cep->file->filename, cep->line_number);
+			}
 		} else if (!strcmp(cep->name, "bot")) {
 			pb_test_bot_block(cf, cep, &errors);
 		} else {
@@ -603,6 +640,8 @@ static int pb_configrun(ConfigFile *cf, ConfigEntry *ce, int type)
 			safe_strdup(cfg.database_path, cep->value);
 		} else if (!strcmp(cep->name, "webhook-failure-suspend-after")) {
 			cfg.webhook_failure_suspend_after = atoi(cep->value);
+		} else if (!strcmp(cep->name, "registration-secret")) {
+			safe_strdup(cfg.registration_secret, cep->value);
 		} else if (!strcmp(cep->name, "bot")) {
 			pb_parse_bot_block(cep);
 		}
@@ -1123,6 +1162,57 @@ static void cmd_pushbot_info(Client *client, const char *nick)
 	}
 }
 
+static void cmd_pushbot_setstatus(Client *client, const char *nick, PbStatus new_status, const char *verb)
+{
+	PbBot *b = pb_find_bot_by_nick(nick);
+	if (!b) { sendnotice(client, "No such bot: %s", nick); return; }
+	if (b->from_config) {
+		sendnotice(client, "Bot %s is config-defined; edit obbyircd.conf + /REHASH", nick);
+		return;
+	}
+	if (b->status == new_status) {
+		sendnotice(client, "Bot %s is already %s", nick, verb);
+		return;
+	}
+	PbStatus old = b->status;
+	b->status = new_status;
+
+	if (new_status == PB_STATUS_ACTIVE && !b->ghost) {
+		pb_spawn_ghost(b);
+	}
+	if (new_status != PB_STATUS_ACTIVE && b->ghost) {
+		Client *g = b->ghost;
+		b->ghost = NULL;
+		exit_client(g, NULL, "Bot deactivated by operator");
+	}
+	if (new_status == PB_STATUS_DELETED) {
+		sqlite3_stmt *st = NULL;
+		if (sqlite3_prepare_v2(db, "UPDATE pushbots SET status='deleted' WHERE bot_id=?", -1, &st, NULL) == SQLITE_OK) {
+			sqlite3_bind_text(st, 1, b->bot_id, -1, SQLITE_STATIC);
+			sqlite3_step(st);
+			sqlite3_finalize(st);
+		}
+	} else {
+		const char *str = new_status == PB_STATUS_ACTIVE ? "active" :
+		                  new_status == PB_STATUS_SUSPENDED ? "suspended" : "pending";
+		sqlite3_stmt *st = NULL;
+		if (sqlite3_prepare_v2(db, "UPDATE pushbots SET status=? WHERE bot_id=?", -1, &st, NULL) == SQLITE_OK) {
+			sqlite3_bind_text(st, 1, str, -1, SQLITE_STATIC);
+			sqlite3_bind_text(st, 2, b->bot_id, -1, SQLITE_STATIC);
+			sqlite3_step(st);
+			sqlite3_finalize(st);
+		}
+	}
+	sendnotice(client, "Bot %s status: %s -> %s", nick,
+	           old == PB_STATUS_ACTIVE ? "active" : old == PB_STATUS_PENDING ? "pending" : old == PB_STATUS_SUSPENDED ? "suspended" : "deleted",
+	           verb);
+	unreal_log(ULOG_INFO, "pushbot", "ADMIN", client,
+	           "Operator $opnick: $verb bot $bot",
+	           log_data_string("opnick", client->name),
+	           log_data_string("verb", verb),
+	           log_data_string("bot", nick));
+}
+
 CMD_FUNC(cmd_pushbot)
 {
 	if (!MyConnect(client) || !IsUser(client)) return;
@@ -1132,7 +1222,7 @@ CMD_FUNC(cmd_pushbot)
 		return;
 	}
 	if (parc < 2) {
-		sendnotice(client, "Usage: PUSHBOT LIST | INFO <nick>");
+		sendnotice(client, "Usage: PUSHBOT LIST | INFO <nick> | APPROVE <nick> | SUSPEND <nick> | UNSUSPEND <nick> | DELETE <nick>");
 		return;
 	}
 
@@ -1147,6 +1237,26 @@ CMD_FUNC(cmd_pushbot)
 			return;
 		}
 		cmd_pushbot_info(client, parv[2]);
+		return;
+	}
+	if (!strcasecmp(sub, "APPROVE")) {
+		if (parc < 3) { sendnotice(client, "Usage: PUSHBOT APPROVE <nick>"); return; }
+		cmd_pushbot_setstatus(client, parv[2], PB_STATUS_ACTIVE, "active");
+		return;
+	}
+	if (!strcasecmp(sub, "SUSPEND")) {
+		if (parc < 3) { sendnotice(client, "Usage: PUSHBOT SUSPEND <nick>"); return; }
+		cmd_pushbot_setstatus(client, parv[2], PB_STATUS_SUSPENDED, "suspended");
+		return;
+	}
+	if (!strcasecmp(sub, "UNSUSPEND")) {
+		if (parc < 3) { sendnotice(client, "Usage: PUSHBOT UNSUSPEND <nick>"); return; }
+		cmd_pushbot_setstatus(client, parv[2], PB_STATUS_ACTIVE, "active");
+		return;
+	}
+	if (!strcasecmp(sub, "DELETE")) {
+		if (parc < 3) { sendnotice(client, "Usage: PUSHBOT DELETE <nick>"); return; }
+		cmd_pushbot_setstatus(client, parv[2], PB_STATUS_DELETED, "deleted");
 		return;
 	}
 	sendnotice(client, "Unknown PUSHBOT subcommand: %s", sub);
@@ -1279,6 +1389,35 @@ static int pb_handle_webrequest(Client *client, WebRequest *web)
 		return 0;
 	}
 
+	/* Phase 8: self-registration endpoint -- doesn't auth as a bot,
+	 * but against the configured registration-secret.  Both POST
+	 * (register) and GET (list pending requests, ircop-only via the
+	 * registration-secret) defer to the body handler. */
+	if (web->uri && !strcmp(web->uri, "/pushbot/v1/bots")) {
+		/* For POST we MUST read the body even on auth failure --
+		 * sending a response + close while the client is still
+		 * streaming POST data triggers TCP RST and clients see
+		 * "Remote end closed connection without response".
+		 * Defer to handle_body so the kernel buffers the body
+		 * first.  For GET (no body), reply now. */
+		if (web->method == HTTP_METHOD_POST)
+			return 1;  /* wait for body, then validate + respond */
+		if (!cfg.registration_secret) {
+			webserver_send_response(client, 403, "self-registration disabled\n");
+			return 0;
+		}
+		if (strcmp(token, cfg.registration_secret)) {
+			webserver_send_response(client, 401, "invalid registration secret\n");
+			return 0;
+		}
+		if (web->method == HTTP_METHOD_GET) {
+			pb_rest_list_bots(client, web);
+			return 0;
+		}
+		webserver_send_response(client, 405, "method not allowed\n");
+		return 0;
+	}
+
 	/* Need to keep token around until the upgrade is complete so we
 	 * can hand it to the session.  Stash on the WebSocketUser-equiv
 	 * for now (we'll create our session below). */
@@ -1386,6 +1525,18 @@ static int pb_handle_webrequest_data(Client *client, WebRequest *web, const char
 		if (!pb_check_bearer(auth, token, sizeof(token))) {
 			webserver_send_response(client, 401, "Bearer required\n");
 			return 0;
+		}
+		/* Phase 8: self-registration uses the registration-secret,
+		 * not a bot bearer token. */
+		if (web->uri && !strcmp(web->uri, "/pushbot/v1/bots") &&
+		    web->method == HTTP_METHOD_POST) {
+			if (!cfg.registration_secret ||
+			    strcmp(token, cfg.registration_secret)) {
+				webserver_send_response(client, 401, "invalid registration secret\n");
+				return 0;
+			}
+			pb_rest_register_bot(client, web);
+			return 1;
 		}
 		PbBot *b = pb_find_bot_by_token(token);
 		if (!b) {
@@ -2696,6 +2847,247 @@ static int pb_pct_decode(char *s)
 	*o = '\0';
 	return 0;
 }
+
+/* Generate a fresh random bearer token (40 alnum chars). */
+static void pb_generate_token(char *out, size_t outlen)
+{
+	int n = outlen ? (int)outlen - 1 : 0;
+	if (n > 64) n = 64;
+	gen_random_alnum(out, n);
+	out[n] = '\0';
+}
+
+/* Build a minimal PbConfigBot from a parsed JSON body for re-use of
+ * pb_upsert_bot_row + pb_apply_pending_bots-style materialisation. */
+static int pb_register_bot_internal(json_t *body, int active,
+                                    char *bot_id_out, char *token_out)
+{
+	json_t *jnick = json_object_get(body, "nick");
+	if (!json_is_string(jnick)) return -1;
+	const char *nick = json_string_value(jnick);
+	if (!*nick || pb_find_bot_by_nick(nick) || find_user(nick, NULL))
+		return -2;  /* nick clash */
+
+	PbConfigBot tmp;
+	memset(&tmp, 0, sizeof(tmp));
+	safe_strdup(tmp.nick, nick);
+	const char *rn = NULL;
+	json_t *jrn = json_object_get(body, "realname");
+	if (json_is_string(jrn)) rn = json_string_value(jrn);
+	safe_strdup(tmp.realname, rn ? rn : nick);
+	json_t *jsc = json_object_get(body, "scope");
+	tmp.scope = pb_parse_scope(json_is_string(jsc) ? json_string_value(jsc) : "channel");
+	json_t *jtr = json_object_get(body, "transport");
+	tmp.transport = pb_parse_transport(json_is_string(jtr) ? json_string_value(jtr) : "gateway");
+	json_t *jwh = json_object_get(body, "webhook_url");
+	if (json_is_string(jwh)) safe_strdup(tmp.webhook_url, json_string_value(jwh));
+	json_t *jws = json_object_get(body, "webhook_secret");
+	if (json_is_string(jws)) safe_strdup(tmp.webhook_secret, json_string_value(jws));
+
+	pb_generate_token(token_out, 41);
+	safe_strdup(tmp.token, token_out);
+	char bot_id[16];
+	pb_generate_id(bot_id, sizeof(bot_id));
+	strlcpy(bot_id_out, bot_id, 16);
+
+	if (pb_upsert_bot_row(bot_id, &tmp) < 0) {
+		safe_free(tmp.nick); safe_free(tmp.realname); safe_free(tmp.token);
+		safe_free(tmp.webhook_url); safe_free(tmp.webhook_secret);
+		return -3;
+	}
+
+	PbBot *b = safe_alloc(sizeof(*b));
+	safe_strdup(b->bot_id, bot_id);
+	safe_strdup(b->nick, tmp.nick);
+	safe_strdup(b->account, tmp.nick);
+	safe_strdup(b->realname, tmp.realname);
+	b->scope = tmp.scope;
+	b->transport = tmp.transport;
+	b->status = active ? PB_STATUS_ACTIVE : PB_STATUS_PENDING;
+	if (tmp.webhook_url) safe_strdup(b->webhook_url, tmp.webhook_url);
+	if (tmp.webhook_secret) safe_strdup(b->webhook_secret, tmp.webhook_secret);
+	safe_strdup(b->config_token, tmp.token);
+	AddListItem(b, bots);
+	if (active) pb_spawn_ghost(b);
+
+	safe_free(tmp.nick); safe_free(tmp.realname); safe_free(tmp.token);
+	safe_free(tmp.webhook_url); safe_free(tmp.webhook_secret);
+	return 0;
+}
+
+static void pb_rest_register_bot(Client *client, WebRequest *web)
+{
+	if (cfg.registration_mode &&
+	    !strcasecmp(cfg.registration_mode, "admin")) {
+		pb_rest_send_error(client, 403, "registration mode=admin: config-only");
+		return;
+	}
+	if (!web->request_buffer) {
+		pb_rest_send_error(client, 400, "missing body");
+		return;
+	}
+	json_error_t err;
+	json_t *body = json_loads(web->request_buffer, 0, &err);
+	if (!body || !json_is_object(body)) {
+		if (body) json_decref(body);
+		pb_rest_send_error(client, 400, "body must be a JSON object");
+		return;
+	}
+	int active = (cfg.registration_mode &&
+	              !strcasecmp(cfg.registration_mode, "open")) ? 1 : 0;
+	char bot_id[16] = "", token[64] = "";
+	int rc = pb_register_bot_internal(body, active, bot_id, token);
+	json_decref(body);
+	if (rc == -1) { pb_rest_send_error(client, 400, "missing or invalid 'nick'"); return; }
+	if (rc == -2) { pb_rest_send_error(client, 409, "nick already in use"); return; }
+	if (rc < 0)   { pb_rest_send_error(client, 500, "create failed"); return; }
+
+	json_t *resp = json_object();
+	json_object_set_new(resp, "bot_id", json_string(bot_id));
+	json_object_set_new(resp, "token", json_string(token));
+	json_object_set_new(resp, "status", json_string(active ? "active" : "pending"));
+	pb_rest_send_json(client, active ? 201 : 202, resp);
+
+	unreal_log(ULOG_INFO, "pushbot", "SELF_REGISTER", NULL,
+	           "Bot $bot_id ($nick) created via REST self-registration ($status)",
+	           log_data_string("bot_id", bot_id),
+	           log_data_string("nick", "?"),
+	           log_data_string("status", active ? "active" : "pending"));
+}
+
+static void pb_rest_list_bots(Client *client, WebRequest *web)
+{
+	json_t *arr = json_array();
+	for (PbBot *b = bots; b; b = b->next) {
+		json_t *o = json_object();
+		json_object_set_new(o, "bot_id", json_string(b->bot_id));
+		json_object_set_new(o, "nick", json_string(b->nick));
+		json_object_set_new(o, "scope", json_string(pb_scope_str(b->scope)));
+		json_object_set_new(o, "transport", json_string(pb_transport_str(b->transport)));
+		json_object_set_new(o, "status",
+		    json_string(b->status == PB_STATUS_ACTIVE ? "active" :
+		                b->status == PB_STATUS_PENDING ? "pending" :
+		                b->status == PB_STATUS_SUSPENDED ? "suspended" : "deleted"));
+		json_object_set_new(o, "from_config", json_boolean(b->from_config));
+		json_array_append_new(arr, o);
+	}
+	json_t *body = json_object();
+	json_object_set_new(body, "bots", arr);
+	pb_rest_send_json(client, 200, body);
+}
+
+/* ===================================================================
+ * Phase 9 -- JSON-RPC parity
+ * =================================================================== */
+
+static json_t *pb_bot_to_json(PbBot *b)
+{
+	json_t *o = json_object();
+	json_object_set_new(o, "bot_id", json_string(b->bot_id ? b->bot_id : ""));
+	json_object_set_new(o, "nick", json_string(b->nick ? b->nick : ""));
+	json_object_set_new(o, "realname", json_string(b->realname ? b->realname : ""));
+	json_object_set_new(o, "scope", json_string(pb_scope_str(b->scope)));
+	json_object_set_new(o, "transport", json_string(pb_transport_str(b->transport)));
+	json_object_set_new(o, "status",
+	    json_string(b->status == PB_STATUS_ACTIVE ? "active" :
+	                b->status == PB_STATUS_PENDING ? "pending" :
+	                b->status == PB_STATUS_SUSPENDED ? "suspended" : "deleted"));
+	json_object_set_new(o, "from_config", json_boolean(b->from_config));
+	json_object_set_new(o, "webhook_url",
+	    json_string(b->webhook_url ? b->webhook_url : ""));
+	json_object_set_new(o, "online",
+	    json_boolean(b->session && b->session->identified));
+	json_object_set_new(o, "channels_count", json_integer(
+	    b->ghost && b->ghost->user ? 0 : 0));  /* TODO membership count */
+	return o;
+}
+
+RPC_CALL_FUNC(pb_rpc_list)
+{
+	json_t *result = json_object();
+	json_t *list = json_array();
+	for (PbBot *b = bots; b; b = b->next)
+		json_array_append_new(list, pb_bot_to_json(b));
+	json_object_set_new(result, "list", list);
+	rpc_response(client, request, result);
+	json_decref(result);
+}
+
+RPC_CALL_FUNC(pb_rpc_get)
+{
+	const char *nick;
+	REQUIRE_PARAM_STRING("nick", nick);
+	PbBot *b = pb_find_bot_by_nick(nick);
+	if (!b) {
+		rpc_error(client, request, JSON_RPC_ERROR_NOT_FOUND, "No such bot");
+		return;
+	}
+	json_t *result = pb_bot_to_json(b);
+	rpc_response(client, request, result);
+	json_decref(result);
+}
+
+RPC_CALL_FUNC(pb_rpc_register)
+{
+	if (cfg.registration_mode && !strcasecmp(cfg.registration_mode, "admin")) {
+		rpc_error(client, request, JSON_RPC_ERROR_DENIED,
+		          "registration mode=admin: config-only");
+		return;
+	}
+	const char *nick;
+	REQUIRE_PARAM_STRING("nick", nick);
+	if (pb_find_bot_by_nick(nick) || find_user(nick, NULL)) {
+		rpc_error(client, request, JSON_RPC_ERROR_ALREADY_EXISTS, "nick already in use");
+		return;
+	}
+	int active = (cfg.registration_mode &&
+	              !strcasecmp(cfg.registration_mode, "open")) ? 1 : 0;
+	char bot_id[16] = "", token[64] = "";
+	int rc = pb_register_bot_internal(params, active, bot_id, token);
+	if (rc < 0) {
+		rpc_error(client, request, JSON_RPC_ERROR_INTERNAL_ERROR, "create failed");
+		return;
+	}
+	json_t *result = json_object();
+	json_object_set_new(result, "bot_id", json_string(bot_id));
+	json_object_set_new(result, "token", json_string(token));
+	json_object_set_new(result, "status", json_string(active ? "active" : "pending"));
+	rpc_response(client, request, result);
+	json_decref(result);
+}
+
+static void pb_rpc_status_change(Client *client, json_t *request, json_t *params,
+                                 PbStatus new_status, const char *verb)
+{
+	const char *nick;
+	REQUIRE_PARAM_STRING("nick", nick);
+	PbBot *b = pb_find_bot_by_nick(nick);
+	if (!b) {
+		rpc_error(client, request, JSON_RPC_ERROR_NOT_FOUND, "No such bot");
+		return;
+	}
+	if (b->from_config) {
+		rpc_error(client, request, JSON_RPC_ERROR_DENIED,
+		          "config-defined bot; edit obbyircd.conf");
+		return;
+	}
+	b->status = new_status;
+	if (new_status == PB_STATUS_ACTIVE && !b->ghost) pb_spawn_ghost(b);
+	if (new_status != PB_STATUS_ACTIVE && b->ghost) {
+		Client *g = b->ghost; b->ghost = NULL;
+		exit_client(g, NULL, "Bot deactivated by RPC");
+	}
+	json_t *result = json_object();
+	json_object_set_new(result, "ok", json_true());
+	json_object_set_new(result, "status", json_string(verb));
+	rpc_response(client, request, result);
+	json_decref(result);
+}
+
+RPC_CALL_FUNC(pb_rpc_approve)   { pb_rpc_status_change(client, request, params, PB_STATUS_ACTIVE, "active"); }
+RPC_CALL_FUNC(pb_rpc_suspend)   { pb_rpc_status_change(client, request, params, PB_STATUS_SUSPENDED, "suspended"); }
+RPC_CALL_FUNC(pb_rpc_unsuspend) { pb_rpc_status_change(client, request, params, PB_STATUS_ACTIVE, "active"); }
+RPC_CALL_FUNC(pb_rpc_delete)    { pb_rpc_status_change(client, request, params, PB_STATUS_DELETED, "deleted"); }
 
 static int pb_handle_rest(Client *client, WebRequest *web, PbBot *b)
 {
