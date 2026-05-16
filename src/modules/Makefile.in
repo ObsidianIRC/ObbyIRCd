@@ -94,6 +94,7 @@ MODULES= \
 	guest-nicks.so \
 	obbyscript.so \
 	obbypy.so \
+	pushbot.so \
 	metadata.so \
 	metadata-db.so \
 	filehost.so \
@@ -192,3 +193,8 @@ PYTHON_EMBED_LIBS   := $(shell pkg-config --libs   python3-embed 2>/dev/null || 
 obbypy.so: obbypy.c $(INCLUDES)
 	$(CC) $(CFLAGS) $(PYTHON_EMBED_CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
 		-o obbypy.so obbypy.c $(PYTHON_EMBED_LIBS)
+
+# pushbot keeps its own SQLite store (separate from obsidian.db).
+pushbot.so: pushbot.c $(INCLUDES)
+	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
+		-o pushbot.so pushbot.c -lsqlite3
