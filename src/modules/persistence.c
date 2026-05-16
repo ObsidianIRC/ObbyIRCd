@@ -1684,6 +1684,83 @@ CMD_FUNC(cmd_persistence)
 		send_status(client, e);
 		persist_db_mark_dirty();
 	}
+	else if (!strcasecmp(subcmd, "ERASE"))
+	{
+		/* Mirrors Ergo's `NickServ ERASE <account> [code]`:
+		 * first call returns a confirmation code; second call with that
+		 * code performs the wipe. */
+		PersistEntry *target;
+		char expected[16];
+
+		if (!IsOper(client))
+		{
+			sendto_one(client, NULL,
+			           "FAIL PERSISTENCE PRIVS_NEEDED :Permission Denied- You do not have the correct IRC operator privileges");
+			return;
+		}
+
+		if (parc < 3 || BadPtr(parv[2]))
+		{
+			sendto_one(client, NULL,
+			           "FAIL PERSISTENCE INVALID_PARAMETERS :Usage: PERSISTENCE ERASE <account> [code]");
+			return;
+		}
+
+		target = find_entry(parv[2]);
+		if (!target)
+		{
+			sendto_one(client, NULL,
+			           "FAIL PERSISTENCE NO_SUCH_ACCOUNT :No persistence entry for account \"%s\"",
+			           parv[2]);
+			return;
+		}
+
+		/* Confirmation code: 8 hex chars derived from the entry's account
+		 * + disconnect_time. Stable per-entry, unguessable without first
+		 * issuing the no-code call. FNV-1a is plenty for an anti-typo
+		 * gate (this isn't a security boundary — the gate is IsOper). */
+		{
+			const char *p;
+			uint64_t h = 0xcbf29ce484222325ULL;
+			for (p = target->account; *p; p++)
+			{
+				h ^= (unsigned char)*p;
+				h *= 0x100000001b3ULL;
+			}
+			h ^= (uint64_t)target->disconnect_time;
+			snprintf(expected, sizeof(expected), "%08lx",
+			         (unsigned long)(h & 0xffffffffULL));
+		}
+
+		if (parc < 4 || BadPtr(parv[3]))
+		{
+			sendto_one(client, NULL,
+			           "NOTE PERSISTENCE CONFIRM :To erase \"%s\" issue: PERSISTENCE ERASE %s %s",
+			           target->account, target->account, expected);
+			return;
+		}
+
+		if (strcmp(parv[3], expected))
+		{
+			sendto_one(client, NULL,
+			           "FAIL PERSISTENCE INVALID_CODE :Confirmation code mismatch; re-issue without a code to get a fresh one");
+			return;
+		}
+
+		unreal_log(ULOG_INFO, "persistence", "PERSIST_ERASE", client,
+		           "$oper erased persistence entry for account $account",
+		           log_data_string("oper", client->name),
+		           log_data_string("account", target->account));
+
+		if (target->ghost)
+			destroy_ghost(target, "Erased by operator");
+		free_entry(target);
+		persist_save_db();
+
+		sendto_one(client, NULL,
+		           "NOTE PERSISTENCE ERASED :Persistence entry for \"%s\" removed",
+		           parv[2]);
+	}
 }
 
 /* ===================================================================
