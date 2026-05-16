@@ -1,0 +1,26 @@
+[Unit]
+Description=ObbyIRCd help pushbot (server-wide)
+After=obbyircd.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=valware
+Group=valware
+WorkingDirectory=/home/valware/helpbot
+Environment=PUSHBOT_HOST=127.0.0.1
+Environment=PUSHBOT_PORT=6670
+Environment=PUSHBOT_TOKEN=replace-me-with-a-helpbot-token
+Environment=PUSHBOT_NICK=help
+Environment=PUSHBOT_INSECURE=1
+ExecStart=/usr/bin/python3 /home/valware/helpbot/helpbot.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/helpbot.log
+StandardError=inherit
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -2233,6 +2233,24 @@ static void pb_dispatch_command(PbBot *bot, Client *invoker,
  *   2. Otherwise pick the first PushBot in the channel that has a
  *      command with the matching name registered.
  *   3. If multiple match, prefer channel-scope over server-scope. */
+/* Look for a command by name in the bot's registered schema. */
+static int pb_bot_has_command(PbBot *b, const char *name)
+{
+	if (!b || !b->commands || !name) return 0;
+	size_t i; json_t *c;
+	json_array_foreach(b->commands, i, c) {
+		json_t *cn = json_object_get(c, "name");
+		if (json_is_string(cn) && !strcmp(json_string_value(cn), name))
+			return 1;
+	}
+	return 0;
+}
+
+/* Resolve a slash-command invocation in a channel.  Spec §3.3:
+ *   1) explicit target via /cmd@botnick wins;
+ *   2) channel-scope bots in this channel that publish the command;
+ *   3) fall through to server-wide bots that publish the command.
+ * A user can always reach a server-wide bot from any channel by name. */
 static PbBot *pb_resolve_channel_botcmd(Channel *ch, json_t *cmd,
                                         const char *target_nick)
 {
@@ -2242,16 +2260,18 @@ static PbBot *pb_resolve_channel_botcmd(Channel *ch, json_t *cmd,
 	json_t *nmj = json_object_get(cmd, "name");
 	if (json_is_string(nmj)) name = json_string_value(nmj);
 	if (!name) return NULL;
+	/* Pass 1: channel-scope bot in this channel. */
 	for (PbBot *b = bots; b; b = b->next) {
 		if (b->status != PB_STATUS_ACTIVE) continue;
+		if (b->scope != PB_SCOPE_CHANNEL) continue;
 		if (!pb_bot_is_in_channel(b, ch)) continue;
-		if (!b->commands) continue;
-		size_t i; json_t *c;
-		json_array_foreach(b->commands, i, c) {
-			json_t *cn = json_object_get(c, "name");
-			if (json_is_string(cn) && !strcmp(json_string_value(cn), name))
-				return b;
-		}
+		if (pb_bot_has_command(b, name)) return b;
+	}
+	/* Pass 2: server-wide bot (no channel-membership requirement). */
+	for (PbBot *b = bots; b; b = b->next) {
+		if (b->status != PB_STATUS_ACTIVE) continue;
+		if (b->scope != PB_SCOPE_SERVER) continue;
+		if (pb_bot_has_command(b, name)) return b;
 	}
 	return NULL;
 }

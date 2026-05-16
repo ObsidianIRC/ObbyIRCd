@@ -1,64 +1,44 @@
-# weatherbot — sample PushBot client
+# weatherbot — channel-scope PushBot example
 
-A small, dependency-free Python reference implementation that drives
-the `weather` ghost configured in `doc/conf/examples/pushbot.conf`.
+Reference Python implementation that drives the `weather` ghost
+configured in [`../../conf/examples/pushbot.conf`](../../conf/examples/pushbot.conf).
+Built on the shared client at [`../pushbot_client.py`](../pushbot_client.py)
+— see [`../README.md`](../README.md) for the umbrella overview of
+client + bots and the channel-vs-server-scope distinction.
 
-It demonstrates every piece of the gateway protocol you need to write
-your own bot:
+## What this bot demonstrates
 
-| Phase | What it shows |
-|-------|---------------|
-| WS upgrade + IDENTIFY + RESUME | `ws_connect`, `run_once`, `SessionState` |
-| HELLO / heartbeat / HEARTBEAT_ACK | `heartbeat_thread` |
-| COMMAND_REGISTER + COMMANDS_REGISTERED ack | `COMMAND_SCHEMA`, `OP_COMMAND_REGISTER` send |
-| COMMAND_INVOKE dispatch + INTERACTION_RESPONSE | `handle_dispatch` |
-| INTERACTION_DEFER for slow handlers | `cmd_forecast` defers before hitting wttr.in |
-| MESSAGE_CREATE @mention reply | `MESSAGE_CREATE` branch in `handle_dispatch` |
-| REST as the bot ghost | `rest_send_channel` |
-| auto-reconnect with exponential backoff | `main` loop |
+- **`scope=channel`**: auto-joins `#weather` and `#general` from
+  the config block.  Slash commands only appear in those channels'
+  popovers.
+- **`deferred=True`** on `/forecast` — wttr.in can be slow, so the
+  client emits `INTERACTION_DEFER` before invoking the handler to
+  extend the server-side window from 3 s to 15 s.
+- **`@bot.on_event("MESSAGE_CREATE")`** plus `bot.post_to_channel()`
+  — replies in-channel via the REST API when someone mentions the
+  bot by nick.
 
-## Run it
+## Commands
 
-Set up a `bot { … }` block in your pushbot config that matches the
-nick + token the bot will use, then:
+| Command | Args | What it does |
+|---|---|---|
+| `/forecast <city>` | required string | wttr.in summary (defers) |
+| `/flip` | — | heads or tails |
+
+## Run
 
 ```bash
-PUSHBOT_HOST=obby.example.com \
-PUSHBOT_PORT=6670 \
-PUSHBOT_TOKEN=<your-long-random-token> \
-PUSHBOT_NICK=weather \
+PUSHBOT_HOST=obby.example.com PUSHBOT_PORT=6670 \
+PUSHBOT_TOKEN=<token-from-pushbot.conf> PUSHBOT_NICK=weather \
 python3 weatherbot.py
 ```
 
-For a persistent install with systemd, drop `weatherbot.service`
-into `/etc/systemd/system/` (edit the `Environment=` and `User=`
-lines first), then:
+Or as a systemd service — edit `weatherbot.service` to point at your
+token and path, then:
 
 ```bash
+sudo cp weatherbot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now weatherbot.service
+journalctl -fu weatherbot.service
 ```
-
-Logs go to `/var/log/weatherbot.log`.
-
-## Commands it registers
-
-- `/forecast <city>` — public, fetches a short summary from wttr.in
-- `/flip` — public, classic coin flip
-
-It also responds to MESSAGE_CREATE events that mention the bot's
-nick by name (in any channel it's in) with a one-line "hi, try
-/forecast or /flip" via the REST API.
-
-## What it deliberately keeps simple
-
-- No `permessage-deflate` (the gateway doesn't compress yet).
-- Text frames only — no fragmentation, no binary.
-- No persistence: if it crashes and the resume window (60 s) expires
-  the bot just IDENTIFYs fresh and re-registers its commands.
-- No interaction-response REST path — the bot always answers over
-  the gateway with `op=21 INTERACTION_RESPONSE`.
-
-For a richer example (option type coercion, choices, server-wide
-bots, multi-step interactions) build on top of this scaffold; the
-wire format is identical regardless of language.
