@@ -134,17 +134,26 @@ def _send_text(sock: ssl.SSLSocket, obj: dict) -> None:
     _send_frame(sock, 0x1, json.dumps(obj, separators=(",", ":")).encode())
 
 
-def _tls_ctx(insecure: bool) -> ssl.SSLContext:
+def _tls_ctx(verify: bool) -> ssl.SSLContext:
     ctx = ssl.create_default_context()
-    if insecure:
+    if not verify:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
 
-def _ws_connect(host: str, port: int, path: str, token: str, insecure: bool) -> ssl.SSLSocket:
+def _ws_connect(host: str, port: int, path: str, token: str,
+                tls: bool, tls_verify: bool):
+    """tls=False -> plain `ws://`.
+       tls=True, tls_verify=False -> `wss://` skipping cert verify
+            (the common case for a localhost listener whose cert is for
+             the public hostname).
+       tls=True, tls_verify=True  -> `wss://` with full verification."""
     raw = socket.create_connection((host, port), timeout=15)
-    sock = _tls_ctx(insecure).wrap_socket(raw, server_hostname=host)
+    if not tls:
+        sock = raw
+    else:
+        sock = _tls_ctx(verify=tls_verify).wrap_socket(raw, server_hostname=host)
     key = b64encode(urandom(16)).decode()
     req = (
         f"GET {path} HTTP/1.1\r\n"
@@ -197,14 +206,16 @@ class PushBot:
         port: int,
         token: str,
         nick: str,
-        insecure: bool = True,
+        tls: bool = True,
+        tls_verify: bool = False,
         log: Optional[logging.Logger] = None,
     ) -> None:
         self.host = host
         self.port = port
         self.token = token
         self.nick = nick
-        self.insecure = insecure
+        self.tls = tls
+        self.tls_verify = tls_verify
         self.log = log or logging.getLogger(nick)
         self._commands: dict[str, _Command] = {}
         self._event_handlers: dict[str, Callable[[dict], None]] = {}
@@ -214,14 +225,22 @@ class PushBot:
 
     @classmethod
     def from_env(cls, **overrides: Any) -> "PushBot":
-        """Build from PUSHBOT_HOST/PORT/TOKEN/NICK environment variables."""
+        """Build from PUSHBOT_HOST/PORT/TOKEN/NICK environment variables.
+
+        TLS: defaults to TLS-on, verify-off — the typical localhost-listener
+        case where the cert is issued to a public hostname.  Override with:
+          PUSHBOT_TLS=0       -> plain ws://
+          PUSHBOT_TLS_VERIFY=1 -> verify cert (requires hostname match)
+        """
         return cls(
             host=overrides.pop("host", os.environ.get("PUSHBOT_HOST", "127.0.0.1")),
             port=int(overrides.pop("port", os.environ.get("PUSHBOT_PORT", "6670"))),
             token=overrides.pop("token", os.environ["PUSHBOT_TOKEN"]),
             nick=overrides.pop("nick", os.environ.get("PUSHBOT_NICK", "bot")),
-            insecure=overrides.pop("insecure",
-                                   os.environ.get("PUSHBOT_INSECURE", "1") == "1"),
+            tls=overrides.pop("tls",
+                              os.environ.get("PUSHBOT_TLS", "1") != "0"),
+            tls_verify=overrides.pop("tls_verify",
+                                     os.environ.get("PUSHBOT_TLS_VERIFY", "0") == "1"),
             **overrides,
         )
 
@@ -280,9 +299,10 @@ class PushBot:
         )
 
     def _rest_post(self, path: str, body: dict) -> None:
-        ctx = _tls_ctx(self.insecure)
+        scheme = "https" if self.tls else "http"
+        ctx = _tls_ctx(verify=self.tls_verify) if self.tls else None
         req = urllib.request.Request(
-            f"https://{self.host}:{self.port}{path}",
+            f"{scheme}://{self.host}:{self.port}{path}",
             data=json.dumps(body).encode(),
             headers={
                 "Authorization": f"Bearer {self.token}",
@@ -327,9 +347,11 @@ class PushBot:
     # --- internals --------------------------------------------------------
 
     def _run_once(self) -> bool:
-        self.log.info("connecting to wss://%s:%d/pushbot/v1/gateway", self.host, self.port)
+        scheme = "wss" if self.tls else "ws"
+        self.log.info("connecting to %s://%s:%d/pushbot/v1/gateway",
+                      scheme, self.host, self.port)
         sock = _ws_connect(self.host, self.port, "/pushbot/v1/gateway",
-                           self.token, self.insecure)
+                           self.token, self.tls, self.tls_verify)
         self.log.info("WebSocket upgraded")
 
         hello = self._recv_json(sock)
