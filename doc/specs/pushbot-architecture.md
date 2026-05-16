@@ -3,10 +3,6 @@
 Visual companion to [`pushbot-spec.md`](./pushbot-spec.md).  Five Mermaid diagrams: a 30,000-ft
 architecture view, then one sequence diagram per major flow.
 
-> **Note:** GitHub Gists don't render Mermaid blocks.  Paste this file
-> into a regular repo's `.md` file (or use a Mermaid live editor) to see
-> the diagrams.  README.md / docs in a repository render fine.
-
 ---
 
 ## 1. System architecture
