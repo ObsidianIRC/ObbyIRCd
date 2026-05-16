@@ -1778,6 +1778,28 @@ static void pb_handle_identify(Client *client, json_t *frame)
 		return;
 	}
 
+	/* If another session is already attached to this bot, evict it --
+	 * IDENTIFY semantics are "I'm taking over".  Without this the old
+	 * connection sits there orphaned but with its commands/state still
+	 * registered, leading to flapping schemas if the displacing client
+	 * registers a different set. */
+	if (s->bot->session && s->bot->session != s &&
+	    s->bot->session->client && !IsDead(s->bot->session->client))
+	{
+		unreal_log(ULOG_INFO, "pushbot", "BOT_SESSION_EVICTED", NULL,
+		           "Bot $nick: evicting previous session in favour of fresh IDENTIFY",
+		           log_data_string("nick", s->bot->nick));
+		pb_close_ws(s->bot->session->client, PB_CLOSE_AUTH_FAILED,
+		            "Session displaced by new IDENTIFY");
+	}
+	/* Also drop any previously-registered command schema so a fresh
+	 * IDENTIFY isn't serving the old session's commands until the new
+	 * session sends its own COMMAND_REGISTER. */
+	if (s->bot->commands) {
+		json_decref(s->bot->commands);
+		s->bot->commands = NULL;
+	}
+
 	/* IDENTIFY (vs RESUME) explicitly starts a fresh session.  Any
 	 * previous resume window is closed and queued events tossed. */
 	while (s->bot->queue_head) {
