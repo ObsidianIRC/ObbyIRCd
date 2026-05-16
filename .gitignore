@@ -116,3 +116,6 @@ migration-research/
 *.deb
 *.rpm
 *.AppImage
+
+# Claude Code local state -- never tracked
+.claude/
