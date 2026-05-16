@@ -208,6 +208,28 @@ static ModuleInfo *modinfo_ref = NULL;
  * happen. */
 #define PB_CAP_NAME "obby.world/channel-bots"
 static long CAP_CHANBOTS = 0L;
+static long pb_cap_away_notify = 0L;
+
+/* Broadcast a bot ghost's away state change to channel members who have
+ * the away-notify cap.  Mirrors away.c cmd_away's broadcast pattern: if
+ * the ghost is now away, send `:nick AWAY :reason`; if not, send the
+ * bare `:nick AWAY`.  Also fires HOOKTYPE_AWAY so other modules (like
+ * server-to-server propagation) can observe the change. */
+static void pb_broadcast_away(Client *ghost)
+{
+	MessageTag *mtags = NULL;
+	if (!ghost || !ghost->user) return;
+	new_message(ghost, NULL, &mtags);
+	if (ghost->user->away)
+		sendto_local_common_channels(ghost, ghost, pb_cap_away_notify, mtags,
+		                             ":%s AWAY :%s",
+		                             ghost->name, ghost->user->away);
+	else
+		sendto_local_common_channels(ghost, ghost, pb_cap_away_notify, mtags,
+		                             ":%s AWAY", ghost->name);
+	RunHook(HOOKTYPE_AWAY, ghost, mtags, ghost->user->away, 0);
+	free_message_tags(mtags);
+}
 #define PB_BOT_INFO_TAG "obby.world/bot-info"
 
 /* Gateway moddata: per-client session pointer. */
@@ -471,6 +493,10 @@ MOD_INIT()
 		r.method = "pushbot.unsuspend"; r.call = pb_rpc_unsuspend;RPCHandlerAdd(modinfo->handle, &r);
 		r.method = "pushbot.delete";  r.call = pb_rpc_delete;     RPCHandlerAdd(modinfo->handle, &r);
 	}
+
+	/* Cache the away-notify cap bit so we can broadcast bot
+	 * online/offline transitions to channel members who negotiated it. */
+	pb_cap_away_notify = ClientCapabilityBit("away-notify");
 
 	/* Heartbeat watchdog: every 5s, kick sessions that missed too many. */
 	EventAdd(modinfo->handle, "pb_heartbeat_check", pb_heartbeat_check, NULL, 5000, 0);
@@ -1028,6 +1054,10 @@ static Client *pb_spawn_ghost(PbBot *b)
 	long invis_bit = find_user_mode('i');
 	if (bot_bit) ghost->umodes |= bot_bit;
 	if (invis_bit) ghost->umodes |= invis_bit;
+	if (b->scope == PB_SCOPE_SERVER) {
+		long service_bit = find_user_mode('S');
+		if (service_bit) ghost->umodes |= service_bit;
+	}
 	SetUser(ghost);
 
 	/* Mark away BEFORE adding to lists (matches persistence.c
@@ -1891,10 +1921,12 @@ static void pb_handle_identify(Client *client, json_t *frame)
 	s->bot->session = s;
 	s->last_heartbeat = TStime();
 
-	/* Update the ghost's away to "online" (drop the away flag). */
+	/* Update the ghost's away to "online" (drop the away flag) and
+	 * broadcast the change so away-notify clients see the bot return. */
 	if (s->bot->ghost && s->bot->ghost->user->away) {
 		safe_free(s->bot->ghost->user->away);
 		s->bot->ghost->user->away = NULL;
+		pb_broadcast_away(s->bot->ghost);
 	}
 
 	/* READY dispatch. */
@@ -2048,6 +2080,7 @@ static void pb_session_free(PbSession *s)
 		if (b->ghost && !b->ghost->user->away) {
 			safe_strdup(b->ghost->user->away, "bot offline");
 			b->ghost->user->away_since = TStime();
+			pb_broadcast_away(b->ghost);
 		}
 	}
 	if (s->heartbeat_ev) { EventDel(s->heartbeat_ev); s->heartbeat_ev = NULL; }
