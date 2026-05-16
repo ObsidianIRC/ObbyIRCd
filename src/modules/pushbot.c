@@ -281,6 +281,7 @@ static int pb_config_test_listen(ConfigFile *cf, ConfigEntry *ce, int type, int 
 static int pb_config_run_ex_listen(ConfigFile *cf, ConfigEntry *ce, int type, void *ptr);
 static int pb_config_listener(ConfigItem_listen *l);
 static void pb_client_handshake(Client *client);
+static int pb_pre_handshake_timeout(Client *client, const char **comment);
 static int pb_handle_webrequest(Client *client, WebRequest *web);
 static int pb_handle_webrequest_data(Client *client, WebRequest *web, const char *buf, int len);
 static int pb_ws_handshake_send(Client *client);
@@ -377,6 +378,8 @@ MOD_INIT()
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, pb_configrun);
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN_EX, 0, pb_config_run_ex_listen);
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIG_LISTENER, 0, pb_config_listener);
+	HookAdd(modinfo->handle, HOOKTYPE_PRE_LOCAL_HANDSHAKE_TIMEOUT, 0,
+	        pb_pre_handshake_timeout);
 
 	/* Phase 5: register the client-prefixed message tags used by
 	 * slash-command discovery + invocation.  Without these, the
@@ -1350,6 +1353,23 @@ static void pb_client_handshake(Client *client)
 		fd_setselect(client->local->fd, FD_SELECT_READ, read_packet, client);
 }
 
+/* Pushbot connections never send NICK/USER, so the default IRC
+ * registration-timeout would kill them after ~60 s.  Take over that
+ * decision: once the WS handshake has completed, the connection is
+ * "registered" as far as we're concerned and only the heartbeat
+ * watchdog (pb_heartbeat_check) is allowed to kill it. */
+static int pb_pre_handshake_timeout(Client *client, const char **comment)
+{
+	if (!client || !client->local || !client->local->listener) return HOOK_CONTINUE;
+	if (!pb_is_pushbot_listener(client->local->listener)) return HOOK_CONTINUE;
+	WebSocketUser *wsu = pb_websocket_md
+	    ? (WebSocketUser *)moddata_client(client, pb_websocket_md).ptr
+	    : NULL;
+	if (wsu && wsu->handshake_completed)
+		return HOOK_ALLOW;  /* WS bot is alive; don't time it out */
+	return HOOK_CONTINUE;
+}
+
 static int pb_check_bearer(const char *auth, char *token_out, size_t tlen)
 {
 	if (!auth) return 0;
@@ -2127,13 +2147,21 @@ static MessageTag *pb_make_reply_tags(const char *reply_msgid, const char *chann
 	return head;
 }
 
-/* Decode base64 in-place-ish; returns malloc'd buffer (or NULL). */
+/* Decode base64 -- tolerate missing '=' padding (IRCv3 tag-values
+ * frequently strip it to save bytes; unrealircd's b64_decode is
+ * strict and would reject them otherwise). */
 static char *pb_b64_decode_alloc(const char *b64, int *outlen)
 {
 	if (!b64) return NULL;
 	int n = strlen(b64);
-	char *buf = safe_alloc(n + 1);
-	int got = b64_decode(b64, buf, n + 1);
+	int pad = (4 - (n % 4)) % 4;
+	char *padded = safe_alloc(n + pad + 1);
+	memcpy(padded, b64, n);
+	for (int i = 0; i < pad; i++) padded[n + i] = '=';
+	padded[n + pad] = '\0';
+	char *buf = safe_alloc(n + pad + 1);
+	int got = b64_decode(padded, (unsigned char *)buf, n + pad + 1);
+	safe_free(padded);
 	if (got <= 0) {
 		safe_free(buf);
 		return NULL;
