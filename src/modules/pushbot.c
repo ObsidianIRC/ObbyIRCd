@@ -201,6 +201,14 @@ static sqlite3 *db = NULL;
 static PbBot *bots = NULL;
 static ModuleInfo *modinfo_ref = NULL;
 
+/* obby.world/channel-bots client capability -- when negotiated, the
+ * server sends an initial bot list burst on welcome and pushes
+ * per-bot lifecycle updates ('add' / 'update' / 'remove') as they
+ * happen. */
+#define PB_CAP_NAME "obby.world/channel-bots"
+static long CAP_CHANBOTS = 0L;
+#define PB_BOT_INFO_TAG "obby.world/bot-info"
+
 /* Gateway moddata: per-client session pointer. */
 static ModDataInfo *pb_session_md = NULL;
 /* websocket_common's moddata, for inheriting WSU(). */
@@ -315,6 +323,16 @@ RPC_CALL_FUNC(pb_rpc_suspend);
 RPC_CALL_FUNC(pb_rpc_unsuspend);
 RPC_CALL_FUNC(pb_rpc_delete);
 
+/* obby.world/channel-bots cap helpers */
+static int  pb_mtag_bot_info_is_ok(Client *c, const char *n, const char *v);
+static int  pb_hook_welcome_burst(Client *client);
+static int  pb_hook_oper_change(Client *client, int add,
+                                const char *oper_block, const char *operclass);
+static void pb_send_bot_burst(Client *client);
+static void pb_broadcast_bot_event(PbBot *b, const char *event);
+static int  pb_bot_visible_to(PbBot *b, Client *client);
+static json_t *pb_bot_to_burst_json(PbBot *b, int for_oper, const char *event);
+
 /* Phase 5: slash commands */
 static int  pb_mtag_botcmd_is_ok(Client *c, const char *n, const char *v);
 static int  pb_mtag_botcmds_query_is_ok(Client *c, const char *n, const char *v);
@@ -379,6 +397,28 @@ MOD_INIT()
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIG_LISTENER, 0, pb_config_listener);
 	HookAdd(modinfo->handle, HOOKTYPE_PRE_LOCAL_HANDSHAKE_TIMEOUT, 0,
 	        pb_pre_handshake_timeout);
+
+	/* obby.world/channel-bots cap: clients that negotiate this get a
+	 * bot-list burst at the end of registration and incremental
+	 * updates as bots come/go/change.  The burst rides over TAGMSGs
+	 * carrying an obby.world/bot-info server-tag (base64 JSON). */
+	{
+		ClientCapabilityInfo cap;
+		memset(&cap, 0, sizeof(cap));
+		cap.name = PB_CAP_NAME;
+		if (!ClientCapabilityAdd(modinfo->handle, &cap, &CAP_CHANBOTS)) {
+			config_error("[pushbot] ClientCapabilityAdd(%s) failed", PB_CAP_NAME);
+			return MOD_FAILED;
+		}
+		MessageTagHandlerInfo m;
+		memset(&m, 0, sizeof(m));
+		m.name = PB_BOT_INFO_TAG;
+		m.is_ok = pb_mtag_bot_info_is_ok;
+		m.flags = MTAG_HANDLER_FLAGS_NO_CAP_NEEDED;
+		MessageTagHandlerAdd(modinfo->handle, &m);
+	}
+	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_CONNECT, 0, pb_hook_welcome_burst);
+	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_OPER, 0, pb_hook_oper_change);
 
 	/* Phase 5: register the client-prefixed message tags used by
 	 * slash-command discovery + invocation.  Without these, the
@@ -983,6 +1023,7 @@ static Client *pb_spawn_ghost(PbBot *b)
 	unreal_log(ULOG_INFO, "pushbot", "GHOST_UP", ghost,
 	           "Bot $nick materialised",
 	           log_data_string("nick", b->nick));
+	pb_broadcast_bot_event(b, "add");
 	return ghost;
 }
 
@@ -1214,6 +1255,7 @@ static void cmd_pushbot_setstatus(Client *client, const char *nick, PbStatus new
 	           log_data_string("opnick", client->name),
 	           log_data_string("verb", verb),
 	           log_data_string("bot", nick));
+	pb_broadcast_bot_event(b, new_status == PB_STATUS_DELETED ? "remove" : "update");
 }
 
 CMD_FUNC(cmd_pushbot)
@@ -1845,6 +1887,7 @@ static void pb_handle_identify(Client *client, json_t *frame)
 	unreal_log(ULOG_INFO, "pushbot", "BOT_ONLINE", NULL,
 	           "Bot $nick is now online on gateway",
 	           log_data_string("nick", s->bot->nick));
+	pb_broadcast_bot_event(s->bot, "update");
 }
 
 static void pb_handle_heartbeat(Client *client, json_t *frame)
@@ -1967,8 +2010,10 @@ static void pb_close_ws(Client *client, int code, const char *reason)
 static void pb_session_free(PbSession *s)
 {
 	if (!s) return;
+	PbBot *online_bot = NULL;
 	if (s->bot && s->bot->session == s) {
 		PbBot *b = s->bot;
+		online_bot = b;
 		b->session = NULL;
 		/* Open a resume window: keep queued events + session id
 		 * around for PB_RESUME_TTL_SEC.  pb_heartbeat_check garbage-
@@ -1981,6 +2026,7 @@ static void pb_session_free(PbSession *s)
 	}
 	if (s->heartbeat_ev) { EventDel(s->heartbeat_ev); s->heartbeat_ev = NULL; }
 	safe_free(s);
+	if (online_bot) pb_broadcast_bot_event(online_bot, "update");
 }
 
 static void pb_moddata_session_free(ModData *md)
@@ -2384,6 +2430,7 @@ static void pb_handle_command_register(Client *client, json_t *frame)
 	           "Bot $nick registered $n slash commands",
 	           log_data_string("nick", s->bot->nick),
 	           log_data_integer("n", (int)json_array_size(cmds)));
+	pb_broadcast_bot_event(s->bot, "update");
 }
 
 static void pb_send_interaction_reply(PbInteraction *it, const char *content,
@@ -2480,6 +2527,157 @@ EVENT(pb_interaction_timeout_check)
 		}
 		pb_interaction_free(it);
 	}
+}
+
+/* ===================================================================
+ * obby.world/channel-bots client cap -- bot list + push updates
+ * =================================================================== */
+
+static int pb_mtag_bot_info_is_ok(Client *c, const char *n, const char *v)
+{
+	/* Server-emitted tag.  Reject if a client tries to send one. */
+	return IsServer(c) ? 1 : 0;
+}
+
+/* Decide whether `client` is allowed to see `bot` in burst/push events.
+ * Non-opers only see ACTIVE bots; opers see everything (pending /
+ * suspended / deleted-but-not-yet-purged) so the management UI is
+ * useful. */
+static int pb_bot_visible_to(PbBot *b, Client *client)
+{
+	if (!b) return 0;
+	if (b->status == PB_STATUS_DELETED) return IsOper(client);
+	if (b->status == PB_STATUS_ACTIVE) return 1;
+	/* PENDING and SUSPENDED -> oper-only */
+	return IsOper(client);
+}
+
+/* Build the JSON payload for one bot.  `for_oper` controls whether the
+ * sensitive fields (webhook_url, raw token presence flags) are included.
+ * If `event` is non-NULL, set d.event to it ("add" / "update" / "remove"). */
+static json_t *pb_bot_to_burst_json(PbBot *b, int for_oper, const char *event)
+{
+	json_t *j = json_object();
+	if (event) json_object_set_new(j, "event", json_string(event));
+	json_object_set_new(j, "bot_id", json_string(b->bot_id ? b->bot_id : ""));
+	json_object_set_new(j, "nick", json_string(b->nick ? b->nick : ""));
+	json_object_set_new(j, "realname", json_string(b->realname ? b->realname : ""));
+	json_object_set_new(j, "scope", json_string(pb_scope_str(b->scope)));
+	json_object_set_new(j, "transport", json_string(pb_transport_str(b->transport)));
+	const char *status_str =
+	    b->status == PB_STATUS_ACTIVE ? "active" :
+	    b->status == PB_STATUS_PENDING ? "pending" :
+	    b->status == PB_STATUS_SUSPENDED ? "suspended" : "deleted";
+	json_object_set_new(j, "status", json_string(status_str));
+	json_object_set_new(j, "online",
+	    json_boolean(b->session && b->session->identified));
+	json_object_set_new(j, "from_config", json_boolean(b->from_config));
+
+	json_t *chans = json_array();
+	if (b->ghost) {
+		for (Membership *m = b->ghost->user->channel; m; m = m->next) {
+			if (m->channel && m->channel->name)
+				json_array_append_new(chans, json_string(m->channel->name));
+		}
+	}
+	json_object_set_new(j, "channels", chans);
+
+	if (b->commands)
+		json_object_set_new(j, "commands", json_incref(b->commands));
+	else
+		json_object_set_new(j, "commands", json_array());
+
+	if (for_oper) {
+		json_object_set_new(j, "webhook_url",
+		    json_string(b->webhook_url ? b->webhook_url : ""));
+		json_object_set_new(j, "webhook_suspended", json_boolean(b->webhook_suspended));
+		json_object_set_new(j, "webhook_failures", json_integer(b->webhook_failures));
+	}
+	return j;
+}
+
+/* Emit one TAGMSG line with the bot-info tag set, base64-encoded. */
+static void pb_send_bot_info(Client *client, const char *batch_ref,
+                             json_t *body)
+{
+	char *json_str = json_dumps(body, JSON_COMPACT);
+	if (!json_str) return;
+	int jlen = strlen(json_str);
+	int b64_max = ((jlen + 2) / 3) * 4 + 1;
+	char *b64 = safe_alloc(b64_max);
+	b64_encode(json_str, jlen, b64, b64_max);
+	free(json_str);
+
+	if (batch_ref) {
+		sendto_one(client, NULL,
+		           "@batch=%s;" PB_BOT_INFO_TAG "=%s :%s TAGMSG %s",
+		           batch_ref, b64, me.name, client->name);
+	} else {
+		sendto_one(client, NULL,
+		           "@" PB_BOT_INFO_TAG "=%s :%s TAGMSG %s",
+		           b64, me.name, client->name);
+	}
+	safe_free(b64);
+}
+
+/* Send the full bot-list burst to one client, BATCH-wrapped. */
+static void pb_send_bot_burst(Client *client)
+{
+	if (!HasCapabilityFast(client, CAP_CHANBOTS)) return;
+	if (!MyUser(client) || !client->name || !*client->name) return;
+
+	char ref[BATCHLEN + 1];
+	gen_random_alnum(ref, BATCHLEN);
+	ref[BATCHLEN] = '\0';
+	int for_oper = IsOper(client) ? 1 : 0;
+
+	int n = 0;
+	for (PbBot *b = bots; b; b = b->next)
+		if (pb_bot_visible_to(b, client)) n++;
+	if (n == 0) return;  /* nothing to send */
+
+	sendto_one(client, NULL, ":%s BATCH +%s " PB_CAP_NAME, me.name, ref);
+	for (PbBot *b = bots; b; b = b->next) {
+		if (!pb_bot_visible_to(b, client)) continue;
+		json_t *body = pb_bot_to_burst_json(b, for_oper, "add");
+		pb_send_bot_info(client, ref, body);
+		json_decref(body);
+	}
+	sendto_one(client, NULL, ":%s BATCH -%s", me.name, ref);
+}
+
+/* Push a single bot event to every cap-aware local client that can see
+ * the bot.  Used on add / online-status-change / commands-updated /
+ * remove. */
+static void pb_broadcast_bot_event(PbBot *b, const char *event)
+{
+	if (!b || !event) return;
+	Client *c;
+	list_for_each_entry(c, &lclient_list, lclient_node) {
+		if (!HasCapabilityFast(c, CAP_CHANBOTS)) continue;
+		if (!MyUser(c) || !IsUser(c)) continue;
+		if (!c->name || !*c->name) continue;
+		if (strcmp(event, "remove") != 0 && !pb_bot_visible_to(b, c)) continue;
+		json_t *body = pb_bot_to_burst_json(b, IsOper(c), event);
+		pb_send_bot_info(c, NULL, body);
+		json_decref(body);
+	}
+}
+
+static int pb_hook_welcome_burst(Client *client)
+{
+	pb_send_bot_burst(client);
+	return 0;
+}
+
+static int pb_hook_oper_change(Client *client, int add,
+                               const char *oper_block, const char *operclass)
+{
+	/* Re-send the burst: opers see suspended/pending bots that
+	 * non-opers don't, and unoper means they should stop seeing them. */
+	(void)oper_block; (void)operclass; (void)add;
+	pb_send_bot_burst(client);
+	return 0;
 }
 
 /* ===================================================================
@@ -3202,6 +3400,7 @@ static void pb_rpc_status_change(Client *client, json_t *request, json_t *params
 		Client *g = b->ghost; b->ghost = NULL;
 		exit_client(g, NULL, "Bot deactivated by RPC");
 	}
+	pb_broadcast_bot_event(b, new_status == PB_STATUS_DELETED ? "remove" : "update");
 	json_t *result = json_object();
 	json_object_set_new(result, "ok", json_true());
 	json_object_set_new(result, "status", json_string(verb));
