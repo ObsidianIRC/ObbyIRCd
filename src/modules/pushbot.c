@@ -1217,10 +1217,6 @@ static int pb_ws_handshake_send(Client *client)
 static int pb_handle_webrequest_data(Client *client, WebRequest *web, const char *buf, int len)
 {
 	WebSocketUser *wsu = pb_websocket_md ? moddata_client(client, pb_websocket_md).ptr : NULL;
-	unreal_log(ULOG_INFO, "pushbot", "WS_DATA", NULL,
-	           "incoming bytes=$len wsu=$wsu",
-	           log_data_integer("len", len),
-	           log_data_integer("wsu", wsu ? 1 : 0));
 	if (wsu)
 		return pb_handle_body_websocket(client, web, buf, len);
 	/* TODO phase 4: REST body handling. */
@@ -1376,9 +1372,6 @@ static void pb_send_dispatch(Client *client, const char *event_name, json_t *dat
 
 static void pb_handle_ws_message(Client *client, char *msg, int len)
 {
-	unreal_log(ULOG_INFO, "pushbot", "WS_MSG", NULL, "msg len=$len: $msg",
-	           log_data_integer("len", len),
-	           log_data_string("msg", msg));
 	json_error_t err;
 	json_t *frame = json_loadb(msg, len, 0, &err);
 	if (!frame || !json_is_object(frame)) {
