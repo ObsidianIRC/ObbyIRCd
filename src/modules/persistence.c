@@ -165,6 +165,7 @@ static int persist_remote_kick(Client *client, Client *victim, Channel *channel,
 static int persist_configrun(ConfigFile *cf, ConfigEntry *ce, int type);
 static int persist_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs);
 CMD_FUNC(cmd_persistence);
+RPC_CALL_FUNC(persist_rpc_erase);
 CMD_OVERRIDE_FUNC(session_msg_override);
 CMD_OVERRIDE_FUNC(session_join_override);
 CMD_OVERRIDE_FUNC(session_part_override);
@@ -197,6 +198,15 @@ MOD_INIT()
 	ClientCapabilityAdd(modinfo->handle, &cap, &CAP_PERSISTENCE);
 
 	CommandAdd(modinfo->handle, "PERSISTENCE", cmd_persistence, MAXPARA, CMD_USER);
+
+	{
+		RPCHandlerInfo r;
+		memset(&r, 0, sizeof(r));
+		r.loglevel = ULOG_INFO;
+		r.method = "persistence.erase";
+		r.call = persist_rpc_erase;
+		RPCHandlerAdd(modinfo->handle, &r);
+	}
 
 	memset(&mdi, 0, sizeof(mdi));
 	mdi.name = "persistence_ghost";
@@ -1761,6 +1771,40 @@ CMD_FUNC(cmd_persistence)
 		           "NOTE PERSISTENCE ERASED :Persistence entry for \"%s\" removed",
 		           parv[2]);
 	}
+}
+
+/* JSON-RPC: persistence.erase {"account":"<name>"}
+ * Programmatic counterpart to /PERSISTENCE ERASE -- no confirmation
+ * code, the caller already has RPC access which is the trust gate. */
+RPC_CALL_FUNC(persist_rpc_erase)
+{
+	const char *account;
+	PersistEntry *target;
+
+	REQUIRE_PARAM_STRING("account", account);
+
+	target = find_entry(account);
+	if (!target)
+	{
+		rpc_error(client, request, JSON_RPC_ERROR_NOT_FOUND,
+		          "No persistence entry for that account");
+		return;
+	}
+
+	unreal_log(ULOG_INFO, "persistence", "PERSIST_ERASE_RPC", NULL,
+	           "Persistence entry for account $account erased via RPC",
+	           log_data_string("account", target->account));
+
+	if (target->ghost)
+		destroy_ghost(target, "Erased via RPC");
+	free_entry(target);
+	persist_save_db();
+
+	json_t *result = json_object();
+	json_object_set_new(result, "account", json_string(account));
+	json_object_set_new(result, "erased", json_true());
+	rpc_response(client, request, result);
+	json_decref(result);
 }
 
 /* ===================================================================
