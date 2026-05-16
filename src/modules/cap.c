@@ -245,7 +245,11 @@ static void cap_req(Client *client, const char *arg)
 	ClientCapability *cap;
 	int buflen, plen;
 	int i = 0;
-	int capadd = 0, capdel = 0;
+	/* MUST be long: cap bits live in a 64-bit field (client->local->caps).
+	 * Using int here truncates any bit >= 32 to zero, which silently drops
+	 * caps registered later in module load order -- famously breaking SASL
+	 * once enough other caps have been registered ahead of it. */
+	long capadd = 0, capdel = 0;
 	int finished = 0, negate;
 	int errors = 0;
 
