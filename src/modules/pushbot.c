@@ -251,6 +251,7 @@ static int pb_configrun(ConfigFile *cf, ConfigEntry *ce, int type);
 static int pb_open_db(void);
 static int pb_init_schema(void);
 static int pb_apply_pending_bots(void);
+static int pb_on_rehash_complete(void);
 static int pb_upsert_bot_row(const char *bot_id, PbConfigBot *b);
 static int pb_load_active_bots_from_db(void);
 static PbBot *pb_find_bot_by_nick(const char *nick);
@@ -398,6 +399,12 @@ MOD_INIT()
 
 	modinfo_ref = modinfo;
 	MARK_AS_OFFICIAL_MODULE(modinfo);
+	/* Stay loaded across /REHASH so gateway WS sessions survive --
+	 * the alternative was tearing down every bot's WebSocket on every
+	 * rehash and waiting for the client-side reconnect loop.  PERM
+	 * skips Unload_all_loaded_modules; conf changes to the
+	 * pushbot {} block now arrive via HOOKTYPE_REHASH (pb_on_rehash). */
+	ModuleSetOptions(modinfo->handle, MOD_OPT_PERM, 1);
 
 	/* Register our per-client session moddata. */
 	memset(&mreq, 0, sizeof(mreq));
@@ -420,6 +427,11 @@ MOD_INIT()
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIG_LISTENER, 0, pb_config_listener);
 	HookAdd(modinfo->handle, HOOKTYPE_PRE_LOCAL_HANDSHAKE_TIMEOUT, 0,
 	        pb_pre_handshake_timeout);
+	/* Apply conf-block edits live on /REHASH.  cfg.pending_bots was
+	 * just rebuilt by pb_configrun; pb_apply_pending_bots is
+	 * idempotent (add + update on existing nicks).  Removed-from-conf
+	 * bots and database_path changes still need a full restart. */
+	HookAdd(modinfo->handle, HOOKTYPE_REHASH_COMPLETE, 0, pb_on_rehash_complete);
 
 	/* obby.world/channel-bots cap: clients that negotiate this get a
 	 * bot-list burst at the end of registration and incremental
@@ -504,6 +516,17 @@ MOD_INIT()
 	EventAdd(modinfo->handle, "pb_interaction_timeout_check",
 	         pb_interaction_timeout_check, NULL, 1000, 0);
 	return MOD_SUCCESS;
+}
+
+static int pb_on_rehash_complete(void)
+{
+	/* Reapply config-block bot definitions.  pb_configrun already
+	 * rebuilt cfg.pending_bots from the new config; this turns those
+	 * into live bots (add or update existing nicks).  Removed-from-
+	 * conf bots stay live until restart -- handling that delta cleanly
+	 * needs an explicit destroy path and is a phase-2 enhancement. */
+	pb_apply_pending_bots();
+	return 0;
 }
 
 MOD_LOAD()
