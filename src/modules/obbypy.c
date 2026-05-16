@@ -2766,14 +2766,20 @@ MOD_INIT()
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, obbypy_configrun);
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 1, obbypy_dispatch_configrun);
 
-	if (PyImport_AppendInittab("obby", PyInit_obby) == -1) {
-		config_error("[obbypy] PyImport_AppendInittab failed");
-		return MOD_FAILED;
-	}
-	if (!Py_IsInitialized()) Py_Initialize();
+	/* AppendInittab + Py_Initialize is a one-time-per-process setup;
+	 * Python aborts the process if AppendInittab is called after
+	 * Py_Initialize.  On /REHASH MOD_INIT runs again on the freshly
+	 * dlopened obbypy.so, so guard everything behind IsInitialized. */
 	if (!Py_IsInitialized()) {
-		config_error("[obbypy] Py_Initialize failed");
-		return MOD_FAILED;
+		if (PyImport_AppendInittab("obby", PyInit_obby) == -1) {
+			config_error("[obbypy] PyImport_AppendInittab failed");
+			return MOD_FAILED;
+		}
+		Py_Initialize();
+		if (!Py_IsInitialized()) {
+			config_error("[obbypy] Py_Initialize failed");
+			return MOD_FAILED;
+		}
 	}
 
 	RegisterApiCallbackWebResponse(modinfo->handle, HTTP_API_CALLBACK_NAME,
@@ -2790,7 +2796,14 @@ MOD_LOAD()
 MOD_UNLOAD()
 {
 	cleanup_state();
-	if (Py_IsInitialized()) Py_Finalize();
+	/* Do NOT call Py_Finalize() here.  libpython is process-global,
+	 * and Python's embedded API does not survive a finalize +
+	 * re-initialise cycle: the next MOD_INIT after /REHASH SEGVs
+	 * inside Py_InitializeFromConfig (strlen on a NULL from the
+	 * post-finalize config-bootstrap path).  cleanup_state() above
+	 * already releases every Python ref we own; leaving the
+	 * interpreter alive for the process lifetime is the documented
+	 * workaround and keeps /REHASH safe. */
 	safe_free(cfg.scripts_dir);
 	return MOD_SUCCESS;
 }
