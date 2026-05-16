@@ -2632,6 +2632,23 @@ static int pb_skip_sender(Client *client, PbBot *b)
 	return (client == b->ghost) ? 1 : 0;
 }
 
+/* Returns 1 if the bot has at least one path to deliver events:
+ * either a live identified gateway session, or a webhook URL on
+ * a webhook|both transport (and not suspended).  Used to skip
+ * iterating bots that can't currently receive anything. */
+static int pb_bot_deliverable(PbBot *b)
+{
+	if (!b || b->status != PB_STATUS_ACTIVE) return 0;
+	if (b->session && b->session->identified &&
+	    b->session->client && !IsDead(b->session->client) &&
+	    (b->transport == PB_TRANSPORT_GATEWAY || b->transport == PB_TRANSPORT_BOTH))
+		return 1;
+	if (b->webhook_url && !b->webhook_suspended &&
+	    (b->transport == PB_TRANSPORT_WEBHOOK || b->transport == PB_TRANSPORT_BOTH))
+		return 1;
+	return 0;
+}
+
 /* Hook on every channel PRIVMSG/NOTICE/TAGMSG: deliver MESSAGE_CREATE
  * to every bot in the channel that isn't the source. */
 static int pb_hook_chanmsg(Client *client, Channel *channel, int sendflags,
@@ -2655,7 +2672,7 @@ static int pb_hook_chanmsg(Client *client, Channel *channel, int sendflags,
 
 	for (PbBot *b = bots; b; b = b->next) {
 		if (b->status != PB_STATUS_ACTIVE) continue;
-		if (!b->session || !b->session->identified) continue;
+		if (!pb_bot_deliverable(b)) continue;
 		if (!pb_bot_is_in_channel(b, channel)) continue;
 		if (pb_skip_sender(client, b)) continue;
 
@@ -2702,7 +2719,7 @@ static int pb_hook_usermsg(Client *client, Client *to, MessageTag *mtags,
 
 	for (PbBot *b = bots; b; b = b->next) {
 		if (b->status != PB_STATUS_ACTIVE) continue;
-		if (!b->session || !b->session->identified) continue;
+		if (!pb_bot_deliverable(b)) continue;
 		if (to != b->ghost) continue;     /* DM addressed at this bot only */
 		if (pb_skip_sender(client, b)) continue;
 
@@ -2729,7 +2746,7 @@ static int pb_hook_local_join(Client *client, Channel *channel, MessageTag *mtag
 	if (!channel) return 0;
 	for (PbBot *b = bots; b; b = b->next) {
 		if (b->status != PB_STATUS_ACTIVE) continue;
-		if (!b->session || !b->session->identified) continue;
+		if (!pb_bot_deliverable(b)) continue;
 		if (!pb_bot_is_in_channel(b, channel)) continue;
 		if (pb_skip_sender(client, b)) continue;
 		json_t *d = json_object();
@@ -2746,7 +2763,7 @@ static int pb_hook_local_part(Client *client, Channel *channel, MessageTag *mtag
 	if (!channel) return 0;
 	for (PbBot *b = bots; b; b = b->next) {
 		if (b->status != PB_STATUS_ACTIVE) continue;
-		if (!b->session || !b->session->identified) continue;
+		if (!pb_bot_deliverable(b)) continue;
 		if (!pb_bot_is_in_channel(b, channel)) continue;
 		if (pb_skip_sender(client, b)) continue;
 		json_t *d = json_object();
@@ -2764,7 +2781,7 @@ static int pb_hook_local_kick(Client *client, Client *victim, Channel *channel,
 	if (!channel) return 0;
 	for (PbBot *b = bots; b; b = b->next) {
 		if (b->status != PB_STATUS_ACTIVE) continue;
-		if (!b->session || !b->session->identified) continue;
+		if (!pb_bot_deliverable(b)) continue;
 		if (!pb_bot_is_in_channel(b, channel)) continue;
 		json_t *d = json_object();
 		json_object_set_new(d, "client", pb_json_client(client));
