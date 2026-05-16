@@ -27,6 +27,9 @@
 #include "unrealircd.h"
 #include <sqlite3.h>
 #include <jansson.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
+#include <stdint.h>
 
 #define MYCONF "pushbot"
 #define DEFAULT_DB "pushbot.db"
@@ -54,6 +57,13 @@
 #define PB_OP_INVALID_SESSION 9
 #define PB_OP_HELLO          10
 #define PB_OP_HEARTBEAT_ACK  11
+/* Phase 5: slash-command opcodes. */
+#define PB_OP_COMMAND_REGISTER     20  /* bot -> server */
+#define PB_OP_INTERACTION_RESPONSE 21  /* bot -> server */
+#define PB_OP_INTERACTION_DEFER    22  /* bot -> server (extend window) */
+
+#define PB_INTERACTION_TIMEOUT_SEC 3
+#define PB_INTERACTION_DEFER_SEC   15
 
 ModuleHeader MOD_HEADER = {
 	"pushbot",
@@ -118,6 +128,9 @@ struct PbBot {
 	PbTransport transport;
 	PbStatus status;
 	char *webhook_url;     /* may be NULL */
+	char *webhook_secret;  /* HMAC-SHA256 signing key; may be NULL */
+	int   webhook_failures; /* consecutive non-2xx; reset on success */
+	int   webhook_suspended; /* 1 = stop firing webhooks until /REHASH */
 	char *config_token;    /* plaintext token from config; NULL for self-reg */
 	NameList *auto_join;   /* channels to auto-join after ghost creation */
 	int from_config;       /* 1 = defined in obbyircd.conf this run */
@@ -131,7 +144,24 @@ struct PbBot {
 	long long last_acked_seq; /* highest seq the bot has acked */
 	char *resume_session_id;  /* id valid for RESUME (matches IDENTIFY result) */
 	time_t resume_expires_at; /* when the resume window closes (0 = active) */
+
+	/* Phase 5: slash commands the bot has registered. */
+	json_t *commands;         /* JSON array; each entry per spec §7.2 */
 };
+
+/* Outstanding interactions waiting for INTERACTION_RESPONSE. */
+typedef struct PbInteraction PbInteraction;
+struct PbInteraction {
+	PbInteraction *prev, *next;
+	char *id;                 /* server-generated; echoed in COMMAND_INVOKE.d.id */
+	char *invoker_nick;       /* who ran the slash command */
+	char *channel;            /* channel context (NULL = DM with bot) */
+	char *invoker_msgid;      /* msgid of the TAGMSG (for +reply) */
+	PbBot *bot;
+	time_t expires_at;        /* hard timeout: 3s default, 15s after defer */
+	int deferred;
+};
+static PbInteraction *interactions = NULL;
 
 /* One gateway connection.  Created on WS upgrade, hung off the
  * connecting client via moddata.  Becomes "bound" to a PbBot once
@@ -153,6 +183,7 @@ struct PbConfigBot {
 	char *realname;
 	char *token;
 	char *webhook_url;
+	char *webhook_secret;
 	PbScope scope;
 	PbTransport transport;
 	NameList *auto_join;
@@ -177,7 +208,7 @@ static ModDataInfo *pb_websocket_md = NULL;
 /* webserver's moddata, for accessing WebRequest from client. */
 static ModDataInfo *pb_webserver_md = NULL;
 
-#define PB_SESS(c) ((PbSession *)moddata_client(c, pb_session_md).ptr)
+#define PB_SESS(c) ((PbSession *)moddata_local_client(c, pb_session_md).ptr)
 #define PB_WEB(c)  ((WebRequest *)moddata_local_client(c, pb_webserver_md).ptr)
 
 /* ===================================================================
@@ -207,6 +238,43 @@ static void pb_generate_id(char *out, size_t outlen);
 
 CMD_FUNC(cmd_pushbot);
 
+/* Event-dispatch -- forward decls (Phase 3) */
+static int pb_hook_chanmsg(Client *client, Channel *channel, int sendflags,
+                           const char *member_modes, const char *target,
+                           MessageTag *mtags, const char *text, SendType sendtype);
+static int pb_hook_local_join(Client *client, Channel *channel, MessageTag *mtags);
+static int pb_hook_local_part(Client *client, Channel *channel, MessageTag *mtags,
+                              const char *comment);
+static int pb_hook_local_kick(Client *client, Client *victim, Channel *channel,
+                              MessageTag *mtags, const char *comment);
+static int pb_hook_usermsg(Client *client, Client *to, MessageTag *mtags,
+                           const char *text, SendType sendtype);
+static json_t *pb_json_client(Client *c);
+static json_t *pb_json_channel(Channel *ch);
+static int pb_bot_is_in_channel(PbBot *b, Channel *ch);
+
+/* REST API -- forward decls (Phase 4) */
+static int pb_handle_rest(Client *client, WebRequest *web, PbBot *b);
+static void pb_rest_send_json(Client *client, int status, json_t *body);
+static void pb_rest_send_error(Client *client, int status, const char *msg);
+static void pb_rest_channel_message(Client *client, WebRequest *web, PbBot *b,
+                                    const char *channel);
+static void pb_rest_user_message(Client *client, WebRequest *web, PbBot *b,
+                                 const char *nick);
+static void pb_rest_react(Client *client, WebRequest *web, PbBot *b,
+                          const char *channel, const char *msgid, int remove,
+                          const char *emoji);
+static void pb_rest_redact(Client *client, WebRequest *web, PbBot *b,
+                           const char *channel, const char *msgid);
+static void pb_rest_channel_join(Client *client, WebRequest *web, PbBot *b,
+                                 const char *channel);
+static void pb_rest_channel_part(Client *client, WebRequest *web, PbBot *b,
+                                 const char *channel);
+static void pb_rest_get_bot(Client *client, WebRequest *web, PbBot *b);
+static void pb_rest_get_channels(Client *client, WebRequest *web, PbBot *b);
+static void pb_rest_get_members(Client *client, WebRequest *web, PbBot *b,
+                                const char *channel);
+
 /* Gateway -- forward decls */
 static int pb_config_test_listen(ConfigFile *cf, ConfigEntry *ce, int type, int *errs);
 static int pb_config_run_ex_listen(ConfigFile *cf, ConfigEntry *ce, int type, void *ptr);
@@ -228,6 +296,30 @@ static void pb_close_ws(Client *client, int code, const char *reason);
 static void pb_session_free(PbSession *s);
 static void pb_moddata_session_free(ModData *md);
 EVENT(pb_heartbeat_check);
+
+/* Phase 6: outgoing webhook delivery */
+static void pb_webhook_dispatch(PbBot *b, const char *event_name, const char *body_json);
+static void pb_webhook_response(OutgoingWebRequest *req, OutgoingWebResponse *resp);
+
+/* Phase 5: slash commands */
+static int  pb_mtag_botcmd_is_ok(Client *c, const char *n, const char *v);
+static int  pb_mtag_botcmds_query_is_ok(Client *c, const char *n, const char *v);
+static int  pb_mtag_botcmds_is_ok(Client *c, const char *n, const char *v);
+static int  pb_mtag_botcmds_changed_is_ok(Client *c, const char *n, const char *v);
+static void pb_mtag_forward(Client *sender, MessageTag *recv_mtags,
+                            MessageTag **mtag_list, const char *signature);
+static void pb_handle_command_register(Client *client, json_t *frame);
+static void pb_handle_interaction_response(Client *client, json_t *frame);
+static void pb_handle_interaction_defer(Client *client, json_t *frame);
+static int  pb_route_botcmd_channel(Client *invoker, Channel *channel,
+                                    MessageTag *mtags, const char *botcmd_b64);
+static int  pb_route_botcmd_user(Client *invoker, Client *to, MessageTag *mtags,
+                                 const char *botcmd_b64, const char *channel_context);
+static PbInteraction *pb_interaction_new(PbBot *bot, Client *invoker,
+                                         const char *channel, const char *msgid);
+static PbInteraction *pb_interaction_find(const char *id);
+static void pb_interaction_free(PbInteraction *it);
+EVENT(pb_interaction_timeout_check);
 
 /* ===================================================================
  * Module lifecycle
@@ -270,10 +362,49 @@ MOD_INIT()
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, pb_configrun);
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN_EX, 0, pb_config_run_ex_listen);
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIG_LISTENER, 0, pb_config_listener);
+
+	/* Phase 5: register the client-prefixed message tags used by
+	 * slash-command discovery + invocation.  Without these, the
+	 * ircd silently drops them on the parser side. */
+	{
+		MessageTagHandlerInfo m;
+		memset(&m, 0, sizeof(m));
+		m.is_ok = pb_mtag_botcmd_is_ok;
+		m.flags = MTAG_HANDLER_FLAGS_NO_CAP_NEEDED;
+		m.name = "+draft/bot-cmd";
+		MessageTagHandlerAdd(modinfo->handle, &m);
+		m.is_ok = pb_mtag_botcmds_query_is_ok;
+		m.name = "+draft/bot-cmds-query";
+		MessageTagHandlerAdd(modinfo->handle, &m);
+		m.is_ok = pb_mtag_botcmds_is_ok;
+		m.name = "+draft/bot-cmds";
+		MessageTagHandlerAdd(modinfo->handle, &m);
+		m.is_ok = pb_mtag_botcmds_changed_is_ok;
+		m.name = "+draft/bot-cmds-changed";
+		MessageTagHandlerAdd(modinfo->handle, &m);
+	}
+	/* Forward client-prefixed bot-cmd tags from recv_mtags into the
+	 * outbound mtag set so HOOKTYPE_CHANMSG / USERMSG can see them. */
+	HookAddVoid(modinfo->handle, HOOKTYPE_NEW_MESSAGE, 0, pb_mtag_forward);
+
+	/* Phase 6: register webhook response callback so url_start_async()
+	 * can call us back when delivery completes. */
+	RegisterApiCallbackWebResponse(modinfo->handle, "pb_webhook_response",
+	                               pb_webhook_response);
+
+	/* Phase 3: dispatch events to bots whose channels they're in. */
+	HookAdd(modinfo->handle, HOOKTYPE_CHANMSG, 0, pb_hook_chanmsg);
+	HookAdd(modinfo->handle, HOOKTYPE_USERMSG, 0, pb_hook_usermsg);
+	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_JOIN, 0, pb_hook_local_join);
+	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_PART, 0, pb_hook_local_part);
+	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_KICK, 0, pb_hook_local_kick);
 	CommandAdd(modinfo->handle, "PUSHBOT", cmd_pushbot, MAXPARA, CMD_USER);
 
 	/* Heartbeat watchdog: every 5s, kick sessions that missed too many. */
 	EventAdd(modinfo->handle, "pb_heartbeat_check", pb_heartbeat_check, NULL, 5000, 0);
+	/* Phase 5: expire stale interactions every second. */
+	EventAdd(modinfo->handle, "pb_interaction_timeout_check",
+	         pb_interaction_timeout_check, NULL, 1000, 0);
 	return MOD_SUCCESS;
 }
 
@@ -437,6 +568,7 @@ static void pb_parse_bot_block(ConfigEntry *bot_ce)
 		else if (!strcmp(cep->name, "scope")) b->scope = pb_parse_scope(cep->value);
 		else if (!strcmp(cep->name, "transport")) b->transport = pb_parse_transport(cep->value);
 		else if (!strcmp(cep->name, "webhook-url")) safe_strdup(b->webhook_url, cep->value);
+		else if (!strcmp(cep->name, "webhook-secret")) safe_strdup(b->webhook_secret, cep->value);
 		else if (!strcmp(cep->name, "auto-join")) {
 			for (ConfigEntry *ch = cep->items; ch; ch = ch->next) {
 				if (ch->name && ch->name[0] == '#')
@@ -485,6 +617,7 @@ static void pb_free_pending_bot(PbConfigBot *b)
 	safe_free(b->realname);
 	safe_free(b->token);
 	safe_free(b->webhook_url);
+	safe_free(b->webhook_secret);
 	free_entire_name_list(b->auto_join);
 	safe_free(b);
 }
@@ -708,6 +841,7 @@ static int pb_apply_pending_bots(void)
 			b->transport = pc->transport;
 			b->status = PB_STATUS_ACTIVE;
 			if (pc->webhook_url) safe_strdup(b->webhook_url, pc->webhook_url);
+			if (pc->webhook_secret) safe_strdup(b->webhook_secret, pc->webhook_secret);
 			AddListItem(b, bots);
 		} else {
 			/* Update mutable fields from new config */
@@ -716,6 +850,10 @@ static int pb_apply_pending_bots(void)
 			b->transport = pc->transport;
 			safe_free(b->webhook_url);
 			if (pc->webhook_url) safe_strdup(b->webhook_url, pc->webhook_url);
+			safe_free(b->webhook_secret);
+			if (pc->webhook_secret) safe_strdup(b->webhook_secret, pc->webhook_secret);
+			b->webhook_suspended = 0;  /* /REHASH clears suspension */
+			b->webhook_failures = 0;
 		}
 		safe_strdup(b->config_token, pc->token);
 		b->from_config = 1;
@@ -884,7 +1022,9 @@ static void pb_free_bot(PbBot *b)
 	safe_free(b->account);
 	safe_free(b->realname);
 	safe_free(b->webhook_url);
+	safe_free(b->webhook_secret);
 	safe_free(b->config_token);
+	if (b->commands) json_decref(b->commands);
 	free_entire_name_list(b->auto_join);
 	DelListItem(b, bots);
 	safe_free(b);
@@ -1176,7 +1316,7 @@ static int pb_handle_webrequest(Client *client, WebRequest *web)
 		s->client = client;
 		s->bot = NULL; /* attached on IDENTIFY, not here */
 		s->last_heartbeat = TStime();
-		moddata_client(client, pb_session_md).ptr = s;
+		moddata_local_client(client, pb_session_md).ptr = s;
 
 		/* Stash the bot we resolved so IDENTIFY can verify the token
 		 * matches what was sent. We do this by storing bot_id in the
@@ -1190,9 +1330,19 @@ static int pb_handle_webrequest(Client *client, WebRequest *web)
 		return 1; /* accept */
 	}
 
-	/* TODO phase 4: REST routes here. */
-	webserver_send_response(client, 404, "PushBot REST API not implemented yet (phase 4).\n");
-	return 0;
+	/* REST routes -- bot already resolved via Bearer token. */
+	PbBot *rest_bot = pb_find_bot_by_token(token);
+	if (!rest_bot) {
+		webserver_send_response(client, 401, "Invalid bearer token\n");
+		return 0;
+	}
+	/* For methods that carry a body (POST), defer until the body has
+	 * arrived: webserver will keep calling pb_handle_webrequest_data
+	 * with chunks, and we dispatch to pb_handle_rest once complete. */
+	if (web->method == HTTP_METHOD_POST || web->method == HTTP_METHOD_PUT) {
+		return 1;
+	}
+	return pb_handle_rest(client, web, rest_bot);
 }
 
 static int pb_ws_handshake_send(Client *client)
@@ -1219,9 +1369,32 @@ static int pb_handle_webrequest_data(Client *client, WebRequest *web, const char
 	WebSocketUser *wsu = pb_websocket_md ? moddata_client(client, pb_websocket_md).ptr : NULL;
 	if (wsu)
 		return pb_handle_body_websocket(client, web, buf, len);
-	/* TODO phase 4: REST body handling. */
-	webserver_send_response(client, 404, "Page not found.\n");
-	return 0;
+
+	/* REST body (POST): accumulate via webserver_handle_body, then
+	 * once complete, the existing pb_handle_rest path doesn't run
+	 * again (we already returned 1 from handle_request).  Web body
+	 * data comes through here for POST endpoints. */
+	if (!webserver_handle_body(client, web, buf, len)) {
+		webserver_send_response(client, 400, "Error reading body\n");
+		return 0;
+	}
+	if (web->request_body_complete) {
+		/* re-resolve bot by token (cheap; ensures we don't trust
+		 * stale state across requests on the same connection) */
+		const char *auth = get_nvplist(web->headers, "Authorization");
+		char token[512];
+		if (!pb_check_bearer(auth, token, sizeof(token))) {
+			webserver_send_response(client, 401, "Bearer required\n");
+			return 0;
+		}
+		PbBot *b = pb_find_bot_by_token(token);
+		if (!b) {
+			webserver_send_response(client, 401, "Invalid token\n");
+			return 0;
+		}
+		pb_handle_rest(client, web, b);
+	}
+	return 1;
 }
 
 static int pb_handle_body_websocket(Client *client, WebRequest *web, const char *buf, int len)
@@ -1348,9 +1521,11 @@ static void pb_dispatch_event(PbBot *b, const char *event_name, json_t *data)
 
 	pb_queue_push(b, seq, body);
 
+	/* Gateway leg: deliver if the bot has an active session. */
 	if (b->session && b->session->client &&
 	    !IsDead(b->session->client) && b->session->client->local &&
-	    b->session->identified) {
+	    b->session->identified &&
+	    (b->transport == PB_TRANSPORT_GATEWAY || b->transport == PB_TRANSPORT_BOTH)) {
 		int len = strlen(body);
 		char *out = body;
 		if (websocket_create_packet(WSOP_TEXT, &out, &len) >= 0) {
@@ -1358,6 +1533,12 @@ static void pb_dispatch_event(PbBot *b, const char *event_name, json_t *data)
 			send_queued(b->session->client);
 		}
 	}
+
+	/* Webhook leg: fire HTTP POST if configured. */
+	if ((b->transport == PB_TRANSPORT_WEBHOOK || b->transport == PB_TRANSPORT_BOTH) &&
+	    b->webhook_url && !b->webhook_suspended)
+		pb_webhook_dispatch(b, event_name, body);
+
 	free(body);
 }
 
@@ -1390,6 +1571,9 @@ static void pb_handle_ws_message(Client *client, char *msg, int len)
 	case PB_OP_IDENTIFY:   pb_handle_identify(client, frame); break;
 	case PB_OP_HEARTBEAT:  pb_handle_heartbeat(client, frame); break;
 	case PB_OP_RESUME:   pb_handle_resume(client, frame); break;
+	case PB_OP_COMMAND_REGISTER:     pb_handle_command_register(client, frame); break;
+	case PB_OP_INTERACTION_RESPONSE: pb_handle_interaction_response(client, frame); break;
+	case PB_OP_INTERACTION_DEFER:    pb_handle_interaction_defer(client, frame); break;
 	default:
 		unreal_log(ULOG_DEBUG, "pushbot", "WS_UNKNOWN_OP", client,
 		           "Received unknown opcode $op",
@@ -1651,3 +1835,1158 @@ EVENT(pb_heartbeat_check)
 		}
 	}
 }
+
+/* ===================================================================
+ * Phase 5 -- slash commands
+ * =================================================================== */
+
+/* Tag validators.  All four are client-prefixed (`+draft/`) tags that
+ * carry base64-JSON values; we only sanity-check size + base64-ish
+ * character set.  Per-context validation (does the bot exist? does
+ * the JSON parse?) happens later in pb_route_botcmd_*. */
+static int pb_mtag_botcmd_is_ok(Client *c, const char *n, const char *v)
+{
+	if (!v || !*v) return 0;
+	int len = strlen(v);
+	if (len > 4096) return 0;
+	for (int i = 0; i < len; i++) {
+		char ch = v[i];
+		if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+		      (ch >= '0' && ch <= '9') || ch == '+' || ch == '/' || ch == '=' ||
+		      ch == '-' || ch == '_'))
+			return 0;
+	}
+	return 1;
+}
+static int pb_mtag_botcmds_query_is_ok(Client *c, const char *n, const char *v)
+{
+	return v && *v ? 1 : 0;
+}
+static int pb_mtag_botcmds_is_ok(Client *c, const char *n, const char *v)
+{
+	return pb_mtag_botcmd_is_ok(c, n, v);
+}
+static int pb_mtag_botcmds_changed_is_ok(Client *c, const char *n, const char *v)
+{
+	return 1;
+}
+
+/* Copy our client-prefixed tags from the incoming message into the
+ * outgoing tag list, so HOOKTYPE_CHANMSG/USERMSG can see them. */
+static void pb_mtag_forward(Client *sender, MessageTag *recv_mtags,
+                            MessageTag **mtag_list, const char *signature)
+{
+	if (!IsUser(sender)) return;
+	static const char *names[] = {
+		"+draft/bot-cmd", "+draft/bot-cmds-query",
+		"+draft/bot-cmds", "+draft/bot-cmds-changed",
+		NULL
+	};
+	for (int i = 0; names[i]; i++) {
+		MessageTag *m = find_mtag(recv_mtags, names[i]);
+		if (!m) continue;
+		MessageTag *dup = duplicate_mtag(m);
+		AddListItem(dup, *mtag_list);
+	}
+}
+
+static PbInteraction *pb_interaction_find(const char *id)
+{
+	if (!id) return NULL;
+	for (PbInteraction *it = interactions; it; it = it->next)
+		if (it->id && !strcmp(it->id, id))
+			return it;
+	return NULL;
+}
+
+static PbInteraction *pb_interaction_new(PbBot *bot, Client *invoker,
+                                         const char *channel, const char *msgid)
+{
+	PbInteraction *it = safe_alloc(sizeof(*it));
+	char idbuf[64];
+	snprintf(idbuf, sizeof(idbuf), "iact.%lx.%lx",
+	         (unsigned long)TStime(), (unsigned long)rand());
+	safe_strdup(it->id, idbuf);
+	if (invoker && invoker->name) safe_strdup(it->invoker_nick, invoker->name);
+	if (channel) safe_strdup(it->channel, channel);
+	if (msgid) safe_strdup(it->invoker_msgid, msgid);
+	it->bot = bot;
+	it->expires_at = TStime() + PB_INTERACTION_TIMEOUT_SEC;
+	AddListItem(it, interactions);
+	return it;
+}
+
+static void pb_interaction_free(PbInteraction *it)
+{
+	if (!it) return;
+	DelListItem(it, interactions);
+	safe_free(it->id);
+	safe_free(it->invoker_nick);
+	safe_free(it->channel);
+	safe_free(it->invoker_msgid);
+	safe_free(it);
+}
+
+/* Build a NameValuePrioList holding +reply / +draft/channel-context
+ * for use with sendto_one() etc.  Caller must free_message_tags(). */
+static MessageTag *pb_make_reply_tags(const char *reply_msgid, const char *channel_ctx)
+{
+	MessageTag *head = NULL, *tail = NULL;
+	if (reply_msgid && *reply_msgid) {
+		MessageTag *m = safe_alloc(sizeof(*m));
+		safe_strdup(m->name, "+reply");
+		safe_strdup(m->value, reply_msgid);
+		AddListItem(m, head);
+		if (!tail) tail = m;
+	}
+	if (channel_ctx && *channel_ctx) {
+		MessageTag *m = safe_alloc(sizeof(*m));
+		safe_strdup(m->name, "+draft/channel-context");
+		safe_strdup(m->value, channel_ctx);
+		AddListItem(m, head);
+	}
+	return head;
+}
+
+/* Decode base64 in-place-ish; returns malloc'd buffer (or NULL). */
+static char *pb_b64_decode_alloc(const char *b64, int *outlen)
+{
+	if (!b64) return NULL;
+	int n = strlen(b64);
+	char *buf = safe_alloc(n + 1);
+	int got = b64_decode(b64, buf, n + 1);
+	if (got <= 0) {
+		safe_free(buf);
+		return NULL;
+	}
+	if (outlen) *outlen = got;
+	return buf;
+}
+
+/* Common dispatch path once the bot, invoker, and command JSON
+ * are known.  Generates an interaction id, fires COMMAND_INVOKE. */
+static void pb_dispatch_command(PbBot *bot, Client *invoker,
+                                const char *channel, const char *invoker_msgid,
+                                json_t *cmd_json)
+{
+	if (!bot || !invoker || !cmd_json) {
+		if (cmd_json) json_decref(cmd_json);
+		return;
+	}
+	if (!bot->session || !bot->session->identified ||
+	    !bot->session->client || IsDead(bot->session->client)) {
+		sendto_one(invoker, NULL, ":%s FAIL BOTCMD BOT_OFFLINE %s :Bot is offline",
+		           me.name, bot->nick ? bot->nick : "?");
+		json_decref(cmd_json);
+		return;
+	}
+	PbInteraction *it = pb_interaction_new(bot, invoker, channel, invoker_msgid);
+
+	json_t *d = json_object();
+	json_object_set_new(d, "id", json_string(it->id));
+	json_object_set_new(d, "invoker", pb_json_client(invoker));
+	if (channel) json_object_set_new(d, "channel", json_string(channel));
+	else         json_object_set_new(d, "channel", json_null());
+	if (invoker_msgid)
+		json_object_set_new(d, "invoker_msgid", json_string(invoker_msgid));
+	/* cmd_json is { "name": ..., "options": {...} } */
+	const char *cmd_name = NULL;
+	json_t *nm = json_object_get(cmd_json, "name");
+	if (json_is_string(nm)) cmd_name = json_string_value(nm);
+	json_object_set_new(d, "name", json_string(cmd_name ? cmd_name : ""));
+	json_t *opts = json_object_get(cmd_json, "options");
+	json_object_set_new(d, "options", opts ? json_incref(opts) : json_object());
+	pb_dispatch_event(bot, "COMMAND_INVOKE", d);
+	json_decref(cmd_json);
+}
+
+/* Resolve the target bot from a TAGMSG sent to a channel.  Strategy:
+ *   1. If the +draft/bot-cmd JSON has "target": "<nick>", use that.
+ *   2. Otherwise pick the first PushBot in the channel that has a
+ *      command with the matching name registered.
+ *   3. If multiple match, prefer channel-scope over server-scope. */
+static PbBot *pb_resolve_channel_botcmd(Channel *ch, json_t *cmd,
+                                        const char *target_nick)
+{
+	if (target_nick && *target_nick)
+		return pb_find_bot_by_nick(target_nick);
+	const char *name = NULL;
+	json_t *nmj = json_object_get(cmd, "name");
+	if (json_is_string(nmj)) name = json_string_value(nmj);
+	if (!name) return NULL;
+	for (PbBot *b = bots; b; b = b->next) {
+		if (b->status != PB_STATUS_ACTIVE) continue;
+		if (!pb_bot_is_in_channel(b, ch)) continue;
+		if (!b->commands) continue;
+		size_t i; json_t *c;
+		json_array_foreach(b->commands, i, c) {
+			json_t *cn = json_object_get(c, "name");
+			if (json_is_string(cn) && !strcmp(json_string_value(cn), name))
+				return b;
+		}
+	}
+	return NULL;
+}
+
+static int pb_route_botcmd_channel(Client *invoker, Channel *channel,
+                                   MessageTag *mtags, const char *botcmd_b64)
+{
+	int plen = 0;
+	char *json_buf = pb_b64_decode_alloc(botcmd_b64, &plen);
+	if (!json_buf) {
+		sendto_one(invoker, NULL, ":%s FAIL BOTCMD INVALID :bot-cmd: bad base64", me.name);
+		return 0;
+	}
+	json_error_t err;
+	json_t *cmd = json_loadb(json_buf, plen, 0, &err);
+	safe_free(json_buf);
+	if (!cmd || !json_is_object(cmd)) {
+		if (cmd) json_decref(cmd);
+		sendto_one(invoker, NULL, ":%s FAIL BOTCMD INVALID :bot-cmd: invalid JSON", me.name);
+		return 0;
+	}
+	const char *target_nick = NULL;
+	json_t *tj = json_object_get(cmd, "target");
+	if (json_is_string(tj)) target_nick = json_string_value(tj);
+
+	PbBot *bot = pb_resolve_channel_botcmd(channel, cmd, target_nick);
+	if (!bot) {
+		sendto_one(invoker, NULL, ":%s FAIL BOTCMD NO_SUCH_BOT :bot-cmd: no such bot/command", me.name);
+		json_decref(cmd);
+		return 0;
+	}
+
+	const char *msgid = NULL;
+	for (MessageTag *m = mtags; m; m = m->next)
+		if (m->name && !strcmp(m->name, "msgid")) { msgid = m->value; break; }
+
+	pb_dispatch_command(bot, invoker, channel->name, msgid, cmd);
+	return 0;
+}
+
+static int pb_route_botcmd_user(Client *invoker, Client *to, MessageTag *mtags,
+                                const char *botcmd_b64, const char *channel_context)
+{
+	PbBot *bot = NULL;
+	for (PbBot *b = bots; b; b = b->next)
+		if (b->ghost == to) { bot = b; break; }
+	if (!bot) return 0;  /* not a pushbot, leave for other handlers */
+
+	int plen = 0;
+	char *json_buf = pb_b64_decode_alloc(botcmd_b64, &plen);
+	if (!json_buf) {
+		sendto_one(invoker, NULL, ":%s FAIL BOTCMD INVALID :bot-cmd: bad base64", me.name);
+		return 0;
+	}
+	json_error_t err;
+	json_t *cmd = json_loadb(json_buf, plen, 0, &err);
+	safe_free(json_buf);
+	if (!cmd || !json_is_object(cmd)) {
+		if (cmd) json_decref(cmd);
+		sendto_one(invoker, NULL, ":%s FAIL BOTCMD INVALID :bot-cmd: invalid JSON", me.name);
+		return 0;
+	}
+
+	/* Validate channel_context: bot AND invoker must be in it. */
+	if (channel_context && *channel_context) {
+		Channel *ch = find_channel(channel_context);
+		if (!ch || !find_membership_link(invoker->user->channel, ch) ||
+		    !pb_bot_is_in_channel(bot, ch)) {
+			sendto_one(invoker, NULL,
+			           ":%s FAIL BOTCMD INVALID_CHANNEL_CONTEXT %s :bot-cmd: invalid channel context",
+			           me.name, channel_context);
+			json_decref(cmd);
+			return 0;
+		}
+	}
+
+	const char *msgid = NULL;
+	for (MessageTag *m = mtags; m; m = m->next)
+		if (m->name && !strcmp(m->name, "msgid")) { msgid = m->value; break; }
+
+	pb_dispatch_command(bot, invoker, channel_context, msgid, cmd);
+	return 0;
+}
+
+static void pb_handle_command_register(Client *client, json_t *frame)
+{
+	PbSession *s = PB_SESS(client);
+	if (!s || !s->bot || !s->identified) {
+		pb_close_ws(client, PB_CLOSE_AUTH_FAILED, "Not authenticated");
+		return;
+	}
+	json_t *d = json_object_get(frame, "d");
+	if (!json_is_object(d)) {
+		pb_close_ws(client, PB_CLOSE_INVALID_SESSION, "COMMAND_REGISTER.d must be object");
+		return;
+	}
+	json_t *cmds = json_object_get(d, "commands");
+	if (!json_is_array(cmds)) {
+		pb_close_ws(client, PB_CLOSE_INVALID_SESSION, "commands must be array");
+		return;
+	}
+	if (s->bot->commands) json_decref(s->bot->commands);
+	s->bot->commands = json_incref(cmds);
+
+	json_t *ack_d = json_object();
+	json_object_set_new(ack_d, "count", json_integer(json_array_size(cmds)));
+	pb_dispatch_event(s->bot, "COMMANDS_REGISTERED", ack_d);
+
+	unreal_log(ULOG_INFO, "pushbot", "CMDS_REGISTERED", NULL,
+	           "Bot $nick registered $n slash commands",
+	           log_data_string("nick", s->bot->nick),
+	           log_data_integer("n", (int)json_array_size(cmds)));
+}
+
+static void pb_send_interaction_reply(PbInteraction *it, const char *content,
+                                      const char *visibility, int ephemeral)
+{
+	if (!it || !content) return;
+	Client *target = find_user(it->invoker_nick, NULL);
+	if (!target) return;
+	if (!it->bot || !it->bot->ghost) return;
+
+	int as_notice = ephemeral ? 1 : 0;
+	int public_visible = (visibility && !strcasecmp(visibility, "public"));
+
+	if (it->channel && public_visible) {
+		/* Public reply in-channel: PRIVMSG <ch> from bot ghost. */
+		Channel *ch = find_channel(it->channel);
+		if (!ch) return;
+		MessageTag *tags = pb_make_reply_tags(it->invoker_msgid, NULL);
+		sendto_channel(ch, it->bot->ghost, NULL, NULL, 0, SEND_ALL, tags,
+		               ":%s PRIVMSG %s :%s", it->bot->ghost->name, ch->name, content);
+		free_message_tags(tags);
+		return;
+	}
+
+	/* Private reply: NOTICE/PRIVMSG to invoker with channel-context tag. */
+	MessageTag *tags = pb_make_reply_tags(it->invoker_msgid, it->channel);
+	const char *cmd = as_notice ? "NOTICE" : "PRIVMSG";
+	sendto_one(target, tags, ":%s %s %s :%s",
+	           it->bot->ghost->name, cmd, target->name, content);
+	free_message_tags(tags);
+}
+
+static void pb_handle_interaction_response(Client *client, json_t *frame)
+{
+	PbSession *s = PB_SESS(client);
+	if (!s || !s->bot || !s->identified) {
+		pb_close_ws(client, PB_CLOSE_AUTH_FAILED, "Not authenticated");
+		return;
+	}
+	json_t *d = json_object_get(frame, "d");
+	if (!json_is_object(d)) return;
+	json_t *idj = json_object_get(d, "id");
+	if (!json_is_string(idj)) return;
+	PbInteraction *it = pb_interaction_find(json_string_value(idj));
+	if (!it) {
+		unreal_log(ULOG_INFO, "pushbot", "INT_LATE", NULL,
+		           "Bot $nick responded to unknown/expired interaction $id",
+		           log_data_string("nick", s->bot->nick),
+		           log_data_string("id", json_string_value(idj)));
+		return;
+	}
+	if (it->bot != s->bot) return;  /* impersonation guard */
+
+	const char *content = "";
+	const char *vis = "public";
+	int ephemeral = 0;
+	json_t *cj = json_object_get(d, "content");
+	if (json_is_string(cj)) content = json_string_value(cj);
+	json_t *vj = json_object_get(d, "visibility");
+	if (json_is_string(vj)) vis = json_string_value(vj);
+	json_t *ej = json_object_get(d, "ephemeral");
+	if (json_is_boolean(ej)) ephemeral = json_is_true(ej) ? 1 : 0;
+
+	pb_send_interaction_reply(it, content, vis, ephemeral);
+	pb_interaction_free(it);
+}
+
+static void pb_handle_interaction_defer(Client *client, json_t *frame)
+{
+	PbSession *s = PB_SESS(client);
+	if (!s || !s->bot || !s->identified) return;
+	json_t *d = json_object_get(frame, "d");
+	if (!json_is_object(d)) return;
+	json_t *idj = json_object_get(d, "id");
+	if (!json_is_string(idj)) return;
+	PbInteraction *it = pb_interaction_find(json_string_value(idj));
+	if (!it || it->bot != s->bot) return;
+	it->expires_at = TStime() + PB_INTERACTION_DEFER_SEC;
+	it->deferred = 1;
+}
+
+EVENT(pb_interaction_timeout_check)
+{
+	time_t now = TStime();
+	PbInteraction *next;
+	for (PbInteraction *it = interactions; it; it = next) {
+		next = it->next;
+		if (it->expires_at >= now) continue;
+		/* Time out: send a FAIL standard-reply to invoker. */
+		Client *target = find_user(it->invoker_nick, NULL);
+		if (target) {
+			sendto_one(target, NULL, ":%s FAIL BOTCMD TIMEOUT %s :bot timed out",
+			           me.name, it->bot && it->bot->nick ? it->bot->nick : "?");
+		}
+		pb_interaction_free(it);
+	}
+}
+
+/* ===================================================================
+ * Phase 6 -- outgoing webhook delivery
+ * =================================================================== */
+
+/* hex-encode `n` bytes from `in` into `out` (must be 2n+1 bytes). */
+static void pb_hexenc(const unsigned char *in, int n, char *out)
+{
+	static const char hex[] = "0123456789abcdef";
+	for (int i = 0; i < n; i++) {
+		out[2*i]     = hex[(in[i] >> 4) & 0xf];
+		out[2*i + 1] = hex[in[i] & 0xf];
+	}
+	out[2*n] = '\0';
+}
+
+/* Compute HMAC-SHA256(secret, body) and hex-encode it. */
+static void pb_hmac_sha256_hex(const char *secret, const char *body, char *hex_out)
+{
+	unsigned char digest[32];
+	unsigned int dlen = 0;
+	HMAC(EVP_sha256(),
+	     secret, secret ? strlen(secret) : 0,
+	     (const unsigned char *)body, body ? strlen(body) : 0,
+	     digest, &dlen);
+	pb_hexenc(digest, dlen, hex_out);
+}
+
+/* Wrap a webhook attempt with retry-state bookkeeping so the response
+ * callback knows what to do.  Owned by callback_data. */
+typedef struct PbWebhookCtx {
+	char *bot_id;     /* don't keep raw pointers; bot may be freed by then */
+	char *event_name;
+	char *body;       /* original JSON body; preserved across retries */
+	int attempt;      /* 0, 1, 2, ... */
+} PbWebhookCtx;
+
+static void pb_webhook_ctx_free(PbWebhookCtx *c)
+{
+	if (!c) return;
+	safe_free(c->bot_id);
+	safe_free(c->event_name);
+	safe_free(c->body);
+	safe_free(c);
+}
+
+/* Look up a bot by bot_id (used by the response callback). */
+static PbBot *pb_find_bot_by_id(const char *id)
+{
+	if (!id) return NULL;
+	for (PbBot *b = bots; b; b = b->next)
+		if (b->bot_id && !strcmp(b->bot_id, id))
+			return b;
+	return NULL;
+}
+
+static void pb_webhook_fire(PbBot *b, PbWebhookCtx *ctx)
+{
+	if (!b || !b->webhook_url) {
+		pb_webhook_ctx_free(ctx);
+		return;
+	}
+	OutgoingWebRequest *req = safe_alloc(sizeof(*req));
+	safe_strdup(req->url, b->webhook_url);
+	req->http_method = HTTP_METHOD_POST;
+	safe_strdup(req->body, ctx->body);
+	req->connect_timeout  = 5;
+	req->transfer_timeout = 10;
+	req->max_redirects = 0;
+	safe_strdup(req->apicallback, "pb_webhook_response");
+	req->callback_data = ctx;
+
+	add_nvplist(&req->headers, 0, "Content-Type", "application/json");
+	add_nvplist(&req->headers, 0, "X-PushBot-Event", ctx->event_name ? ctx->event_name : "");
+	add_nvplist(&req->headers, 0, "X-PushBot-Bot", b->nick ? b->nick : "");
+
+	/* Sign with HMAC-SHA256 if the bot has a secret. */
+	if (b->webhook_secret && *b->webhook_secret) {
+		char sig[16 + 64 + 1];
+		char hex[65];
+		pb_hmac_sha256_hex(b->webhook_secret, ctx->body, hex);
+		snprintf(sig, sizeof(sig), "sha256=%s", hex);
+		add_nvplist(&req->headers, 0, "X-PushBot-Signature", sig);
+	}
+
+	url_start_async(req);
+}
+
+static void pb_webhook_dispatch(PbBot *b, const char *event_name, const char *body_json)
+{
+	if (!b || !body_json) return;
+	PbWebhookCtx *ctx = safe_alloc(sizeof(*ctx));
+	safe_strdup(ctx->bot_id, b->bot_id);
+	safe_strdup(ctx->event_name, event_name ? event_name : "");
+	safe_strdup(ctx->body, body_json);
+	ctx->attempt = 0;
+	pb_webhook_fire(b, ctx);
+}
+
+/* Schedule a retry by waking up after `delay` seconds.  We piggyback
+ * on the periodic interaction timeout event by stashing the ctx on a
+ * pending queue; a tiny one-shot EventAdd handles the actual fire. */
+static PbWebhookCtx *pb_retry_pending = NULL; /* unused for now; reserved */
+
+static void pb_webhook_retry_fire(void *data)
+{
+	PbWebhookCtx *ctx = data;
+	PbBot *b = pb_find_bot_by_id(ctx ? ctx->bot_id : NULL);
+	if (!b || !b->webhook_url || b->webhook_suspended) {
+		pb_webhook_ctx_free(ctx);
+		return;
+	}
+	pb_webhook_fire(b, ctx);
+}
+
+static void pb_webhook_schedule_retry(PbWebhookCtx *ctx, int delay_ms)
+{
+	if (!ctx) return;
+	char name[64];
+	snprintf(name, sizeof(name), "pb_webhook_retry_%lx",
+	         (unsigned long)(uintptr_t)ctx);
+	EventAdd(modinfo_ref->handle, name, pb_webhook_retry_fire, ctx, delay_ms, 1);
+}
+
+static void pb_webhook_response(OutgoingWebRequest *req, OutgoingWebResponse *resp)
+{
+	PbWebhookCtx *ctx = resp && resp->ptr ? resp->ptr : NULL;
+	PbBot *b = pb_find_bot_by_id(ctx ? ctx->bot_id : NULL);
+	if (!ctx) return;
+
+	int code = resp && !resp->errorbuf ? 200 : 0;
+	/* OutgoingWebResponse doesn't carry a direct HTTP status code in
+	 * the public struct, so we treat "no errorbuf" as success. */
+	if (resp && resp->errorbuf) code = 0;
+
+	if (!b) {
+		/* Bot gone; just drop. */
+		pb_webhook_ctx_free(ctx);
+		return;
+	}
+	if (code >= 200 && code < 300) {
+		b->webhook_failures = 0;
+		unreal_log(ULOG_DEBUG, "pushbot", "WEBHOOK_OK", NULL,
+		           "Webhook delivered for $nick event=$ev",
+		           log_data_string("nick", b->nick),
+		           log_data_string("ev", ctx->event_name));
+		pb_webhook_ctx_free(ctx);
+		return;
+	}
+	/* Failure path. */
+	b->webhook_failures++;
+	unreal_log(ULOG_INFO, "pushbot", "WEBHOOK_FAIL", NULL,
+	           "Webhook FAIL for $nick attempt=$att error=$err",
+	           log_data_string("nick", b->nick),
+	           log_data_integer("att", ctx->attempt),
+	           log_data_string("err", (resp && resp->errorbuf) ? resp->errorbuf : "?"));
+
+	int suspend_after = cfg.webhook_failure_suspend_after > 0
+	                    ? cfg.webhook_failure_suspend_after : 20;
+	if (b->webhook_failures >= suspend_after) {
+		b->webhook_suspended = 1;
+		unreal_log(ULOG_WARNING, "pushbot", "WEBHOOK_SUSPENDED", NULL,
+		           "Bot $nick webhook suspended after $n consecutive failures",
+		           log_data_string("nick", b->nick),
+		           log_data_integer("n", b->webhook_failures));
+		pb_webhook_ctx_free(ctx);
+		return;
+	}
+
+	/* Backoff schedule: 1s, 5s, 30s, 60s, then dead-letter. */
+	static const int backoff_ms[] = { 1000, 5000, 30000, 60000 };
+	if (ctx->attempt >= (int)(sizeof(backoff_ms)/sizeof(backoff_ms[0]))) {
+		unreal_log(ULOG_INFO, "pushbot", "WEBHOOK_DEAD_LETTER", NULL,
+		           "Bot $nick event $ev dropped after all retries",
+		           log_data_string("nick", b->nick),
+		           log_data_string("ev", ctx->event_name));
+		pb_webhook_ctx_free(ctx);
+		return;
+	}
+	int delay = backoff_ms[ctx->attempt];
+	ctx->attempt++;
+	pb_webhook_schedule_retry(ctx, delay);
+}
+
+/* ===================================================================
+ * Phase 3 -- event dispatch to bots in matching channels
+ * =================================================================== */
+
+/* Lightweight Client struct serializer; redacts ip/host/geoip/etc by
+ * default per the spec.  Full-fidelity comes when phase 5 needs it
+ * for COMMAND_INVOKE. */
+static json_t *pb_json_client(Client *c)
+{
+	json_t *j = json_object();
+	if (!c) return j;
+	json_object_set_new(j, "nick", json_string(c->name ? c->name : ""));
+	json_object_set_new(j, "id", json_string(c->id ? c->id : ""));
+	if (c->user) {
+		json_object_set_new(j, "account",
+		    json_string(c->user->account && strcmp(c->user->account, "0")
+		                ? c->user->account : ""));
+		json_object_set_new(j, "ident",
+		    json_string(c->user->username ? c->user->username : ""));
+		const char *vhost = c->user->virthost ? c->user->virthost
+		                  : c->user->cloakedhost ? c->user->cloakedhost : "";
+		json_object_set_new(j, "host", json_string(vhost));
+		long bot_bit = find_user_mode('B');
+		json_object_set_new(j, "is_bot",
+		    json_boolean(bot_bit && (c->umodes & bot_bit) ? 1 : 0));
+		char umb[64];
+		get_usermode_string_r(c, umb, sizeof(umb));
+		json_object_set_new(j, "umodes", json_string(umb));
+		json_object_set_new(j, "is_oper", json_boolean(IsOper(c) ? 1 : 0));
+		json_object_set_new(j, "is_secure", json_boolean(IsSecure(c) ? 1 : 0));
+		json_object_set_new(j, "is_logged_in",
+		    json_boolean(IsLoggedIn(c) ? 1 : 0));
+	}
+	return j;
+}
+
+static json_t *pb_json_channel(Channel *ch)
+{
+	json_t *j = json_object();
+	if (!ch) return j;
+	json_object_set_new(j, "name", json_string(ch->name ? ch->name : ""));
+	json_object_set_new(j, "topic", json_string(ch->topic ? ch->topic : ""));
+	int count = 0;
+	for (Member *m = ch->members; m; m = m->next) count++;
+	json_object_set_new(j, "users_count", json_integer(count));
+	return j;
+}
+
+static int pb_bot_is_in_channel(PbBot *b, Channel *ch)
+{
+	if (!b || !b->ghost || !ch) return 0;
+	for (Membership *m = b->ghost->user->channel; m; m = m->next)
+		if (m->channel == ch) return 1;
+	return 0;
+}
+
+static int pb_skip_sender(Client *client, PbBot *b)
+{
+	/* Don't deliver the bot's own messages back to itself -- the
+	 * obvious feedback-loop prevention. */
+	if (!client || !b || !b->ghost) return 0;
+	return (client == b->ghost) ? 1 : 0;
+}
+
+/* Hook on every channel PRIVMSG/NOTICE/TAGMSG: deliver MESSAGE_CREATE
+ * to every bot in the channel that isn't the source. */
+static int pb_hook_chanmsg(Client *client, Channel *channel, int sendflags,
+                           const char *member_modes, const char *target,
+                           MessageTag *mtags, const char *text, SendType sendtype)
+{
+	if (!channel || !text) return 0;
+
+	/* Phase 5: a TAGMSG carrying +draft/bot-cmd is a slash-command
+	 * invocation, not a regular event.  Route it to COMMAND_INVOKE
+	 * instead of MESSAGE_CREATE. */
+	if (sendtype == SEND_TYPE_TAGMSG) {
+		const char *botcmd_b64 = NULL;
+		for (MessageTag *m = mtags; m; m = m->next)
+			if (m->name && !strcmp(m->name, "+draft/bot-cmd")) {
+				botcmd_b64 = m->value; break;
+			}
+		if (botcmd_b64)
+			return pb_route_botcmd_channel(client, channel, mtags, botcmd_b64);
+	}
+
+	for (PbBot *b = bots; b; b = b->next) {
+		if (b->status != PB_STATUS_ACTIVE) continue;
+		if (!b->session || !b->session->identified) continue;
+		if (!pb_bot_is_in_channel(b, channel)) continue;
+		if (pb_skip_sender(client, b)) continue;
+
+		json_t *d = json_object();
+		const char *msgid = NULL;
+		for (MessageTag *m = mtags; m; m = m->next)
+			if (m->name && !strcmp(m->name, "msgid")) { msgid = m->value; break; }
+		json_object_set_new(d, "msgid", json_string(msgid ? msgid : ""));
+		json_object_set_new(d, "channel", pb_json_channel(channel));
+		json_object_set_new(d, "author", pb_json_client(client));
+		json_object_set_new(d, "content", json_string(text));
+		json_object_set_new(d, "is_notice",
+		    json_boolean(sendtype == SEND_TYPE_NOTICE ? 1 : 0));
+		json_object_set_new(d, "is_tagmsg",
+		    json_boolean(sendtype == SEND_TYPE_TAGMSG ? 1 : 0));
+		/* mention_bot: does the message at-mention or contain the bot's nick? */
+		int mentioned = 0;
+		if (b->nick && strstr(text, b->nick)) mentioned = 1;
+		json_object_set_new(d, "mention_bot", json_boolean(mentioned));
+		pb_dispatch_event(b, "MESSAGE_CREATE", d);
+	}
+	return 0;
+}
+
+static int pb_hook_usermsg(Client *client, Client *to, MessageTag *mtags,
+                           const char *text, SendType sendtype)
+{
+	if (!to || !text) return 0;
+
+	/* Phase 5: a TAGMSG to a bot's ghost with +draft/bot-cmd is a
+	 * slash invocation in DM (or private-visibility channel context). */
+	if (sendtype == SEND_TYPE_TAGMSG) {
+		const char *botcmd_b64 = NULL;
+		const char *channel_ctx = NULL;
+		for (MessageTag *m = mtags; m; m = m->next) {
+			if (m->name && !strcmp(m->name, "+draft/bot-cmd"))
+				botcmd_b64 = m->value;
+			else if (m->name && !strcmp(m->name, "+draft/channel-context"))
+				channel_ctx = m->value;
+		}
+		if (botcmd_b64)
+			return pb_route_botcmd_user(client, to, mtags, botcmd_b64, channel_ctx);
+	}
+
+	for (PbBot *b = bots; b; b = b->next) {
+		if (b->status != PB_STATUS_ACTIVE) continue;
+		if (!b->session || !b->session->identified) continue;
+		if (to != b->ghost) continue;     /* DM addressed at this bot only */
+		if (pb_skip_sender(client, b)) continue;
+
+		json_t *d = json_object();
+		const char *msgid = NULL;
+		for (MessageTag *m = mtags; m; m = m->next)
+			if (m->name && !strcmp(m->name, "msgid")) { msgid = m->value; break; }
+		json_object_set_new(d, "msgid", json_string(msgid ? msgid : ""));
+		json_object_set_new(d, "channel", json_null());  /* DM */
+		json_object_set_new(d, "author", pb_json_client(client));
+		json_object_set_new(d, "content", json_string(text));
+		json_object_set_new(d, "is_notice",
+		    json_boolean(sendtype == SEND_TYPE_NOTICE ? 1 : 0));
+		json_object_set_new(d, "is_tagmsg",
+		    json_boolean(sendtype == SEND_TYPE_TAGMSG ? 1 : 0));
+		json_object_set_new(d, "is_dm", json_true());
+		pb_dispatch_event(b, "MESSAGE_CREATE", d);
+	}
+	return 0;
+}
+
+static int pb_hook_local_join(Client *client, Channel *channel, MessageTag *mtags)
+{
+	if (!channel) return 0;
+	for (PbBot *b = bots; b; b = b->next) {
+		if (b->status != PB_STATUS_ACTIVE) continue;
+		if (!b->session || !b->session->identified) continue;
+		if (!pb_bot_is_in_channel(b, channel)) continue;
+		if (pb_skip_sender(client, b)) continue;
+		json_t *d = json_object();
+		json_object_set_new(d, "client", pb_json_client(client));
+		json_object_set_new(d, "channel", pb_json_channel(channel));
+		pb_dispatch_event(b, "CHANNEL_JOIN", d);
+	}
+	return 0;
+}
+
+static int pb_hook_local_part(Client *client, Channel *channel, MessageTag *mtags,
+                              const char *comment)
+{
+	if (!channel) return 0;
+	for (PbBot *b = bots; b; b = b->next) {
+		if (b->status != PB_STATUS_ACTIVE) continue;
+		if (!b->session || !b->session->identified) continue;
+		if (!pb_bot_is_in_channel(b, channel)) continue;
+		if (pb_skip_sender(client, b)) continue;
+		json_t *d = json_object();
+		json_object_set_new(d, "client", pb_json_client(client));
+		json_object_set_new(d, "channel", pb_json_channel(channel));
+		json_object_set_new(d, "reason", json_string(comment ? comment : ""));
+		pb_dispatch_event(b, "CHANNEL_PART", d);
+	}
+	return 0;
+}
+
+static int pb_hook_local_kick(Client *client, Client *victim, Channel *channel,
+                              MessageTag *mtags, const char *comment)
+{
+	if (!channel) return 0;
+	for (PbBot *b = bots; b; b = b->next) {
+		if (b->status != PB_STATUS_ACTIVE) continue;
+		if (!b->session || !b->session->identified) continue;
+		if (!pb_bot_is_in_channel(b, channel)) continue;
+		json_t *d = json_object();
+		json_object_set_new(d, "client", pb_json_client(client));
+		json_object_set_new(d, "victim", pb_json_client(victim));
+		json_object_set_new(d, "channel", pb_json_channel(channel));
+		json_object_set_new(d, "reason", json_string(comment ? comment : ""));
+		pb_dispatch_event(b, "CHANNEL_KICK", d);
+	}
+	return 0;
+}
+
+/* ===================================================================
+ * Phase 4 -- REST API
+ *
+ * Routes (all under /pushbot/v1/):
+ *   GET    /bot                                 -> bot profile
+ *   GET    /channels                            -> list channels
+ *   POST   /channels/<name>/join                -> JOIN
+ *   POST   /channels/<name>/part                -> PART
+ *   POST   /channels/<name>/messages            -> PRIVMSG to channel
+ *   POST   /channels/<name>/messages/<msgid>/react      -> add reaction
+ *   DELETE /channels/<name>/messages/<msgid>/react/<emoji> -> remove
+ *   DELETE /channels/<name>/messages/<msgid>    -> redact
+ *   POST   /users/<nick>/messages               -> DM
+ *   GET    /channels/<name>/members             -> members
+ *
+ * All paths are under /pushbot/v1/.  Auth: same Bearer as gateway.
+ * Body: JSON for POSTs.  Response: JSON.
+ *
+ * URL parsing is hand-rolled (UnrealIRCd's webserver has no router);
+ * keeps it dependency-free.
+ * =================================================================== */
+
+static void pb_rest_send_json(Client *client, int status, json_t *body)
+{
+	char *json_str = body ? json_dumps(body, JSON_COMPACT) : strdup("{}");
+	if (!json_str) json_str = strdup("{}");
+	char hdr[512];
+	int blen = strlen(json_str);
+	snprintf(hdr, sizeof(hdr),
+	         "HTTP/1.1 %d OK\r\n"
+	         "Content-Type: application/json\r\n"
+	         "Content-Length: %d\r\n"
+	         "Connection: close\r\n"
+	         "\r\n",
+	         status, blen);
+	dbuf_put(&client->local->sendQ, hdr, strlen(hdr));
+	dbuf_put(&client->local->sendQ, json_str, blen);
+	send_queued(client);
+	free(json_str);
+	if (body) json_decref(body);
+	dead_socket(client, "REST response sent");
+}
+
+static void pb_rest_send_error(Client *client, int status, const char *msg)
+{
+	json_t *body = json_object();
+	json_object_set_new(body, "error", json_string(msg ? msg : ""));
+	pb_rest_send_json(client, status, body);
+}
+
+/* Decode a single %XX in-place; returns 0 on success, -1 on malformed. */
+static int pb_pct_decode(char *s)
+{
+	char *o = s;
+	for (char *p = s; *p; p++) {
+		if (*p == '%') {
+			if (!p[1] || !p[2]) return -1;
+			int hi = (p[1] >= '0' && p[1] <= '9') ? p[1] - '0'
+			       : (p[1] >= 'a' && p[1] <= 'f') ? p[1] - 'a' + 10
+			       : (p[1] >= 'A' && p[1] <= 'F') ? p[1] - 'A' + 10 : -1;
+			int lo = (p[2] >= '0' && p[2] <= '9') ? p[2] - '0'
+			       : (p[2] >= 'a' && p[2] <= 'f') ? p[2] - 'a' + 10
+			       : (p[2] >= 'A' && p[2] <= 'F') ? p[2] - 'A' + 10 : -1;
+			if (hi < 0 || lo < 0) return -1;
+			*o++ = (char)(hi * 16 + lo);
+			p += 2;
+		} else *o++ = *p;
+	}
+	*o = '\0';
+	return 0;
+}
+
+static int pb_handle_rest(Client *client, WebRequest *web, PbBot *b)
+{
+	if (!web->uri || strncmp(web->uri, "/pushbot/v1/", 12) != 0) {
+		pb_rest_send_error(client, 404, "not found");
+		return 0;
+	}
+	char path[512];
+	strlcpy(path, web->uri + 12, sizeof(path));   /* skip /pushbot/v1/ */
+	/* Strip query string if any. */
+	char *q = strchr(path, '?');
+	if (q) *q = '\0';
+
+	/* /bot */
+	if (!strcmp(path, "bot")) {
+		if (web->method != HTTP_METHOD_GET) {
+			pb_rest_send_error(client, 405, "method not allowed");
+			return 0;
+		}
+		pb_rest_get_bot(client, web, b);
+		return 0;
+	}
+
+	/* /channels */
+	if (!strcmp(path, "channels")) {
+		if (web->method != HTTP_METHOD_GET) {
+			pb_rest_send_error(client, 405, "method not allowed");
+			return 0;
+		}
+		pb_rest_get_channels(client, web, b);
+		return 0;
+	}
+
+	/* /channels/<name>/... */
+	if (!strncmp(path, "channels/", 9)) {
+		char rest[512];
+		strlcpy(rest, path + 9, sizeof(rest));
+		char *slash = strchr(rest, '/');
+		char *channel = rest;
+		const char *sub = "";
+		if (slash) { *slash = '\0'; sub = slash + 1; }
+		if (pb_pct_decode(channel) < 0) {
+			pb_rest_send_error(client, 400, "bad channel encoding");
+			return 0;
+		}
+
+		if (!strcmp(sub, "join") && web->method == HTTP_METHOD_POST) {
+			pb_rest_channel_join(client, web, b, channel);
+			return 0;
+		}
+		if (!strcmp(sub, "part") && web->method == HTTP_METHOD_POST) {
+			pb_rest_channel_part(client, web, b, channel);
+			return 0;
+		}
+		if (!strcmp(sub, "messages") && web->method == HTTP_METHOD_POST) {
+			pb_rest_channel_message(client, web, b, channel);
+			return 0;
+		}
+		if (!strcmp(sub, "members") && web->method == HTTP_METHOD_GET) {
+			pb_rest_get_members(client, web, b, channel);
+			return 0;
+		}
+		/* messages/<msgid>/... */
+		if (!strncmp(sub, "messages/", 9)) {
+			char msub[256];
+			strlcpy(msub, sub + 9, sizeof(msub));
+			char *mslash = strchr(msub, '/');
+			char *msgid = msub;
+			const char *msub2 = "";
+			if (mslash) { *mslash = '\0'; msub2 = mslash + 1; }
+			/* UnrealIRCd's webserver doesn't support DELETE; use POST
+			 * with subroutes for delete-style ops. */
+			if (!strcmp(msub2, "redact") && web->method == HTTP_METHOD_POST) {
+				pb_rest_redact(client, web, b, channel, msgid);
+				return 0;
+			}
+			if (!strcmp(msub2, "react") && web->method == HTTP_METHOD_POST) {
+				pb_rest_react(client, web, b, channel, msgid, 0, NULL);
+				return 0;
+			}
+			if (!strcmp(msub2, "unreact") && web->method == HTTP_METHOD_POST) {
+				pb_rest_react(client, web, b, channel, msgid, 1, NULL);
+				return 0;
+			}
+		}
+	}
+
+	/* /users/<nick>/messages */
+	if (!strncmp(path, "users/", 6)) {
+		char rest[256];
+		strlcpy(rest, path + 6, sizeof(rest));
+		char *slash = strchr(rest, '/');
+		char *nick = rest;
+		const char *sub = "";
+		if (slash) { *slash = '\0'; sub = slash + 1; }
+		pb_pct_decode(nick);
+		if (!strcmp(sub, "messages") && web->method == HTTP_METHOD_POST) {
+			pb_rest_user_message(client, web, b, nick);
+			return 0;
+		}
+	}
+
+	pb_rest_send_error(client, 404, "no such route");
+	return 0;
+}
+
+static void pb_rest_get_bot(Client *client, WebRequest *web, PbBot *b)
+{
+	json_t *body = json_object();
+	json_object_set_new(body, "bot_id", json_string(b->bot_id));
+	json_object_set_new(body, "nick", json_string(b->nick));
+	json_object_set_new(body, "realname", json_string(b->realname));
+	json_object_set_new(body, "scope", json_string(pb_scope_str(b->scope)));
+	json_object_set_new(body, "transport", json_string(pb_transport_str(b->transport)));
+	json_object_set_new(body, "status", json_string(pb_status_str(b->status)));
+	json_object_set_new(body, "gateway_connected",
+	    json_boolean(b->session && b->session->identified ? 1 : 0));
+	pb_rest_send_json(client, 200, body);
+}
+
+static void pb_rest_get_channels(Client *client, WebRequest *web, PbBot *b)
+{
+	json_t *arr = json_array();
+	if (b->ghost) {
+		for (Membership *m = b->ghost->user->channel; m; m = m->next)
+			json_array_append_new(arr, json_string(m->channel->name));
+	}
+	json_t *body = json_object();
+	json_object_set_new(body, "channels", arr);
+	pb_rest_send_json(client, 200, body);
+}
+
+static void pb_rest_get_members(Client *client, WebRequest *web, PbBot *b,
+                                const char *channel)
+{
+	Channel *ch = find_channel(channel);
+	if (!ch) { pb_rest_send_error(client, 404, "no such channel"); return; }
+	if (!pb_bot_is_in_channel(b, ch)) {
+		pb_rest_send_error(client, 403, "bot not in channel");
+		return;
+	}
+	json_t *arr = json_array();
+	for (Member *m = ch->members; m; m = m->next)
+		json_array_append_new(arr, pb_json_client(m->client));
+	json_t *body = json_object();
+	json_object_set_new(body, "members", arr);
+	pb_rest_send_json(client, 200, body);
+}
+
+/* For POST bodies: jansson-parse, extract string field "content".
+ * Returns NULL + writes 400 on bad input. */
+static const char *pb_post_string_field(Client *client, WebRequest *web,
+                                        const char *field, json_t **owner_out)
+{
+	if (!web->request_buffer) {
+		pb_rest_send_error(client, 400, "missing body");
+		return NULL;
+	}
+	json_error_t err;
+	json_t *body = json_loads(web->request_buffer, 0, &err);
+	if (!body || !json_is_object(body)) {
+		pb_rest_send_error(client, 400, "body must be a JSON object");
+		if (body) json_decref(body);
+		return NULL;
+	}
+	json_t *v = json_object_get(body, field);
+	if (!json_is_string(v)) {
+		pb_rest_send_error(client, 400, "missing string field");
+		json_decref(body);
+		return NULL;
+	}
+	*owner_out = body;
+	return json_string_value(v);
+}
+
+static void pb_rest_channel_message(Client *client, WebRequest *web, PbBot *b,
+                                    const char *channel)
+{
+	Channel *ch = find_channel(channel);
+	if (!ch) { pb_rest_send_error(client, 404, "no such channel"); return; }
+	if (!pb_bot_is_in_channel(b, ch)) {
+		pb_rest_send_error(client, 403, "bot not in channel");
+		return;
+	}
+	json_t *owner = NULL;
+	const char *content = pb_post_string_field(client, web, "content", &owner);
+	if (!content) return;
+
+	sendto_channel(ch, b->ghost, NULL, 0, 0, SEND_ALL, NULL,
+	               "PRIVMSG %s :%s", ch->name, content);
+	json_decref(owner);
+
+	json_t *body = json_object();
+	json_object_set_new(body, "ok", json_true());
+	pb_rest_send_json(client, 200, body);
+}
+
+static void pb_rest_user_message(Client *client, WebRequest *web, PbBot *b,
+                                 const char *nick)
+{
+	Client *target = find_user(nick, NULL);
+	if (!target) { pb_rest_send_error(client, 404, "no such user"); return; }
+	json_t *owner = NULL;
+	const char *content = pb_post_string_field(client, web, "content", &owner);
+	if (!content) return;
+
+	sendto_one(target, NULL, ":%s PRIVMSG %s :%s",
+	           b->ghost ? b->ghost->name : b->nick, target->name, content);
+	json_decref(owner);
+	json_t *body = json_object();
+	json_object_set_new(body, "ok", json_true());
+	pb_rest_send_json(client, 200, body);
+}
+
+static void pb_rest_react(Client *client, WebRequest *web, PbBot *b,
+                          const char *channel, const char *msgid, int remove,
+                          const char *emoji)
+{
+	Channel *ch = find_channel(channel);
+	if (!ch) { pb_rest_send_error(client, 404, "no such channel"); return; }
+	if (!pb_bot_is_in_channel(b, ch)) {
+		pb_rest_send_error(client, 403, "bot not in channel");
+		return;
+	}
+	const char *the_emoji = emoji;
+	json_t *owner = NULL;
+	if (!the_emoji) {
+		the_emoji = pb_post_string_field(client, web, "emoji", &owner);
+		if (!the_emoji) return;
+	}
+	/* React via TAGMSG with the IRCv3 react tag. */
+	if (remove) {
+		sendto_channel(ch, b->ghost, NULL, 0, 0, SEND_ALL, NULL,
+		               "@+draft/react=%s;+draft/reply=%s TAGMSG %s",
+		               the_emoji, msgid, ch->name);
+	} else {
+		sendto_channel(ch, b->ghost, NULL, 0, 0, SEND_ALL, NULL,
+		               "@+draft/react=%s;+draft/reply=%s TAGMSG %s",
+		               the_emoji, msgid, ch->name);
+	}
+	if (owner) json_decref(owner);
+	json_t *body = json_object();
+	json_object_set_new(body, "ok", json_true());
+	pb_rest_send_json(client, 200, body);
+}
+
+static void pb_rest_redact(Client *client, WebRequest *web, PbBot *b,
+                           const char *channel, const char *msgid)
+{
+	Channel *ch = find_channel(channel);
+	if (!ch) { pb_rest_send_error(client, 404, "no such channel"); return; }
+	if (!pb_bot_is_in_channel(b, ch)) {
+		pb_rest_send_error(client, 403, "bot not in channel");
+		return;
+	}
+	/* draft/message-redaction protocol: REDACT command. */
+	const char *parv[4] = { "REDACT", ch->name, msgid, NULL };
+	do_cmd(b->ghost, NULL, "REDACT", 3, parv);
+	json_t *body = json_object();
+	json_object_set_new(body, "ok", json_true());
+	pb_rest_send_json(client, 200, body);
+}
+
+static void pb_rest_channel_join(Client *client, WebRequest *web, PbBot *b,
+                                 const char *channel)
+{
+	if (!b->ghost) { pb_rest_send_error(client, 500, "ghost not up"); return; }
+	Channel *ch = find_channel(channel);
+	if (!ch) ch = make_channel(channel);
+	if (!ch) { pb_rest_send_error(client, 500, "could not create channel"); return; }
+	if (!pb_bot_is_in_channel(b, ch))
+		add_user_to_channel(ch, b->ghost, "");
+	json_t *body = json_object();
+	json_object_set_new(body, "ok", json_true());
+	json_object_set_new(body, "channel", json_string(ch->name));
+	pb_rest_send_json(client, 200, body);
+}
+
+static void pb_rest_channel_part(Client *client, WebRequest *web, PbBot *b,
+                                 const char *channel)
+{
+	if (!b->ghost) { pb_rest_send_error(client, 500, "ghost not up"); return; }
+	Channel *ch = find_channel(channel);
+	if (!ch) { pb_rest_send_error(client, 404, "no such channel"); return; }
+	Membership *target = NULL;
+	for (Membership *m = b->ghost->user->channel; m; m = m->next)
+		if (m->channel == ch) { target = m; break; }
+	if (!target) { pb_rest_send_error(client, 404, "not in channel"); return; }
+	remove_user_from_channel_withmb(b->ghost, ch, target, 1);
+	json_t *body = json_object();
+	json_object_set_new(body, "ok", json_true());
+	pb_rest_send_json(client, 200, body);
+}
+
