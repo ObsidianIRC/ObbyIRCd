@@ -2463,11 +2463,16 @@ static int pb_route_botcmd_user(Client *invoker, Client *to, MessageTag *mtags,
 		return 0;
 	}
 
-	/* Validate channel_context: bot AND invoker must be in it. */
+	/* Validate channel_context: the invoker must be in the channel.
+	 * For channel-scope bots the bot ghost must also be a member;
+	 * server-scope bots (helpbot, dicebot) are reachable from any
+	 * channel and never auto-join, so skip the bot-in-channel check
+	 * for them. */
 	if (channel_context && *channel_context) {
 		Channel *ch = find_channel(channel_context);
-		if (!ch || !find_membership_link(invoker->user->channel, ch) ||
-		    !pb_bot_is_in_channel(bot, ch)) {
+		int bot_ok = (bot->scope == PB_SCOPE_SERVER) ||
+		             (ch && pb_bot_is_in_channel(bot, ch));
+		if (!ch || !find_membership_link(invoker->user->channel, ch) || !bot_ok) {
 			sendto_one(invoker, NULL,
 			           ":%s FAIL BOTCMD INVALID_CHANNEL_CONTEXT %s :bot-cmd: invalid channel context",
 			           me.name, channel_context);
