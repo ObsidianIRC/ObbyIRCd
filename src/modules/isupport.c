@@ -29,6 +29,21 @@
 void _send_isupport(Client *client);
 void _isupport_check_for_changes(void);
 
+/* Per-local-client moddata: whether _send_isupport has already
+ * delivered the full RPL_ISUPPORT list to this client.  Lets the
+ * post-welcome auto-send in nick.c be skipped for v0.2 clients that
+ * already pulled the data via the pre-registration ISUPPORT command,
+ * per the draft/extended-isupport-0.2 "MAY skip" clause. */
+static ModDataInfo *isupport_sent_md = NULL;
+#define ISUPPORT_SENT(c) \
+	((c) && (c)->local && \
+	 isupport_sent_md && \
+	 moddata_local_client((c), isupport_sent_md).i)
+#define SET_ISUPPORT_SENT(c) \
+	do { if ((c) && (c)->local && isupport_sent_md) \
+	         moddata_local_client((c), isupport_sent_md).i = 1; \
+	} while (0)
+
 ModuleHeader MOD_HEADER
 ={
 	"isupport", /* Name of module */
@@ -50,7 +65,13 @@ MOD_TEST()
 
 MOD_INIT()
 {
+	ModDataInfo mreq;
 	MARK_AS_OFFICIAL_MODULE(modinfo);
+
+	memset(&mreq, 0, sizeof(mreq));
+	mreq.name = "isupport_sent";
+	mreq.type = MODDATATYPE_LOCAL_CLIENT;
+	isupport_sent_md = ModDataAdd(modinfo->handle, mreq);
 
 	return MOD_SUCCESS;
 }
@@ -197,6 +218,16 @@ void _send_isupport(Client *client)
 	int i;
 	MessageTag *mtags = NULL, *m;
 
+	/* Spec (draft/extended-isupport-0.2): the server MAY skip the
+	 * RPL_ISUPPORT replies usually sent when connection registration
+	 * completes if it already sent all information.  When a v0.2
+	 * client pulled the full list pre-registration via the ISUPPORT
+	 * command, ISUPPORT_SENT has been flipped and the post-welcome
+	 * auto-send (nick.c -> send_isupport) is a no-op for them. */
+	if (HasCapability(client, "draft/extended-isupport-0.2") &&
+	    ISUPPORT_SENT(client))
+		return;
+
 	*batch = '\0';
 
 	if (client_wants_isupport_batch(client))
@@ -234,6 +265,8 @@ void _send_isupport(Client *client)
 		sendto_one(client, NULL, ":%s BATCH -%s", me.name, batch);
 		safe_free_message_tags(mtags);
 	}
+
+	SET_ISUPPORT_SENT(client);
 }
 
 ISupport *isupport_find_ex(ISupport *list, const char *name)
