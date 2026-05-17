@@ -26,6 +26,7 @@ struct ChatHistoryTarget {
 
 /* Forward declarations */
 CMD_FUNC(cmd_chathistory);
+static int chathistory_account_is_member(Client *client, Channel *channel);
 
 /* Global variables */
 long CAP_CHATHISTORY = 0L;
@@ -223,6 +224,38 @@ void send_empty_batch(Client *client, const char *target)
 	}
 }
 
+/* CHATHISTORY's membership gate has to be account-aware: the
+ * persistence module attaches extra session clients to an existing
+ * canonical without inserting per-session Memberships into
+ * channel->members (the canonical's single Membership is the
+ * authoritative one).  A plain IsMember() check on the session
+ * client therefore returns false, so we'd reject CHATHISTORY for a
+ * user who is very much part of the channel.
+ *
+ * Resolve via the "account_canonical" moddata the persistence module
+ * publishes: any account-bound client gets a pointer to its
+ * canonical Client*.  If that canonical is a Member, the requesting
+ * session inherits access.  When the persistence module isn't
+ * loaded (or the client isn't logged in) we fall back to the plain
+ * IsMember check.
+ */
+static int chathistory_account_is_member(Client *client, Channel *channel)
+{
+	ModDataInfo *md;
+	Client *canon;
+
+	if (IsMember(client, channel))
+		return 1;
+
+	md = findmoddata_byname("account_canonical", MODDATATYPE_CLIENT);
+	if (!md)
+		return 0;
+	canon = (Client *)moddata_client(client, md).ptr;
+	if (!canon || canon == client)
+		return 0;
+	return IsMember(canon, channel) ? 1 : 0;
+}
+
 CMD_FUNC(cmd_chathistory)
 {
 	HistoryFilter *filter = NULL;
@@ -289,7 +322,7 @@ CMD_FUNC(cmd_chathistory)
 		return;
 	}
 
-	if (!IsMember(client, channel))
+	if (!chathistory_account_is_member(client, channel))
 	{
 		sendto_one(client, NULL, ":%s FAIL CHATHISTORY INVALID_TARGET %s %s :Messages could not be retrieved, you are not a member",
 			me.name, parv[1], parv[2]);

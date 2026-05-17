@@ -103,11 +103,20 @@ static PersistEntry *persist_list = NULL;
 static ModDataInfo *ghost_md = NULL;
 static ModDataInfo *restore_md = NULL;
 static ModDataInfo *session_md = NULL;
+static ModDataInfo *canonical_md = NULL;
 static long CAP_PERSISTENCE = 0L;
 static long away_notify_cap = 0L;
 static long persist_timeout = PERSIST_DEFAULT_TIMEOUT;
 static int persist_default_on = 1;
 static int persist_db_dirty = 0;
+/* Set by session_msg_override to the actual session client who issued the
+ * PRIVMSG/NOTICE/TAGMSG before we swap `client` to its canonical.  The
+ * fanout hooks (persist_chanmsg / persist_usermsg) skip this client to
+ * avoid sending a duplicate copy back to the sender's own session --
+ * the spec dictates the sender only sees their own message via the
+ * echo-message capability, never via cross-session relay.
+ * UnrealIRCd's event loop is single-threaded so this static is safe. */
+static Client *current_session_sender = NULL;
 
 /* Command overrides for session clients */
 static CommandOverride *ovr_privmsg = NULL;
@@ -235,6 +244,26 @@ MOD_INIT()
 	if (!session_md)
 	{
 		config_error("persistence: Failed to add session moddata");
+		return MOD_FAILED;
+	}
+
+	/* Direct canonical pointer for any account-bound client.
+	 * - canonical client: points at itself
+	 * - session client:    points at its canonical
+	 * Exposed under this stable name so other modules (chathistory,
+	 * KICK, mode display, etc.) can ask "what's the account-canonical
+	 * Client* for this connection?" without having to know our
+	 * PersistEntry layout.  Cross-module lookup via
+	 *   findmoddata_byname("account_canonical", MODDATATYPE_CLIENT)
+	 * keeps the dependency one-way and tolerates the persistence
+	 * module being absent. */
+	memset(&mdi, 0, sizeof(mdi));
+	mdi.name = "account_canonical";
+	mdi.type = MODDATATYPE_CLIENT;
+	canonical_md = ModDataAdd(modinfo->handle, mdi);
+	if (!canonical_md)
+	{
+		config_error("persistence: Failed to add account_canonical moddata");
 		return MOD_FAILED;
 	}
 
@@ -697,6 +726,31 @@ static PersistEntry *find_entry_for_session(Client *client)
 	return (PersistEntry *)moddata_client(client, restore_md).ptr;
 }
 
+/* Maintain the cross-module account_canonical pointer for one client.
+ * canonical=NULL clears it.  Safe to call before/after the module is
+ * loaded (no-op if the moddata isn't registered yet). */
+static void canonical_md_set(Client *client, Client *canonical)
+{
+	if (!canonical_md || !client)
+		return;
+	moddata_client(client, canonical_md).ptr = canonical;
+}
+
+/* Re-stamp every member of an account group (canonical + sessions)
+ * with the current canonical pointer.  Called after promote_session
+ * so the freshly-promoted client and any remaining sessions all
+ * point at the new canonical, not the one that just quit. */
+static void canonical_md_refresh_group(PersistEntry *e)
+{
+	PersistSession *sess;
+	if (!e)
+		return;
+	if (e->canonical)
+		canonical_md_set(e->canonical, e->canonical);
+	for (sess = e->sessions; sess; sess = sess->next)
+		canonical_md_set(sess->client, e->canonical);
+}
+
 static void add_session(PersistEntry *e, Client *client)
 {
 	PersistSession *sess;
@@ -706,6 +760,8 @@ static void add_session(PersistEntry *e, Client *client)
 	sess->next = e->sessions;
 	e->sessions = sess;
 	e->num_sessions++;
+
+	canonical_md_set(client, e->canonical);
 }
 
 static void remove_session(PersistEntry *e, Client *client)
@@ -722,6 +778,7 @@ static void remove_session(PersistEntry *e, Client *client)
 				e->sessions = sess->next;
 			e->num_sessions--;
 			safe_free(sess);
+			canonical_md_set(client, NULL);
 			return;
 		}
 		prev = sess;
@@ -768,6 +825,7 @@ static void promote_session(PersistEntry *e)
 	}
 
 	e->canonical = new_canonical;
+	canonical_md_refresh_group(e);
 
 	unreal_log(ULOG_INFO, "persistence", "PERSIST_SESSION_PROMOTED", new_canonical,
 	           "Session promoted to canonical for account $account",
@@ -1195,6 +1253,7 @@ static int persist_account_login(Client *client, MessageTag *mtags)
 		send_status(client, e);
 		restore_channels(client, e);
 		e->canonical = client;
+		canonical_md_set(client, client);
 	}
 
 	persist_db_mark_dirty();
@@ -1237,7 +1296,10 @@ static int persist_welcome(Client *client, int after_numeric)
 			/* Normal restore: join channels, register as canonical */
 			restore_channels(client, e);
 			if (!IsDead(client))
+			{
 				e->canonical = client;
+				canonical_md_set(client, client);
+			}
 		}
 	}
 
@@ -1271,14 +1333,23 @@ static int persist_chanmsg(Client *client, Channel *channel, int sendflags,
 		for (sess = e->sessions; sess; sess = sess->next)
 		{
 			/* Skip sessions already in the channel */
-			if (!IsMember(sess->client, channel))
-				sendto_one(sess->client, mtags, ":%s!%s@%s %s %s :%s",
-				           client->name,
-				           IsUser(client) ? client->user->username : "*",
-				           IsUser(client) ? GetHost(client) : me.name,
-				           sendtype_to_cmd(sendtype),
-				           channel->name,
-				           text);
+			if (IsMember(sess->client, channel))
+				continue;
+			/* Skip the actual sender session.  session_msg_override
+			 * swapped `client` to the canonical, so without this
+			 * we'd happily relay the message back to the session
+			 * that sent it -- producing a duplicate that looks
+			 * like an unwanted echo-message in clients (e.g.
+			 * HexChat) that never negotiated the cap. */
+			if (sess->client == current_session_sender)
+				continue;
+			sendto_one(sess->client, mtags, ":%s!%s@%s %s %s :%s",
+			           client->name,
+			           IsUser(client) ? client->user->username : "*",
+			           IsUser(client) ? GetHost(client) : me.name,
+			           sendtype_to_cmd(sendtype),
+			           channel->name,
+			           text);
 		}
 	}
 	return 0;
@@ -1299,6 +1370,11 @@ static int persist_usermsg(Client *client, Client *to, MessageTag *mtags,
 
 	for (sess = e->sessions; sess; sess = sess->next)
 	{
+		/* Don't relay the user-message back to the session that
+		 * originated it (only happens for self-targeted PMs across
+		 * one's own sessions, e.g. testing /msg myself). */
+		if (sess->client == current_session_sender)
+			continue;
 		sendto_one(sess->client, mtags, ":%s!%s@%s %s %s :%s",
 		           client->name,
 		           IsUser(client) ? client->user->username : "*",
@@ -1571,15 +1647,27 @@ static int persist_remote_kick(Client *client, Client *victim, Channel *channel,
 
 CMD_OVERRIDE_FUNC(session_msg_override)
 {
+	Client *real_sender = NULL;
 	if (is_session_client(client))
 	{
 		PersistEntry *e = find_entry_for_session(client);
 		if (e && e->canonical && IsUser(e->canonical) && !IsDead(e->canonical))
+		{
+			/* Remember who actually sent so persist_chanmsg /
+			 * persist_usermsg can suppress the relay copy that
+			 * would otherwise duplicate the message back to this
+			 * session (the only legitimate self-echo is via the
+			 * echo-message cap, handled in modules/echo-message.c). */
+			real_sender = client;
+			current_session_sender = client;
 			client = e->canonical;
+		}
 		else
 			return;
 	}
 	CALL_NEXT_COMMAND_OVERRIDE();
+	if (real_sender)
+		current_session_sender = NULL;
 }
 
 CMD_OVERRIDE_FUNC(session_join_override)
