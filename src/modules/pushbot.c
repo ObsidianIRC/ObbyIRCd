@@ -2758,6 +2758,13 @@ static void pb_send_bot_info(Client *client, const char *batch_ref,
 }
 
 /* Send the full bot-list burst to one client, BATCH-wrapped. */
+/* On connect, send server-scope bots only -- they're always reachable
+ * regardless of channel membership.  Channel-scope bots are revealed
+ * to the client on a per-channel basis from pb_hook_local_join when
+ * the user joins a channel they're a member of.  Keeps the directory
+ * the client cares about scoped to "what can I actually invoke right
+ * now".  Opers see every bot in the burst since they may need to
+ * manage bots in channels they haven't joined. */
 static void pb_send_bot_burst(Client *client)
 {
 	if (!HasCapabilityFast(client, CAP_CHANBOTS)) return;
@@ -2769,18 +2776,40 @@ static void pb_send_bot_burst(Client *client)
 	int for_oper = IsOper(client) ? 1 : 0;
 
 	int n = 0;
-	for (PbBot *b = bots; b; b = b->next)
-		if (pb_bot_visible_to(b, client)) n++;
+	for (PbBot *b = bots; b; b = b->next) {
+		if (!pb_bot_visible_to(b, client)) continue;
+		if (!for_oper && b->scope != PB_SCOPE_SERVER) continue;
+		n++;
+	}
 	if (n == 0) return;  /* nothing to send */
 
 	sendto_one(client, NULL, ":%s BATCH +%s " PB_CAP_NAME, me.name, ref);
 	for (PbBot *b = bots; b; b = b->next) {
 		if (!pb_bot_visible_to(b, client)) continue;
+		if (!for_oper && b->scope != PB_SCOPE_SERVER) continue;
 		json_t *body = pb_bot_to_burst_json(b, for_oper, "add");
 		pb_send_bot_info(client, ref, body);
 		json_decref(body);
 	}
 	sendto_one(client, NULL, ":%s BATCH -%s", me.name, ref);
+}
+
+/* Announce channel-scope bots present in a channel the user just
+ * joined.  Sent as individual obby.world/bot-info TAGMSGs (no batch
+ * wrapper since the count is typically 0..2). */
+static void pb_announce_channel_bots(Client *client, Channel *ch)
+{
+	if (!client || !ch) return;
+	if (!HasCapabilityFast(client, CAP_CHANBOTS)) return;
+	int for_oper = IsOper(client) ? 1 : 0;
+	for (PbBot *b = bots; b; b = b->next) {
+		if (b->scope != PB_SCOPE_CHANNEL) continue;
+		if (!pb_bot_visible_to(b, client)) continue;
+		if (!pb_bot_is_in_channel(b, ch)) continue;
+		json_t *body = pb_bot_to_burst_json(b, for_oper, "add");
+		pb_send_bot_info(client, NULL, body);
+		json_decref(body);
+	}
 }
 
 /* Push a single bot event to every cap-aware local client that can see
@@ -3187,6 +3216,10 @@ static int pb_hook_usermsg(Client *client, Client *to, MessageTag *mtags,
 static int pb_hook_local_join(Client *client, Channel *channel, MessageTag *mtags)
 {
 	if (!channel) return 0;
+	/* Channel-scope bots only enter the client's directory now -- the
+	 * connect burst sent server-scope bots only; this is the moment
+	 * the user shares a channel with each channel-scope bot in here. */
+	pb_announce_channel_bots(client, channel);
 	for (PbBot *b = bots; b; b = b->next) {
 		if (b->status != PB_STATUS_ACTIVE) continue;
 		if (!pb_bot_deliverable(b)) continue;
