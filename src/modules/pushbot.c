@@ -157,6 +157,10 @@ struct PbInteraction {
 	char *invoker_nick;       /* who ran the slash command */
 	char *channel;            /* channel context (NULL = DM with bot) */
 	char *invoker_msgid;      /* msgid of the TAGMSG (for +reply) */
+	char *invoker_cmd_b64;    /* base64-JSON of {nick, name, options}; sent
+	                           * back as +obby.world/invoked-by on the bot's
+	                           * reply so the client can render a quote
+	                           * attribution without local state. */
 	PbBot *bot;
 	time_t expires_at;        /* hard timeout: 3s default, 15s after defer */
 	int deferred;
@@ -449,6 +453,16 @@ MOD_INIT()
 		memset(&m, 0, sizeof(m));
 		m.name = PB_BOT_INFO_TAG;
 		m.is_ok = pb_mtag_bot_info_is_ok;
+		m.flags = MTAG_HANDLER_FLAGS_NO_CAP_NEEDED;
+		MessageTagHandlerAdd(modinfo->handle, &m);
+
+		/* +obby.world/invoked-by carries a base64 JSON describing the
+		 * original slash-command invocation; emitted on the bot's
+		 * channel reply so the client can render an attribution quote
+		 * without tracking outgoing msgids itself. */
+		memset(&m, 0, sizeof(m));
+		m.name = "+obby.world/invoked-by";
+		m.is_ok = pb_mtag_bot_info_is_ok; /* same base64 validation */
 		m.flags = MTAG_HANDLER_FLAGS_NO_CAP_NEEDED;
 		MessageTagHandlerAdd(modinfo->handle, &m);
 	}
@@ -2272,12 +2286,16 @@ static void pb_interaction_free(PbInteraction *it)
 	safe_free(it->invoker_nick);
 	safe_free(it->channel);
 	safe_free(it->invoker_msgid);
+	safe_free(it->invoker_cmd_b64);
 	safe_free(it);
 }
 
 /* Build a NameValuePrioList holding +reply / +draft/channel-context
- * for use with sendto_one() etc.  Caller must free_message_tags(). */
-static MessageTag *pb_make_reply_tags(const char *reply_msgid, const char *channel_ctx)
+ * / +obby.world/invoked-by for use with sendto_one() etc.  Caller
+ * must free_message_tags(). */
+static MessageTag *pb_make_reply_tags(const char *reply_msgid,
+                                      const char *channel_ctx,
+                                      const char *invoked_by_b64)
 {
 	MessageTag *head = NULL, *tail = NULL;
 	if (reply_msgid && *reply_msgid) {
@@ -2291,6 +2309,12 @@ static MessageTag *pb_make_reply_tags(const char *reply_msgid, const char *chann
 		MessageTag *m = safe_alloc(sizeof(*m));
 		safe_strdup(m->name, "+draft/channel-context");
 		safe_strdup(m->value, channel_ctx);
+		AddListItem(m, head);
+	}
+	if (invoked_by_b64 && *invoked_by_b64) {
+		MessageTag *m = safe_alloc(sizeof(*m));
+		safe_strdup(m->name, "+obby.world/invoked-by");
+		safe_strdup(m->value, invoked_by_b64);
 		AddListItem(m, head);
 	}
 	return head;
@@ -2352,6 +2376,30 @@ static void pb_dispatch_command(PbBot *bot, Client *invoker,
 	json_object_set_new(d, "name", json_string(cmd_name ? cmd_name : ""));
 	json_t *opts = json_object_get(cmd_json, "options");
 	json_object_set_new(d, "options", opts ? json_incref(opts) : json_object());
+
+	/* Snapshot the invocation for the eventual reply tag.  We base64
+	 * a JSON object {nick, name, options} so the receiving client
+	 * doesn't have to track outgoing msgids itself to know what the
+	 * user originally typed -- the reply carries the context inline. */
+	{
+		json_t *snap = json_object();
+		json_object_set_new(snap, "nick",
+		    json_string(invoker && invoker->name ? invoker->name : ""));
+		json_object_set_new(snap, "name", json_string(cmd_name ? cmd_name : ""));
+		json_object_set_new(snap, "options",
+		    opts ? json_incref(opts) : json_object());
+		char *snap_str = json_dumps(snap, JSON_COMPACT);
+		json_decref(snap);
+		if (snap_str) {
+			int slen = strlen(snap_str);
+			int b64_max = ((slen + 2) / 3) * 4 + 1;
+			char *b64 = safe_alloc(b64_max);
+			b64_encode(snap_str, slen, b64, b64_max);
+			free(snap_str);
+			it->invoker_cmd_b64 = b64; /* safe_alloc'd, freed in pb_interaction_free */
+		}
+	}
+
 	pb_dispatch_event(bot, "COMMAND_INVOKE", d);
 	json_decref(cmd_json);
 }
@@ -2535,7 +2583,8 @@ static void pb_send_interaction_reply(PbInteraction *it, const char *content,
 		/* Public reply in-channel: PRIVMSG <ch> from bot ghost. */
 		Channel *ch = find_channel(it->channel);
 		if (!ch) return;
-		MessageTag *tags = pb_make_reply_tags(it->invoker_msgid, NULL);
+		MessageTag *tags = pb_make_reply_tags(it->invoker_msgid, NULL,
+		                                      it->invoker_cmd_b64);
 		sendto_channel(ch, it->bot->ghost, NULL, NULL, 0, SEND_ALL, tags,
 		               ":%s PRIVMSG %s :%s", it->bot->ghost->name, ch->name, content);
 		free_message_tags(tags);
@@ -2543,7 +2592,8 @@ static void pb_send_interaction_reply(PbInteraction *it, const char *content,
 	}
 
 	/* Private reply: NOTICE/PRIVMSG to invoker with channel-context tag. */
-	MessageTag *tags = pb_make_reply_tags(it->invoker_msgid, it->channel);
+	MessageTag *tags = pb_make_reply_tags(it->invoker_msgid, it->channel,
+	                                      it->invoker_cmd_b64);
 	const char *cmd = as_notice ? "NOTICE" : "PRIVMSG";
 	sendto_one(target, tags, ":%s %s %s :%s",
 	           it->bot->ghost->name, cmd, target->name, content);
