@@ -144,7 +144,6 @@ static void add_session(PersistEntry *e, Client *client);
 static void remove_session(PersistEntry *e, Client *client);
 static void promote_session(PersistEntry *e);
 static void setup_session(Client *client, PersistEntry *e);
-static void relay_to_channel_sessions(Channel *channel, PersistEntry *skip_e, MessageTag *mtags, const char *buf);
 static int persistence_effective(Client *client, PersistEntry *e);
 static void send_status(Client *client, PersistEntry *e);
 static const char *pref_to_str(int pref);
@@ -154,23 +153,13 @@ static void persist_db_mark_dirty(void);
 static void persist_load_db(void);
 
 static int persist_local_quit(Client *client, MessageTag *mtags, const char *comment);
-static int persist_remote_quit(Client *client, MessageTag *mtags, const char *comment);
 static int persist_account_login(Client *client, MessageTag *mtags);
 static int persist_welcome(Client *client, int after_numeric);
-static int persist_chanmsg(Client *client, Channel *channel, int sendflags, const char *prefix, const char *target, MessageTag *mtags, const char *text, SendType sendtype);
 static int persist_usermsg(Client *client, Client *to, MessageTag *mtags, const char *text, SendType sendtype);
 static int persist_local_join(Client *client, Channel *channel, MessageTag *mtags);
-static int persist_remote_join(Client *client, Channel *channel, MessageTag *mtags);
 static int persist_local_part(Client *client, Channel *channel, MessageTag *mtags, const char *comment);
-static int persist_remote_part(Client *client, Channel *channel, MessageTag *mtags, const char *comment);
 static int persist_local_nickchange(Client *client, MessageTag *mtags, const char *newnick);
-static int persist_remote_nickchange(Client *client, MessageTag *mtags, const char *newnick);
-static int persist_local_chanmode(Client *client, Channel *channel, MessageTag *mtags, const char *modebuf, const char *parabuf, time_t sendts, int samode, int *destroy_channel);
-static int persist_remote_chanmode(Client *client, Channel *channel, MessageTag *mtags, const char *modebuf, const char *parabuf, time_t sendts, int samode, int *destroy_channel);
-static int persist_topic(Client *client, Channel *channel, MessageTag *mtags, const char *topic);
-static int persist_away(Client *client, MessageTag *mtags, const char *reason, int already_as_away);
 static int persist_local_kick(Client *client, Client *victim, Channel *channel, MessageTag *mtags, const char *comment);
-static int persist_remote_kick(Client *client, Client *victim, Channel *channel, MessageTag *mtags, const char *comment);
 static int persist_configrun(ConfigFile *cf, ConfigEntry *ce, int type);
 static int persist_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs);
 CMD_FUNC(cmd_persistence);
@@ -269,25 +258,23 @@ MOD_INIT()
 
 	/* Core lifecycle hooks */
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_QUIT, 0, persist_local_quit);
-	HookAdd(modinfo->handle, HOOKTYPE_REMOTE_QUIT, 0, persist_remote_quit);
 	HookAdd(modinfo->handle, HOOKTYPE_ACCOUNT_LOGIN, 0, persist_account_login);
 	HookAdd(modinfo->handle, HOOKTYPE_WELCOME, 0, persist_welcome);
 
-	/* Session relay hooks */
-	HookAdd(modinfo->handle, HOOKTYPE_CHANMSG, 0, persist_chanmsg);
+	/* Session-Member upkeep: when canonical joins/parts/gets-kicked,
+	 * we mirror the channel-membership change onto each attached
+	 * session's shadow Member.  All other relay paths (CHANMSG,
+	 * REMOTE_*, NICKCHANGE-relay, CHANMODE-relay, TOPIC-relay,
+	 * AWAY-relay, QUIT-relay) used to hand-roll per-cap-broken
+	 * fanout; with shadow Members in channel->members, core's
+	 * sendto_channel / sendto_local_common_channels / etc. now
+	 * reach sessions directly with proper per-recipient cap
+	 * filtering. */
 	HookAdd(modinfo->handle, HOOKTYPE_USERMSG, 0, persist_usermsg);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_JOIN, 0, persist_local_join);
-	HookAdd(modinfo->handle, HOOKTYPE_REMOTE_JOIN, 0, persist_remote_join);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_PART, 0, persist_local_part);
-	HookAdd(modinfo->handle, HOOKTYPE_REMOTE_PART, 0, persist_remote_part);
-	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_NICKCHANGE, 0, persist_local_nickchange);
-	HookAdd(modinfo->handle, HOOKTYPE_REMOTE_NICKCHANGE, 0, persist_remote_nickchange);
-	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_CHANMODE, 0, persist_local_chanmode);
-	HookAdd(modinfo->handle, HOOKTYPE_REMOTE_CHANMODE, 0, persist_remote_chanmode);
-	HookAdd(modinfo->handle, HOOKTYPE_TOPIC, 0, persist_topic);
-	HookAdd(modinfo->handle, HOOKTYPE_AWAY, 0, persist_away);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_KICK, 0, persist_local_kick);
-	HookAdd(modinfo->handle, HOOKTYPE_REMOTE_KICK, 0, persist_remote_kick);
+	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_NICKCHANGE, 0, persist_local_nickchange);
 
 	EventAdd(modinfo->handle, "persist_cleanup", ghost_cleanup_event, NULL,
 	         PERSIST_CLEANUP_INTERVAL_MS, 0);
@@ -956,37 +943,6 @@ static void setup_session(Client *client, PersistEntry *e)
 	           log_data_string("account", e->account));
 }
 
-/*
- * Relay a pre-formatted IRC line to all session clients of canonical
- * members of `channel`.  Sessions belonging to `skip_e` are skipped
- * (used to avoid sending a canonical's own QUIT to its sessions when
- * a session promotion will handle continuity instead).
- */
-static void relay_to_channel_sessions(Channel *channel, PersistEntry *skip_e,
-                                      MessageTag *mtags, const char *buf)
-{
-	Member *mb;
-	PersistEntry *e;
-	PersistSession *sess;
-
-	for (mb = channel->members; mb; mb = mb->next)
-	{
-		Client *member = mb->client;
-		if (!MyUser(member) || !IsLoggedIn(member))
-			continue;
-		e = find_entry(member->user->account);
-		if (!e || !e->sessions)
-			continue;
-		if (e == skip_e)
-			continue;
-		for (sess = e->sessions; sess; sess = sess->next)
-		{
-			/* Skip sessions already in the channel: they receive via normal IRC path */
-			if (!IsMember(sess->client, channel))
-				sendto_one(sess->client, mtags, "%s", buf);
-		}
-	}
-}
 
 static int persistence_effective(Client *client, PersistEntry *e)
 {
@@ -1095,16 +1051,6 @@ static int persist_local_quit(Client *client, MessageTag *mtags, const char *com
 	if (e->ghost)
 		destroy_ghost(e, NULL);
 
-	/* Relay QUIT to sessions of OTHER channel members before stripping channels */
-	for (mb = client->user->channel; mb; mb = mb->next)
-	{
-		char buf[BUFSIZE];
-		snprintf(buf, sizeof(buf), ":%s!%s@%s QUIT :%s",
-		         client->name, client->user->username, GetHost(client),
-		         comment ? comment : "");
-		relay_to_channel_sessions(mb->channel, e, mtags, buf);
-	}
-
 	/* Capture current state */
 	save_client_to_entry(client, e);
 
@@ -1143,29 +1089,6 @@ static int persist_local_quit(Client *client, MessageTag *mtags, const char *com
 	*client->name = '\0';
 
 	persist_db_mark_dirty();
-
-	return 0;
-}
-
-/* ===================================================================
- * Hook: HOOKTYPE_REMOTE_QUIT
- * Relay remote user quits to sessions of local channel members.
- * =================================================================== */
-static int persist_remote_quit(Client *client, MessageTag *mtags, const char *comment)
-{
-	Membership *mb;
-
-	if (!IsUser(client) || is_ghost_client(client))
-		return 0;
-
-	for (mb = client->user->channel; mb; mb = mb->next)
-	{
-		char buf[BUFSIZE];
-		snprintf(buf, sizeof(buf), ":%s!%s@%s QUIT :%s",
-		         client->name, client->user->username, GetHost(client),
-		         comment ? comment : "");
-		relay_to_channel_sessions(mb->channel, NULL, mtags, buf);
-	}
 
 	return 0;
 }
@@ -1327,51 +1250,6 @@ static int persist_welcome(Client *client, int after_numeric)
  * Session relay hooks
  * =================================================================== */
 
-static int persist_chanmsg(Client *client, Channel *channel, int sendflags,
-                           const char *prefix, const char *target,
-                           MessageTag *mtags, const char *text, SendType sendtype)
-{
-	Member *mb;
-	PersistEntry *e;
-	PersistSession *sess;
-
-	if (sendtype == SEND_TYPE_TAGMSG)
-		return 0;
-
-	for (mb = channel->members; mb; mb = mb->next)
-	{
-		Client *member = mb->client;
-		if (!MyUser(member) || !IsLoggedIn(member))
-			continue;
-		e = find_entry(member->user->account);
-		if (!e || !e->sessions)
-			continue;
-
-		for (sess = e->sessions; sess; sess = sess->next)
-		{
-			/* Skip sessions already in the channel */
-			if (IsMember(sess->client, channel))
-				continue;
-			/* Skip the actual sender session.  session_msg_override
-			 * swapped `client` to the canonical, so without this
-			 * we'd happily relay the message back to the session
-			 * that sent it -- producing a duplicate that looks
-			 * like an unwanted echo-message in clients (e.g.
-			 * HexChat) that never negotiated the cap. */
-			if (sess->client == current_session_sender)
-				continue;
-			sendto_one(sess->client, mtags, ":%s!%s@%s %s %s :%s",
-			           client->name,
-			           IsUser(client) ? client->user->username : "*",
-			           IsUser(client) ? GetHost(client) : me.name,
-			           sendtype_to_cmd(sendtype),
-			           channel->name,
-			           text);
-		}
-	}
-	return 0;
-}
-
 static int persist_usermsg(Client *client, Client *to, MessageTag *mtags,
                            const char *text, SendType sendtype)
 {
@@ -1432,37 +1310,27 @@ static int persist_local_join(Client *client, Channel *channel, MessageTag *mtag
 	 * about the new channel -- sendto_channel already broadcast for
 	 * the canonical's Member but the shadows didn't exist yet at
 	 * that moment, so emit it here. */
-	for (sess = joiner_e->sessions; sess; sess = sess->next)
 	{
-		Membership *mb;
-		if (IsMember(sess->client, channel))
-			continue;
-		add_user_to_channel(channel, sess->client, "");
-		mb = sess->client->user->channel;
-		if (mb)
-			mb->memb_flags |= MEMB_FLAG_SHADOW;
-		if (mb && mb->related)
-			mb->related->memb_flags |= MEMB_FLAG_SHADOW;
-		sendto_one(sess->client, mtags, "%s", buf);
+		Membership *canon_mb = find_membership_link(client->user->channel, channel);
+		const char *canon_modes = canon_mb ? canon_mb->member_modes : "";
+		for (sess = joiner_e->sessions; sess; sess = sess->next)
+		{
+			Membership *mb;
+			if (IsMember(sess->client, channel))
+				continue;
+			/* Mirror the canonical's member_modes onto the shadow
+			 * so per-mode-aware gates (cmd_privmsg's +m check etc.)
+			 * see the session as e.g. voiced when the canonical is. */
+			add_user_to_channel(channel, sess->client, canon_modes);
+			mb = sess->client->user->channel;
+			if (mb)
+				mb->memb_flags |= MEMB_FLAG_SHADOW;
+			if (mb && mb->related)
+				mb->related->memb_flags |= MEMB_FLAG_SHADOW;
+			sendto_one(sess->client, mtags, "%s", buf);
+		}
 	}
 
-	return 0;
-}
-
-static int persist_remote_join(Client *client, Channel *channel, MessageTag *mtags)
-{
-	char buf[BUFSIZE];
-
-	if (is_ghost_client(client))
-		return 0;
-
-	snprintf(buf, sizeof(buf), ":%s!%s@%s JOIN :%s",
-	         client->name,
-	         IsUser(client) ? client->user->username : "*",
-	         IsUser(client) ? GetHost(client) : me.name,
-	         channel->name);
-
-	relay_to_channel_sessions(channel, NULL, mtags, buf);
 	return 0;
 }
 
@@ -1508,146 +1376,31 @@ static int persist_local_part(Client *client, Channel *channel, MessageTag *mtag
 	return 0;
 }
 
-static int persist_remote_part(Client *client, Channel *channel, MessageTag *mtags,
-                               const char *comment)
-{
-	char buf[BUFSIZE];
-
-	if (is_ghost_client(client))
-		return 0;
-
-	if (comment && *comment)
-		snprintf(buf, sizeof(buf), ":%s!%s@%s PART %s :%s",
-		         client->name,
-		         IsUser(client) ? client->user->username : "*",
-		         IsUser(client) ? GetHost(client) : me.name,
-		         channel->name, comment);
-	else
-		snprintf(buf, sizeof(buf), ":%s!%s@%s PART :%s",
-		         client->name,
-		         IsUser(client) ? client->user->username : "*",
-		         IsUser(client) ? GetHost(client) : me.name,
-		         channel->name);
-
-	relay_to_channel_sessions(channel, NULL, mtags, buf);
-	return 0;
-}
-
 static int persist_local_nickchange(Client *client, MessageTag *mtags, const char *newnick)
 {
-	char buf[BUFSIZE];
 	PersistEntry *e;
 	PersistSession *sess;
-	Membership *mb;
 
 	if (is_ghost_client(client) || is_session_client(client) || !IsUser(client))
 		return 0;
-
-	snprintf(buf, sizeof(buf), ":%s!%s@%s NICK :%s",
-	         client->name, client->user->username, GetHost(client), newnick);
-
-	e = IsLoggedIn(client) ? find_entry(client->user->account) : NULL;
-
-	if (e && e->canonical == client)
-	{
-		/* Update stored nick and inform sessions */
-		strlcpy(e->nick, newnick, sizeof(e->nick));
-		for (sess = e->sessions; sess; sess = sess->next)
-			sendto_one(sess->client, mtags, "%s", buf);
-	}
-
-	/* Relay to sessions of other channel members */
-	for (mb = client->user->channel; mb; mb = mb->next)
-		relay_to_channel_sessions(mb->channel, e, mtags, buf);
-
-	return 0;
-}
-
-static int persist_remote_nickchange(Client *client, MessageTag *mtags, const char *newnick)
-{
-	char buf[BUFSIZE];
-	Membership *mb;
-
-	if (!IsUser(client) || is_ghost_client(client))
+	if (!IsLoggedIn(client))
 		return 0;
 
-	snprintf(buf, sizeof(buf), ":%s!%s@%s NICK :%s",
-	         client->name, client->user->username, GetHost(client), newnick);
-
-	for (mb = client->user->channel; mb; mb = mb->next)
-		relay_to_channel_sessions(mb->channel, NULL, mtags, buf);
-
-	return 0;
-}
-
-static int persist_local_chanmode(Client *client, Channel *channel, MessageTag *mtags,
-                                  const char *modebuf, const char *parabuf,
-                                  time_t sendts, int samode, int *destroy_channel)
-{
-	char buf[BUFSIZE];
-
-	if (parabuf && *parabuf)
-		snprintf(buf, sizeof(buf), ":%s!%s@%s MODE %s %s %s",
-		         client->name,
-		         IsUser(client) ? client->user->username : "*",
-		         IsUser(client) ? GetHost(client) : me.name,
-		         channel->name, modebuf, parabuf);
-	else
-		snprintf(buf, sizeof(buf), ":%s!%s@%s MODE %s %s",
-		         client->name,
-		         IsUser(client) ? client->user->username : "*",
-		         IsUser(client) ? GetHost(client) : me.name,
-		         channel->name, modebuf);
-
-	relay_to_channel_sessions(channel, NULL, mtags, buf);
-	return 0;
-}
-
-static int persist_remote_chanmode(Client *client, Channel *channel, MessageTag *mtags,
-                                   const char *modebuf, const char *parabuf,
-                                   time_t sendts, int samode, int *destroy_channel)
-{
-	return persist_local_chanmode(client, channel, mtags, modebuf, parabuf,
-	                              sendts, samode, destroy_channel);
-}
-
-static int persist_topic(Client *client, Channel *channel, MessageTag *mtags,
-                         const char *topic)
-{
-	char buf[BUFSIZE];
-
-	snprintf(buf, sizeof(buf), ":%s!%s@%s TOPIC %s :%s",
-	         client->name,
-	         IsUser(client) ? client->user->username : "*",
-	         IsUser(client) ? GetHost(client) : me.name,
-	         channel->name, topic ? topic : "");
-
-	relay_to_channel_sessions(channel, NULL, mtags, buf);
-	return 0;
-}
-
-static int persist_away(Client *client, MessageTag *mtags, const char *reason,
-                        int already_as_away)
-{
-	char buf[BUFSIZE];
-	Membership *mb;
-	PersistEntry *e;
-
-	if (!IsUser(client) || is_ghost_client(client) || is_session_client(client))
+	e = find_entry(client->user->account);
+	if (!e || e->canonical != client)
 		return 0;
 
-	if (reason && *reason)
-		snprintf(buf, sizeof(buf), ":%s!%s@%s AWAY :%s",
-		         client->name, client->user->username, GetHost(client), reason);
-	else
-		snprintf(buf, sizeof(buf), ":%s!%s@%s AWAY",
-		         client->name, client->user->username, GetHost(client));
+	/* Update persisted nick so ghost / reconnect path uses the new one. */
+	strlcpy(e->nick, newnick, sizeof(e->nick));
 
-	e = IsLoggedIn(client) ? find_entry(client->user->account) : NULL;
+	/* Sessions share the canonical's nick (set at attach time) so
+	 * the channel-side identity stays consistent.  Sync their
+	 * client->name now; sendto_local_common_channels already
+	 * delivered the wire NICK line to them via the shadow Members. */
+	for (sess = e->sessions; sess; sess = sess->next)
+		strlcpy(sess->client->name, newnick, sizeof(sess->client->name));
 
-	for (mb = client->user->channel; mb; mb = mb->next)
-		relay_to_channel_sessions(mb->channel, e, mtags, buf);
-
+	persist_db_mark_dirty();
 	return 0;
 }
 
@@ -1688,38 +1441,29 @@ static int persist_local_kick(Client *client, Client *victim, Channel *channel,
 	return 0;
 }
 
-static int persist_remote_kick(Client *client, Client *victim, Channel *channel,
-                               MessageTag *mtags, const char *comment)
-{
-	return persist_local_kick(client, victim, channel, mtags, comment);
-}
-
 /* ===================================================================
  * Command overrides: proxy session client commands through canonical
  * =================================================================== */
 
 CMD_OVERRIDE_FUNC(session_msg_override)
 {
-	Client *real_sender = NULL;
-	if (is_session_client(client))
-	{
-		PersistEntry *e = find_entry_for_session(client);
-		if (e && e->canonical && IsUser(e->canonical) && !IsDead(e->canonical))
-		{
-			/* Remember who actually sent so persist_chanmsg /
-			 * persist_usermsg can suppress the relay copy that
-			 * would otherwise duplicate the message back to this
-			 * session (the only legitimate self-echo is via the
-			 * echo-message cap, handled in modules/echo-message.c). */
-			real_sender = client;
-			current_session_sender = client;
-			client = e->canonical;
-		}
-		else
-			return;
-	}
+	/* Sessions are real Members of the channels their account is
+	 * in (MEMB_FLAG_SHADOW rows), so cmd_privmsg / cmd_notice /
+	 * cmd_tagmsg's permission checks pass without us having to
+	 * swap `client` to the canonical the way the older code did.
+	 * The message goes out as the session's own identity --
+	 * which shares the canonical's nick (forced at attach time)
+	 * but may carry the session's own user@host; that's fine,
+	 * different connections legitimately have different hosts.
+	 *
+	 * We do still stash the sender for persist_usermsg's
+	 * self-PM dedup case (running /msg own-account from one
+	 * session shouldn't show up on that same session twice). */
+	int is_session = is_session_client(client);
+	if (is_session)
+		current_session_sender = client;
 	CALL_NEXT_COMMAND_OVERRIDE();
-	if (real_sender)
+	if (is_session)
 		current_session_sender = NULL;
 }
 
