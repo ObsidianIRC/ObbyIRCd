@@ -523,6 +523,12 @@ static void who_common_channel(Client *client, Channel *channel,
 	{
 		acptr = cm->client;
 
+		/* Skip shadow members (additional account sessions) so
+		 * other users don't see duplicate WHO rows for the same
+		 * account.  The canonical Member is iterated separately. */
+		if (cm->memb_flags & MEMB_FLAG_SHADOW)
+			continue;
+
 		if (IsMarked(acptr))
 			continue;
 
@@ -636,6 +642,10 @@ static void do_who_on_channel(Client *client, Channel *channel,
 	for (cm = channel->members; cm; cm = cm->next)
 	{
 		Client *acptr = cm->client;
+
+		/* Skip shadow members (extra account sessions). */
+		if (cm->memb_flags & MEMB_FLAG_SHADOW)
+			continue;
 
 		if (IsMatch(fmt, WMATCH_OPER) && !IsOper(acptr))
 			continue;

@@ -144,6 +144,13 @@ CMD_FUNC(cmd_names)
 	for (cm = channel->members; cm; cm = cm->next)
 	{
 		acptr = cm->client;
+		/* Shadow members are additional account sessions kept in the
+		 * channel only so core's send helpers can fan out to them.
+		 * The canonical Member for the same account is in the same
+		 * list -- emitting the session here would surface a
+		 * duplicate nick to other users. */
+		if (cm->memb_flags & MEMB_FLAG_SHADOW)
+			continue;
 		if (IsInvisible(acptr) && !us && !can_see_invisible)
 			continue;
 

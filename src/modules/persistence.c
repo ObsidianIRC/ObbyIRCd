@@ -860,6 +860,23 @@ static void setup_session(Client *client, PersistEntry *e)
 	{
 		Channel *channel = mb->channel;
 
+		/* Insert a shadow Member so core's send helpers
+		 * (sendto_channel, sendto_local_common_channels, etc.)
+		 * reach this session with proper per-recipient cap
+		 * filtering -- echo-message, server-time, account-tag,
+		 * message-tags, batch, labeled-response all just work.
+		 * NAMES / WHO / channel persistence-save MUST filter
+		 * MEMB_FLAG_SHADOW so other users don't see duplicate
+		 * entries for the same account. */
+		if (!IsMember(client, channel))
+		{
+			add_user_to_channel(channel, client, mb->member_modes);
+			if (client->user->channel)
+				client->user->channel->memb_flags |= MEMB_FLAG_SHADOW;
+			if (client->user->channel && client->user->channel->related)
+				client->user->channel->related->memb_flags |= MEMB_FLAG_SHADOW;
+		}
+
 		sendto_one(client, NULL, ":%s!%s@%s JOIN :%s",
 		           e->canonical->name,
 		           e->canonical->user->username,
@@ -1394,24 +1411,40 @@ static int persist_local_join(Client *client, Channel *channel, MessageTag *mtag
 
 	if (is_ghost_client(client) || is_session_client(client))
 		return 0;
+	if (!IsUser(client) || !IsLoggedIn(client))
+		return 0;
+
+	joiner_e = find_entry(client->user->account);
+	if (!joiner_e || !joiner_e->sessions)
+		return 0;
 
 	snprintf(buf, sizeof(buf), ":%s!%s@%s JOIN :%s",
 	         client->name,
-	         IsUser(client) ? client->user->username : "*",
-	         IsUser(client) ? GetHost(client) : me.name,
+	         client->user->username,
+	         GetHost(client),
 	         channel->name);
 
-	joiner_e = (IsUser(client) && IsLoggedIn(client))
-	               ? find_entry(client->user->account)
-	               : NULL;
-
-	/* Relay to sessions of OTHER channel members */
-	relay_to_channel_sessions(channel, joiner_e, mtags, buf);
-
-	/* Also relay to the joiner's own sessions (they see themselves join) */
-	if (joiner_e)
-		for (sess = joiner_e->sessions; sess; sess = sess->next)
-			sendto_one(sess->client, mtags, "%s", buf);
+	/* Canonical just joined this channel.  Pull each of its sessions
+	 * into the same channel as shadow Members so core's send
+	 * helpers reach them on subsequent traffic with proper
+	 * per-recipient cap filtering.  The session's own client also
+	 * needs to receive the JOIN line so its client-side state knows
+	 * about the new channel -- sendto_channel already broadcast for
+	 * the canonical's Member but the shadows didn't exist yet at
+	 * that moment, so emit it here. */
+	for (sess = joiner_e->sessions; sess; sess = sess->next)
+	{
+		Membership *mb;
+		if (IsMember(sess->client, channel))
+			continue;
+		add_user_to_channel(channel, sess->client, "");
+		mb = sess->client->user->channel;
+		if (mb)
+			mb->memb_flags |= MEMB_FLAG_SHADOW;
+		if (mb && mb->related)
+			mb->related->memb_flags |= MEMB_FLAG_SHADOW;
+		sendto_one(sess->client, mtags, "%s", buf);
+	}
 
 	return 0;
 }
@@ -1442,6 +1475,12 @@ static int persist_local_part(Client *client, Channel *channel, MessageTag *mtag
 
 	if (is_ghost_client(client) || is_session_client(client))
 		return 0;
+	if (!IsUser(client) || !IsLoggedIn(client))
+		return 0;
+
+	parter_e = find_entry(client->user->account);
+	if (!parter_e || !parter_e->sessions)
+		return 0;
 
 	if (comment && *comment)
 		snprintf(buf, sizeof(buf), ":%s!%s@%s PART %s :%s",
@@ -1452,15 +1491,19 @@ static int persist_local_part(Client *client, Channel *channel, MessageTag *mtag
 		         client->name, client->user->username, GetHost(client),
 		         channel->name);
 
-	parter_e = (IsUser(client) && IsLoggedIn(client))
-	               ? find_entry(client->user->account)
-	               : NULL;
-
-	relay_to_channel_sessions(channel, parter_e, mtags, buf);
-
-	if (parter_e)
-		for (sess = parter_e->sessions; sess; sess = sess->next)
-			sendto_one(sess->client, mtags, "%s", buf);
+	/* Canonical just parted; remove each session's shadow Member
+	 * from the same channel so channel->users decrements correctly
+	 * and the channel can destroy when all real members leave.
+	 * Send the PART line to each session so its client UI updates. */
+	for (sess = parter_e->sessions; sess; sess = sess->next)
+	{
+		Membership *mb;
+		mb = find_membership_link(sess->client->user->channel, channel);
+		if (!mb || !(mb->memb_flags & MEMB_FLAG_SHADOW))
+			continue;
+		sendto_one(sess->client, mtags, "%s", buf);
+		remove_user_from_channel_withmb(sess->client, channel, mb, 1);
+	}
 
 	return 0;
 }
@@ -1615,6 +1658,13 @@ static int persist_local_kick(Client *client, Client *victim, Channel *channel,
 	PersistEntry *victim_e;
 	PersistSession *sess;
 
+	if (!IsUser(victim) || !IsLoggedIn(victim))
+		return 0;
+
+	victim_e = find_entry(victim->user->account);
+	if (!victim_e || !victim_e->sessions)
+		return 0;
+
 	snprintf(buf, sizeof(buf), ":%s!%s@%s KICK %s %s :%s",
 	         client->name,
 	         IsUser(client) ? client->user->username : "*",
@@ -1622,15 +1672,18 @@ static int persist_local_kick(Client *client, Client *victim, Channel *channel,
 	         channel->name, victim->name,
 	         comment ? comment : client->name);
 
-	relay_to_channel_sessions(channel, NULL, mtags, buf);
-
-	/* Also send to the victim's own sessions */
-	victim_e = (IsUser(victim) && IsLoggedIn(victim))
-	               ? find_entry(victim->user->account)
-	               : NULL;
-	if (victim_e)
-		for (sess = victim_e->sessions; sess; sess = sess->next)
-			sendto_one(sess->client, mtags, "%s", buf);
+	/* Mirror the canonical's kick to each session's shadow Member:
+	 * deliver the KICK line so the session's client UI updates, then
+	 * remove the shadow Membership so channel->users stays correct. */
+	for (sess = victim_e->sessions; sess; sess = sess->next)
+	{
+		Membership *mb;
+		mb = find_membership_link(sess->client->user->channel, channel);
+		if (!mb || !(mb->memb_flags & MEMB_FLAG_SHADOW))
+			continue;
+		sendto_one(sess->client, mtags, "%s", buf);
+		remove_user_from_channel_withmb(sess->client, channel, mb, 1);
+	}
 
 	return 0;
 }

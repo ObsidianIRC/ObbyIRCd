@@ -2444,6 +2444,13 @@ struct Channel {
 };
 
 #define MEMB_FLAG_INVISIBLE	0x1
+/** Shadow member: this Membership belongs to an additional account
+ *  session (not the canonical) so the IRC core's send helpers can
+ *  reach the session through normal channel iteration with proper
+ *  per-recipient cap filtering.  Display-time iterators (NAMES, WHO,
+ *  channel persistence save, etc.) MUST skip these to avoid surfacing
+ *  duplicate entries to other users. */
+#define MEMB_FLAG_SHADOW	0x2
 
 /** user/channel member struct (channel->members).
  * This is Member which is used in the linked list channel->members for each channel.

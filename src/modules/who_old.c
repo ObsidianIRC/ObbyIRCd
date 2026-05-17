@@ -591,6 +591,11 @@ static void do_channel_who(Client *client, Channel *channel, const char *mask)
 		Client *acptr = cm->client;
 		char status[32];
 		int cansee;
+		/* Shadow members are extra account sessions kept in
+		 * channel->members for send-side fanout only; the
+		 * canonical Member is iterated separately. */
+		if (cm->memb_flags & MEMB_FLAG_SHADOW)
+			continue;
 		if ((cansee = can_see(client, acptr, channel)) & WHO_CANTSEE)
 			continue;
 
