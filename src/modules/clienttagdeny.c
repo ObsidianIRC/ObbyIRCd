@@ -53,12 +53,19 @@ MOD_UNLOAD(){
 	return MOD_SUCCESS;
 }
 
-#define BUFLEN 500
+/* The CLIENTTAGDENY value is "*,-tagN,-tagN,..." -- one entry per
+ * registered client-prefixed message-tag handler.  With many handlers
+ * (per-feature drafts, vendor tags, test modules) this comfortably
+ * exceeds one RPL_ISUPPORT line, so the buffer needs headroom and a
+ * cap-aware sender (see isupport.c send_isupport_v02) splits the
+ * value across multiple lines via the `+=` append form when the
+ * client has negotiated draft/extended-isupport-0.2. */
+#define BUFLEN 4096
 
 char *ct_isupport_param(void){
 	static char buf[BUFLEN];
 	MessageTagHandler *m;
-	
+
 	strlcpy(buf, "*", sizeof(buf));
 
 	for (m = mtaghandlers; m; m = m->next) {

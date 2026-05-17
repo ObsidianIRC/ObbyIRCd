@@ -26,14 +26,20 @@
 /* Forward declarations */
 CMD_FUNC(cmd_isupport);
 
-/* Variables */
+/* Variables.
+ * Two caps are advertised side by side:
+ *   draft/extended-isupport      - original spec (single-line tokens only)
+ *   draft/extended-isupport-0.2  - adds the `KEY+=value` append form for
+ *                                  list-valued tokens that overflow one line.
+ * The batch name (draft/isupport) is shared between both. */
 long CAP_EXTISUPPORT = 0L;
+long CAP_EXTISUPPORT_02 = 0L;
 
 ModuleHeader MOD_HEADER
 ={
 	"extended-isupport", /* Name of module */
 	"5.0", /* Version */
-	"Implements IRCv3 draft/extended-isupport", /* Short description of module */
+	"Implements IRCv3 draft/extended-isupport and draft/extended-isupport-0.2", /* Short description of module */
 	"UnrealIRCd Team", /* Author */
 	"unrealircd-6", /* Version of UnrealIRCd */
 };
@@ -47,6 +53,10 @@ MOD_INIT()
 	memset(&cap, 0, sizeof(cap));
 	cap.name = "draft/extended-isupport";
 	ClientCapabilityAdd(modinfo->handle, &cap, &CAP_EXTISUPPORT);
+
+	memset(&cap, 0, sizeof(cap));
+	cap.name = "draft/extended-isupport-0.2";
+	ClientCapabilityAdd(modinfo->handle, &cap, &CAP_EXTISUPPORT_02);
 
 	CommandAdd(modinfo->handle, "ISUPPORT", cmd_isupport, 0, CMD_USER|CMD_UNREGISTERED);
 

@@ -86,7 +86,7 @@ MODULES= \
 	spamreport.so crule.so \
 	central-api.so central-blocklist.so \
 	no-implicit-names.so maxperip.so utf8functions.so utf8only.so \
-	isupport.so extended-isupport.so \
+	isupport.so extended-isupport.so extended-isupport-test.so \
 	$(GEOIP_CLASSIC_OBJECTS) \
 	geoip_mmdb.so \
 	persistence.so \

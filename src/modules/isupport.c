@@ -74,6 +74,123 @@ MOD_UNLOAD()
  * to gatekeep it beyond what would be considered normal usage anyway.
  * -- Valware
  */
+/* Maximum payload bytes available for a single RPL_ISUPPORT line's
+ * token list, after we account for the trailing ":are supported..."
+ * banner.  Same as the cap used by make_isupportstrings. */
+#define ISUPPORT_LINE_PAYLOAD (ISUPPORTLEN)
+
+/* Helper for the v0.2 sender: emit one line (numeric or batched). */
+static void isupport_emit_line(Client *client, MessageTag *mtags,
+                               const char *batch, const char *line)
+{
+	if (*batch)
+		sendtaggednumericfmt(client, mtags, RPL_ISUPPORT,
+		                     "%s :are supported by this server", line);
+	else
+		sendnumeric(client, RPL_ISUPPORT, line);
+}
+
+/* v0.2 sender.  Builds RPL_ISUPPORT lines dynamically from the live
+ * ISupports list so a single token whose value exceeds the line
+ * payload can be delivered as `KEY=first_chunk` + one or more
+ * `KEY+=remainder` lines, per the draft/extended-isupport-0.2 spec.
+ * Splitting is byte-wise -- the spec leaves any token-grammar concern
+ * (separator placement, escape handling) to the token's own spec, and
+ * the server is responsible for emitting required separators inside
+ * the appended value (we trust the producer that built `isupport->value`
+ * to have done so already). */
+static void send_isupport_v02(Client *client, MessageTag *mtags,
+                              const char *batch)
+{
+	ISupport *isupport;
+	char line[ISUPPORT_LINE_PAYLOAD + 1];
+	int tokcnt = 0;
+
+	line[0] = '\0';
+
+	for (isupport = ISupports; isupport; isupport = isupport->next)
+	{
+		const char *key = isupport->token;
+		const char *value = isupport->value;
+		int keylen = (int)strlen(key);
+
+		/* Compose the first-chunk form ("KEY=value" or just "KEY").
+		 * If it fits in a fresh line we can pack it alongside other
+		 * tokens; otherwise we must split it across multiple
+		 * dedicated lines via the `+=` append form. */
+		char first[ISUPPORT_LINE_PAYLOAD + 1];
+		if (value)
+			snprintf(first, sizeof(first), "%s=%s", key, value);
+		else
+			strlcpy(first, key, sizeof(first));
+
+		/* Long-token path: each chunk lives on its own line.  Reserve
+		 * room for the key, the assignment operator (`=` first time,
+		 * `+=` for continuations), and a tiny safety margin. */
+		int firstlen = (int)strlen(first);
+		if (firstlen >= ISUPPORT_LINE_PAYLOAD)
+		{
+			/* Flush whatever's accumulated so the long token starts
+			 * on a clean line. */
+			if (*line)
+			{
+				isupport_emit_line(client, mtags, batch, line);
+				line[0] = '\0';
+				tokcnt = 0;
+			}
+
+			/* Slice the value.  First slice goes out as `KEY=chunk`. */
+			int chunk_first_max = ISUPPORT_LINE_PAYLOAD - keylen - 1; /* '=' */
+			int chunk_rest_max  = ISUPPORT_LINE_PAYLOAD - keylen - 2; /* '+=' */
+			int vlen = value ? (int)strlen(value) : 0;
+			int pos = 0;
+			char chunk_line[ISUPPORT_LINE_PAYLOAD + 1];
+
+			int take = vlen - pos > chunk_first_max ? chunk_first_max : vlen - pos;
+			snprintf(chunk_line, sizeof(chunk_line), "%s=%.*s",
+			         key, take, value + pos);
+			isupport_emit_line(client, mtags, batch, chunk_line);
+			pos += take;
+			while (pos < vlen)
+			{
+				int rest = vlen - pos > chunk_rest_max ? chunk_rest_max : vlen - pos;
+				snprintf(chunk_line, sizeof(chunk_line), "%s+=%.*s",
+				         key, rest, value + pos);
+				isupport_emit_line(client, mtags, batch, chunk_line);
+				pos += rest;
+			}
+			continue;
+		}
+
+		/* Short-token path: pack alongside neighbours, same 13-token
+		 * and ISUPPORTLEN ceilings make_isupportstrings uses. */
+		tokcnt++;
+		if (*line && ((int)strlen(line) + 1 + firstlen >= ISUPPORT_LINE_PAYLOAD ||
+		              tokcnt > 13))
+		{
+			isupport_emit_line(client, mtags, batch, line);
+			line[0] = '\0';
+			tokcnt = 1;
+		}
+		if (*line)
+			strlcat(line, " ", sizeof(line));
+		strlcat(line, first, sizeof(line));
+	}
+
+	if (*line)
+		isupport_emit_line(client, mtags, batch, line);
+}
+
+/* Whether the client has negotiated the original spec.  Both versions
+ * keep the same batch name (draft/isupport) so the wrapper handling is
+ * shared between them. */
+static int client_wants_isupport_batch(Client *client)
+{
+	return HasCapability(client, "batch") &&
+	       (HasCapability(client, "draft/extended-isupport-0.2") ||
+	        HasCapability(client, "draft/extended-isupport"));
+}
+
 void _send_isupport(Client *client)
 {
 	char batch[BATCHLEN+1];
@@ -82,7 +199,7 @@ void _send_isupport(Client *client)
 
 	*batch = '\0';
 
-	if (HasCapability(client, "draft/extended-isupport") && HasCapability(client, "batch"))
+	if (client_wants_isupport_batch(client))
 	{
 		generate_batch_id(batch);
 		new_message(client, NULL, &mtags);
@@ -95,12 +212,21 @@ void _send_isupport(Client *client)
 	if (*batch)
 		sendto_one(client, NULL, ":%s BATCH +%s draft/isupport", me.name, batch);
 
-	for (i = 0; ISupportStrings[i]; i++)
+	if (HasCapability(client, "draft/extended-isupport-0.2"))
 	{
-		if (*batch)
-			sendtaggednumericfmt(client, mtags, RPL_ISUPPORT, "%s :are supported by this server", ISupportStrings[i]);
-		else
-			sendnumeric(client, RPL_ISUPPORT, ISupportStrings[i]);
+		/* v0.2 path: token-level splitting with the `+=` append form. */
+		send_isupport_v02(client, mtags, batch);
+	}
+	else
+	{
+		/* v0.1 / no-cap path: ship the pre-built lines as-is. */
+		for (i = 0; ISupportStrings[i]; i++)
+		{
+			if (*batch)
+				sendtaggednumericfmt(client, mtags, RPL_ISUPPORT, "%s :are supported by this server", ISupportStrings[i]);
+			else
+				sendnumeric(client, RPL_ISUPPORT, ISupportStrings[i]);
+		}
 	}
 
 	if (*batch)
