@@ -204,19 +204,9 @@ See [docker/README.md](docker/README.md) for the full Docker reference.
 
 ## Hosted backend
 
-`hosted-backend/` is a Go REST API server that works alongside the IRCd to provide account management, channel metadata, JWT authentication (IRCv3 `extjwt`), and temporary image hosting.
+The hosted-backend (Go REST/JWT API + WebRTC SFU + TURN that works alongside the IRCd for account management, channel metadata, and image hosting) lives in its own repository: <https://github.com/ObsidianIRC/hosted-backend>. The published image `mattfly/obby-api:latest` is pulled by this repo's `compose.yaml`, so `docker compose up -d` brings up the full stack with no extra steps.
 
-**Prerequisites:** Go 1.21+ with CGO enabled (for SQLite).
-
-```bash
-cd hosted-backend
-export JWT_SECRET=your_secret
-export IRC_SERVER_KEY=your_key
-CGO_ENABLED=1 go build -o backend .
-./backend
-```
-
-The backend listens on `http://localhost:8080` by default. The Docker Compose setup starts it automatically alongside the IRCd. See [hosted-backend/README.md](hosted-backend/README.md) for the full API reference.
+To build the backend from source, clone its repo separately and follow the build instructions there.
 
 ---
 

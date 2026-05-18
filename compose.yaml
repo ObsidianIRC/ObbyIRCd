@@ -3,26 +3,29 @@ services:
     build:
       context: .
       dockerfile: ./docker/Dockerfile
-    image: obbyircd:local
+    image: ${OBBYIRCD_IMAGE:-obbyircd:local}
     container_name: obbyircd
     restart: unless-stopped
     expose:
       - "8080"
+    ports:
+      - "${SSL_HOST_PORT:-6697}:${SSL_PORT:-6697}"
     volumes:
-      - obbyircd_conf:/home/obbyircd/obby/conf
-      - obbyircd_data:/home/obbyircd/obby/data
-      - obbyircd_logs:/home/obbyircd/obby/logs
-      - obbyircd_tls:/home/obbyircd/obby/tls
-      - obbyircd_custom_modules:/home/obbyircd/obby/custom-modules
-      - obbyircd_voice_bridge:/run/obbyirc
+      - ${CONF_BIND:-obbyircd_conf}:/home/obbyircd/obby/conf
+      - ${DATA_BIND:-obbyircd_data}:/home/obbyircd/obby/data
+      - ${LOGS_BIND:-obbyircd_logs}:/home/obbyircd/obby/logs
+      - ${TLS_BIND:-obbyircd_tls}:/home/obbyircd/obby/tls
+      - ${CUSTOM_MODULES_BIND:-obbyircd_custom_modules}:/home/obbyircd/obby/custom-modules
+      - ${VOICE_BRIDGE_BIND:-obbyircd_voice_bridge}:/run/obbyirc
     environment:
-      WS_PORT: "8080"
+      WS_PORT: "${WS_PORT:-8080}"
+      SSL_PORT: "${SSL_PORT:-6697}"
       VOICE_BRIDGE_SOCKET: /run/obbyirc/voice.sock
     env_file:
       - path: .env
         required: false
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 8080"]
+      test: ["CMD-SHELL", "nc -z localhost ${WS_PORT:-8080}"]
       interval: 5s
       timeout: 5s
       retries: 6
@@ -33,6 +36,59 @@ services:
       - traefik.http.routers.obbyircd.tls=true
       - traefik.http.services.obbyircd.loadbalancer.server.port=8080
 
+  # hosted-backend is built and published from its own repo:
+  # https://github.com/ObsidianIRC/hosted-backend
+  # We just pull the published image here.
+  obby-api:
+    image: ${OBBY_API_IMAGE:-mattfly/obby-api:latest}
+    container_name: obby-api
+    restart: unless-stopped
+    depends_on:
+      obbyircd:
+        condition: service_healthy
+    expose:
+      - "8080"
+    ports:
+      - "${TURN_PORT:-3478}:3478/udp"
+    volumes:
+      - ${OBBY_API_DATA_BIND:-obby_api_data}:/app/data
+      - ${OBBY_API_IMAGES_BIND:-obby_api_images}:/app/images
+      - ${VOICE_BRIDGE_BIND:-obbyircd_voice_bridge}:/run/obbyirc
+    environment:
+      PORT: "8080"
+      VOICE_BRIDGE_SOCKET: /run/obbyirc/voice.sock
+      VOICE_TURN_SECRET: ${VOICE_TURN_SECRET}
+      VOICE_PUBLIC_IP: ${VOICE_PUBLIC_IP}
+      VOICE_TURN_PORT: "${TURN_PORT:-3478}"
+      VOICE_MAX_ROOM: "${VOICE_MAX_ROOM:-25}"
+    env_file:
+      - path: .env
+        required: false
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.api.rule=Host(`${API_FQDN}`)
+      - traefik.http.routers.api.tls=true
+      - traefik.http.services.api.loadbalancer.server.port=8080
+
+  # Web client.  Source: https://github.com/ObsidianIRC/ObsidianIRC
+  # Opt-in via `--profile frontend` (or set COMPOSE_PROFILES=frontend in .env)
+  # so backend-only devs can `docker compose up` without pulling the SPA.
+  obby:
+    image: ${OBBY_WEB_IMAGE:-mattfly/obby:latest}
+    container_name: obby-web
+    restart: unless-stopped
+    profiles: ["frontend"]
+    expose:
+      - "80"
+    env_file:
+      - path: .env
+        required: false
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.web.rule=Host(`${WEB_FQDN}`)
+      - traefik.http.routers.web.tls=true
+      - traefik.http.services.web.loadbalancer.server.port=80
+
 volumes:
   obbyircd_conf:
   obbyircd_data:
@@ -40,3 +96,5 @@ volumes:
   obbyircd_tls:
   obbyircd_custom_modules:
   obbyircd_voice_bridge:
+  obby_api_data:
+  obby_api_images:

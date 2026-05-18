@@ -74,14 +74,19 @@ else
     export RPC_CONFIG=""
 fi
 
-# Random cloak keys if the operator didn't supply any.  Operators
-# running multiple servers should set CLOAK_KEY1/2/3 in .env so all
-# nodes agree.
+# Random cloak keys if the operator didn't supply any.  UnrealIRCd
+# requires >= 80 chars of mixed a-zA-Z0-9; hex alone is rejected as
+# "not mixed".  Operators running linked nodes should set
+# CLOAK_KEY1/2/3 in .env so all nodes agree.
+gen_cloak_key() {
+    LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 96
+    echo
+}
 if [ -z "${CLOAK_KEY1:-}" ] || [ -z "${CLOAK_KEY2:-}" ] || [ -z "${CLOAK_KEY3:-}" ]; then
     echo "Generating random cloak keys (set CLOAK_KEY1/2/3 in .env to fix them)"
-    CLOAK_KEY1=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-    CLOAK_KEY2=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-    CLOAK_KEY3=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    CLOAK_KEY1=$(gen_cloak_key)
+    CLOAK_KEY2=$(gen_cloak_key)
+    CLOAK_KEY3=$(gen_cloak_key)
 fi
 export CLOAK_KEY1 CLOAK_KEY2 CLOAK_KEY3
 
