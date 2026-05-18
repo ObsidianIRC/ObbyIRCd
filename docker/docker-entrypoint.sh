@@ -57,9 +57,14 @@ else
     export WS_CONFIG=""
 fi
 
-# Optional filehost block.
+# Single quotes mark escaped=1 so the URL pre-pass skips it; trailing
+# slash satisfies url_parse.
 if [ -n "$FILEHOST_URL" ]; then
-    export FILEHOST_CONFIG="filehosts { host \"$FILEHOST_URL\"; };"
+    case "$FILEHOST_URL" in
+        */) ;;
+        *)  FILEHOST_URL="$FILEHOST_URL/" ;;
+    esac
+    export FILEHOST_CONFIG="filehosts { host '$FILEHOST_URL'; };"
     echo "Filehost: $FILEHOST_URL"
 else
     export FILEHOST_CONFIG=""
