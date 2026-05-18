@@ -25,7 +25,22 @@
 CMD_FUNC(cmd_list);
 int send_list(Client *client);
 
-#define MSG_LIST 	"LIST"	
+/* channel->users includes shadow Members (additional account
+ * sessions kept in channel->members for send-side fanout); they
+ * shouldn't be surfaced as separate users in /LIST output or count
+ * against ELIST usermin/usermax filters.  Walk the member list to
+ * get a "visible-from-the-outside" count. */
+static int list_visible_users(Channel *channel)
+{
+	Member *m;
+	int n = 0;
+	for (m = channel->members; m; m = m->next)
+		if (!(m->memb_flags & MEMB_FLAG_SHADOW))
+			n++;
+	return n;
+}
+
+#define MSG_LIST 	"LIST"
 
 ModuleHeader MOD_HEADER
   = {
@@ -281,7 +296,7 @@ CMD_FUNC(cmd_list)
 						else
 							strlcat(modebuf, "]", sizeof modebuf);
 
-						sendnumeric(client, RPL_LIST, name, channel->users, modebuf,
+						sendnumeric(client, RPL_LIST, name, list_visible_users(channel), modebuf,
 							    channel->topic ? channel->topic : "");
 					}
 				}
@@ -368,9 +383,12 @@ int send_list(Client *client)
 				/* Much more readable like this -- codemastr */
 				if ((!lopt->showall))
 				{
-					/* User count must be in range */
-					if ((channel->users < lopt->usermin) ||
-					    ((lopt->usermax >= 0) && (channel->users > lopt->usermax)))
+					/* User count must be in range -- compare against the
+					 * visible (shadow-excluded) count to match what
+					 * RPL_LIST will display. */
+					int visible_users = list_visible_users(channel);
+					if ((visible_users < lopt->usermin) ||
+					    ((lopt->usermax >= 0) && (visible_users > lopt->usermax)))
 						continue;
 
 					/* Creation time must be in range */
@@ -397,21 +415,24 @@ int send_list(Client *client)
 					modebuf[0] = '\0';
 				else
 					strlcat(modebuf, "]", sizeof modebuf);
-				if (!ValidatePermissionsForPath("channel:see:list:secret",client,NULL,channel,NULL))
-					sendnumeric(client, RPL_LIST,
-					    ShowChannel(client,
-					    channel) ? channel->name :
-					    "*", channel->users,
-					    ShowChannel(client, channel) ?
-					    modebuf : "",
-					    ShowChannel(client,
-					    channel) ? (channel->topic ?
-					    channel->topic : "") : "");
-				else
-					sendnumeric(client, RPL_LIST, channel->name,
-					    channel->users,
-					    modebuf,
-					    (channel->topic ? channel->topic : ""));
+				{
+					int visible = list_visible_users(channel);
+					if (!ValidatePermissionsForPath("channel:see:list:secret",client,NULL,channel,NULL))
+						sendnumeric(client, RPL_LIST,
+						    ShowChannel(client,
+						    channel) ? channel->name :
+						    "*", visible,
+						    ShowChannel(client, channel) ?
+						    modebuf : "",
+						    ShowChannel(client,
+						    channel) ? (channel->topic ?
+						    channel->topic : "") : "");
+					else
+						sendnumeric(client, RPL_LIST, channel->name,
+						    visible,
+						    modebuf,
+						    (channel->topic ? channel->topic : ""));
+				}
 				numsend--;
 			}
 		else
