@@ -196,11 +196,23 @@ groups. The first group MUST be either `known-users` or
 `unknown-users` (the synthetic "this account is recognised" marker
 that the legacy form leads with).
 
-Security-group membership is evaluated against the target's
-canonical client, so the membership is account-level: every session
-of the account observes the same group set. The legacy
-comma-joined `320` line is NOT emitted to cap-on clients; non-cap
-clients (no `obby.world/whois`) continue to receive it unchanged.
+Security-group membership is reported account-wide: for a multi-
+session account, a group MUST be listed if ANY of the canonical or
+attached sessions satisfies the group's rule. Many security-groups
+(`tls-users`, `websocket-users`, geo-based, IP-prefix-based) are
+derived from connection-level facts that legitimately differ across
+the account's sessions; reporting only the canonical's view would
+hide reachable transports/networks. The first synthetic
+`known-users` / `unknown-users` entry is evaluated under the same
+union-across-sessions rule.
+
+Note: this aggregated rendering applies to the WHOIS *display* only.
+Server-internal per-client checks (TLD-blocks, allow-blocks, channel
+match rules, etc.) continue to evaluate per-connection.
+
+The legacy comma-joined `320` line is NOT emitted to cap-on clients;
+non-cap clients (no `obby.world/whois`) continue to receive it
+unchanged.
 
 ### Compatibility with RFC 2812
 

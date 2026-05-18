@@ -350,6 +350,62 @@ static int whois_is_per_session_name(const char *name)
 	return 0;
 }
 
+/* Evaluate security-group membership across every live session of
+ * the target's account: a group "matches" if ANY of canonical +
+ * sessions satisfies the rule.  Rationale: groups like `tls-users`
+ * or `websocket-users` are computed from connection-level facts
+ * (transport, cipher) and legitimately differ across a multi-session
+ * account.  Reporting only the canonical's view hides the fact that
+ * the user IS reachable over TLS / WS through one of their other
+ * sessions.  For non-persistence clients (no account_canonical
+ * moddata), this falls through to the single-client evaluator.
+ *
+ * Only used for WHOIS DISPLAY; the global user_allowed_by_security_group
+ * is still per-client for TLD-blocks, allow-blocks, etc. where
+ * connection-level granularity is the intended semantics. */
+static int account_in_security_group(Client *target, SecurityGroup *sg)
+{
+	ModDataInfo *canon_md;
+	Client *target_canon, *c;
+
+	if (!sg) return 0;
+	if (user_allowed_by_security_group(target, sg)) return 1;
+
+	canon_md = findmoddata_byname("account_canonical", MODDATATYPE_CLIENT);
+	if (!canon_md) return 0;
+	target_canon = moddata_client(target, canon_md).ptr;
+	if (!target_canon) return 0;
+
+	list_for_each_entry(c, &lclient_list, lclient_node)
+	{
+		if (!IsUser(c) || c == target) continue;
+		if (moddata_client(c, canon_md).ptr != target_canon) continue;
+		if (user_allowed_by_security_group(c, sg)) return 1;
+	}
+	return 0;
+}
+
+static int account_in_security_group_name(Client *target, const char *name)
+{
+	ModDataInfo *canon_md;
+	Client *target_canon, *c;
+
+	if (user_allowed_by_security_group_name(target, name)) return 1;
+
+	canon_md = findmoddata_byname("account_canonical", MODDATATYPE_CLIENT);
+	if (!canon_md) return 0;
+	target_canon = moddata_client(target, canon_md).ptr;
+	if (!target_canon) return 0;
+
+	list_for_each_entry(c, &lclient_list, lclient_node)
+	{
+		if (!IsUser(c) || c == target) continue;
+		if (moddata_client(c, canon_md).ptr != target_canon) continue;
+		if (user_allowed_by_security_group_name(c, name)) return 1;
+	}
+	return 0;
+}
+
 /* Collect local clients sharing the target's account_canonical (the
  * target's own canonical is included).  Returns total count even if
  * it exceeds 'max' (caller's storage is bounded).  No-op when the
@@ -779,9 +835,13 @@ CMD_FUNC(cmd_whois)
 			SecurityGroup *s;
 
 			/* "known-users" / "unknown-users" is reported first as a
-			 * synthetic group: existing whois output convention. */
+			 * synthetic group: existing whois output convention.
+			 * Evaluated across every session of the account -- if
+			 * the account has at least one recognised session
+			 * (typically logged-in or matching a known IP) the
+			 * whole account is reported as known-users. */
 			const char *known_label =
-			    user_allowed_by_security_group_name(target, "known-users")
+			    account_in_security_group_name(target, "known-users")
 			        ? "known-users"
 			        : "unknown-users";
 
@@ -796,7 +856,7 @@ CMD_FUNC(cmd_whois)
 				for (s = securitygroups; s; s = s->next)
 				{
 					if (!strcmp(s->name, "known-users")) continue;
-					if (!user_allowed_by_security_group(target, s)) continue;
+					if (!account_in_security_group(target, s)) continue;
 					n = safe_alloc(sizeof(struct sg_node));
 					strlcpy(n->name, s->name, sizeof(n->name));
 					if (!sg_head) sg_head = n;
@@ -828,7 +888,7 @@ CMD_FUNC(cmd_whois)
 						*buf = '\0';
 						len = 0;
 					}
-					if (strcmp(s->name, "known-users") && user_allowed_by_security_group(target, s))
+					if (strcmp(s->name, "known-users") && account_in_security_group(target, s))
 					{
 						strcpy(buf + len, s->name);
 						len += strlen(buf+len);
