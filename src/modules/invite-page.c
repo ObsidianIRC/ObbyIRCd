@@ -41,8 +41,10 @@ ModuleHeader MOD_HEADER = {
 struct {
 	char *network_name;     /* display name, e.g. "ObbyNet" */
 	char *irc_host;         /* hostname for ircs:// link */
-	int irc_port;           /* port for ircs:// link */
-	char *client_url;       /* optional web-client fallback URL */
+	int irc_port;           /* port for ircs:// link (typically WSS) */
+	int native_port;        /* port shown for "connect manually with a
+	                         * traditional client" — TLS-IRC. Falls
+	                         * back to irc_port when unset. */
 	char *default_channel;  /* optional: auto-prefill the channel form */
 	char *accent_color;     /* optional hex accent, defaults to #5865F2 */
 } cfg = { 0 };
@@ -87,7 +89,6 @@ MOD_UNLOAD()
 {
 	safe_free(cfg.network_name);
 	safe_free(cfg.irc_host);
-	safe_free(cfg.client_url);
 	safe_free(cfg.default_channel);
 	safe_free(cfg.accent_color);
 	return MOD_SUCCESS;
@@ -113,7 +114,6 @@ static int invite_configtest_set(ConfigFile *cf, ConfigEntry *ce, int type, int 
 			continue;
 		if (!strcmp(cep->name, "network-name") ||
 		    !strcmp(cep->name, "irc-host") ||
-		    !strcmp(cep->name, "client-url") ||
 		    !strcmp(cep->name, "default-channel") ||
 		    !strcmp(cep->name, "accent-color"))
 		{
@@ -124,13 +124,14 @@ static int invite_configtest_set(ConfigFile *cf, ConfigEntry *ce, int type, int 
 				errors++;
 			}
 		} else
-		if (!strcmp(cep->name, "irc-port"))
+		if (!strcmp(cep->name, "irc-port") ||
+		    !strcmp(cep->name, "native-port"))
 		{
 			int p = cep->value ? atoi(cep->value) : 0;
 			if (p <= 0 || p > 65535)
 			{
-				config_error("%s:%i: set::invite-page::irc-port must be 1..65535",
-				             cep->file->filename, cep->line_number);
+				config_error("%s:%i: set::invite-page::%s must be 1..65535",
+				             cep->file->filename, cep->line_number, cep->name);
 				errors++;
 			}
 		} else
@@ -162,14 +163,14 @@ static int invite_configrun_set(ConfigFile *cf, ConfigEntry *ce, int type)
 			safe_strdup(cfg.network_name, cep->value);
 		else if (!strcmp(cep->name, "irc-host"))
 			safe_strdup(cfg.irc_host, cep->value);
-		else if (!strcmp(cep->name, "client-url"))
-			safe_strdup(cfg.client_url, cep->value);
 		else if (!strcmp(cep->name, "default-channel"))
 			safe_strdup(cfg.default_channel, cep->value);
 		else if (!strcmp(cep->name, "accent-color"))
 			safe_strdup(cfg.accent_color, cep->value);
 		else if (!strcmp(cep->name, "irc-port"))
 			cfg.irc_port = atoi(cep->value);
+		else if (!strcmp(cep->name, "native-port"))
+			cfg.native_port = atoi(cep->value);
 	}
 	return 1;
 }
@@ -417,10 +418,14 @@ static char *build_invite_html(const char *channel)
 	const char *net = cfg.network_name ? cfg.network_name : "this network";
 	const char *host = cfg.irc_host;
 	const char *accent = cfg.accent_color ? cfg.accent_color : "#5865F2";
-	const char *client_url = cfg.client_url;
+	/* Shared network logo from set::network-icon (draft/ICON
+	 * ISUPPORT). Already validated by core to be an https:// URL
+	 * without spaces. */
+	const char *icon = NETWORK_ICON;
 	int port = cfg.irc_port;
+	int native_port = cfg.native_port > 0 ? cfg.native_port : cfg.irc_port;
 	char ircs_link[256];
-	char client_link[1024] = "";
+	char join_line[CHANNELLEN + 16] = "";
 	char *out;
 	size_t cap = 8192;
 	int n;
@@ -448,26 +453,10 @@ static char *build_invite_html(const char *channel)
 		encoded_chan[i] = '\0';
 		snprintf(ircs_link, sizeof(ircs_link),
 		         "ircs://%s:%d/%s", host, port, encoded_chan);
+		snprintf(join_line, sizeof(join_line), "/join %s", channel);
 	} else {
 		snprintf(ircs_link, sizeof(ircs_link),
 		         "ircs://%s:%d/", host, port);
-	}
-
-	/* Build client-url fallback if configured. */
-	if (client_url && *client_url)
-	{
-		if (channel)
-		{
-			snprintf(client_link, sizeof(client_link),
-			         "%s%s?server=%s&port=%d&channel=%s",
-			         client_url, strchr(client_url, '?') ? "&" : "",
-			         host, port, channel + (channel[0] == '#' ? 1 : 0));
-		} else {
-			snprintf(client_link, sizeof(client_link),
-			         "%s%s?server=%s&port=%d",
-			         client_url, strchr(client_url, '?') ? "&" : "",
-			         host, port);
-		}
 	}
 
 	out = safe_alloc(cap);
@@ -486,23 +475,45 @@ static char *build_invite_html(const char *channel)
 	    " h1 .net{color:%s}\n"
 	    " .sub{color:#9a9aa3;margin:0 0 28px;font-size:14px;line-height:1.5}\n"
 	    " .chan{display:inline-flex;align-items:center;gap:6px;background:#222530;color:#fff;font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:14px;padding:4px 10px;border-radius:8px;margin:0 4px}\n"
+	    " .icon{width:72px;height:72px;border-radius:16px;display:block;margin:0 auto 16px;object-fit:cover;background:#222530;box-shadow:0 4px 12px rgba(0,0,0,.3)}\n"
 	    " .btn{display:block;width:100%%;text-align:center;background:%s;color:#fff;text-decoration:none;font-weight:600;font-size:16px;padding:14px 18px;border-radius:10px;margin:0 0 12px;transition:filter .15s}\n"
 	    " .btn:hover{filter:brightness(1.1)}\n"
-	    " .btn.sec{background:#2a2d36}\n"
-	    " .raw{margin-top:24px;font-size:12px;color:#6b6c75;text-align:center;word-break:break-all}\n"
-	    " .raw code{background:#222530;padding:2px 6px;border-radius:4px;color:#a9aab2}\n"
+	    " details{margin-top:18px;background:#11131a;border-radius:10px;border:1px solid #232631}\n"
+	    " summary{cursor:pointer;list-style:none;padding:12px 16px;font-size:13px;color:#a9aab2;user-select:none}\n"
+	    " summary::-webkit-details-marker{display:none}\n"
+	    " summary::after{content:'\\203A';float:right;color:#5d5e66;transition:transform .15s}\n"
+	    " details[open] summary::after{transform:rotate(90deg)}\n"
+	    " summary:hover{color:#fff}\n"
+	    " .manual{padding:4px 16px 14px;font-size:13px}\n"
+	    " .manual dl{margin:0;display:grid;grid-template-columns:max-content 1fr;gap:6px 14px}\n"
+	    " .manual dt{color:#6b6c75;font-size:11px;text-transform:uppercase;letter-spacing:.05em;align-self:center}\n"
+	    " .manual dd{margin:0;color:#e8e8ea;font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:13px;word-break:break-all}\n"
+	    " .manual .note{margin-top:12px;color:#6b6c75;font-family:inherit;font-size:12px;line-height:1.5}\n"
 	    " .footer{margin-top:24px;text-align:center;font-size:11px;color:#5d5e66}\n"
 	    "</style>\n"
 	    "</head><body>\n"
-	    "<div class=\"card\">\n"
-	    "<h1>You're invited to <span class=\"net\">%s</span></h1>\n",
+	    "<div class=\"card\">\n",
 	    /* title */ html_escape(net),
 	    channel ? " &middot; " : "",
 	    channel ? html_escape(channel) : "",
-	    accent, accent, accent,
-	    html_escape(net));
+	    accent, accent, accent);
 
 	if (n < 0 || (size_t)n >= cap) return out;
+
+	/* Network icon (set::network-icon).  Rendered above the heading
+	 * when configured; omitted otherwise so the card layout stays
+	 * tight.  Server-validated to be https:// + no spaces, but we
+	 * still HTML-escape defensively. */
+	if (icon && *icon)
+	{
+		n += snprintf(out + n, cap - n,
+		    "<img class=\"icon\" src=\"%s\" alt=\"%s\" referrerpolicy=\"no-referrer\">\n",
+		    html_escape(icon), html_escape(net));
+	}
+
+	n += snprintf(out + n, cap - n,
+	    "<h1>You're invited to <span class=\"net\">%s</span></h1>\n",
+	    html_escape(net));
 
 	if (channel)
 	{
@@ -511,33 +522,51 @@ static char *build_invite_html(const char *channel)
 		    html_escape(channel));
 	} else {
 		n += snprintf(out + n, cap - n,
-		    "<p class=\"sub\">Click below to connect to <code>%s</code> in your IRC client.</p>\n",
+		    "<p class=\"sub\">Connect to <code>%s</code> in your IRC client.</p>\n",
 		    html_escape(host));
 	}
 
+	/* Primary button: triggers the ircs:// handler ONLY on click.
+	 * No auto-redirect on load -- the user opted in to follow the
+	 * invite link, but the IRC client launch is a separate explicit
+	 * action so e.g. previewing the invite in a browser tab doesn't
+	 * yank focus to the desktop IRC app. */
 	n += snprintf(out + n, cap - n,
 	    "<a class=\"btn\" href=\"%s\">Open in IRC client</a>\n",
 	    ircs_link);
 
-	if (*client_link)
+	/* Manual-connect details: collapsed by default. Shows everything
+	 * a user would need to connect with another IRC client of their
+	 * choice (HexChat, irssi, weechat, etc.). */
+	n += snprintf(out + n, cap - n,
+	    "<details>\n"
+	    "<summary>Connect manually</summary>\n"
+	    "<div class=\"manual\">\n"
+	    "<dl>\n"
+	    "<dt>Server</dt><dd>%s</dd>\n"
+	    "<dt>Port</dt><dd>%d</dd>\n"
+	    "<dt>TLS</dt><dd>Required</dd>\n",
+	    html_escape(host), native_port);
+
+	if (channel)
 	{
 		n += snprintf(out + n, cap - n,
-		    "<a class=\"btn sec\" href=\"%s\" target=\"_blank\" rel=\"noopener\">Use the web client</a>\n",
-		    client_link);
+		    "<dt>Channel</dt><dd>%s</dd>\n"
+		    "<dt>Join</dt><dd>%s</dd>\n",
+		    html_escape(channel), html_escape(join_line));
 	}
 
 	n += snprintf(out + n, cap - n,
-	    "<div class=\"raw\">Or copy this link:<br><code>%s</code></div>\n"
+	    "</dl>\n"
+	    "<p class=\"note\">Point your client at <code>%s</code> on port %d with TLS. "
+	    "Once connected%s, you're in.</p>\n"
+	    "</div>\n"
+	    "</details>\n"
 	    "<div class=\"footer\">powered by obbyircd</div>\n"
 	    "</div>\n"
-	    /* On page load, fire the ircs:// handler so browsers that
-	     * have ObsidianIRC (or another IRC client) registered as
-	     * the protocol handler prompt the user automatically.  The
-	     * <a> button remains for browsers that block this or for
-	     * users who dismissed the prompt. */
-	    "<script>setTimeout(function(){location.href=%c%s%c;},300);</script>\n"
 	    "</body></html>\n",
-	    ircs_link, '"', ircs_link, '"');
+	    html_escape(host), native_port,
+	    channel ? ", run the join command above" : "");
 
 	return out;
 }
