@@ -663,15 +663,46 @@ static char *build_invite_html(const char *channel, const char *inviter)
 	    ircs_link);
 
 	/* Optional secondary "Join via Web" button. Only renders when
-	 * set::invite-page::web-url is configured. The URL is opened in
-	 * a new tab as-is — the admin is responsible for what's there
-	 * (a static landing page, a hosted client, a deeplink router,
-	 * whatever). */
+	 * set::invite-page::web-url is configured. When the invite is
+	 * channel-specific, append ?channel=<encoded> (or &channel=...
+	 * if the base URL already carries a query string) so the hosted
+	 * client can auto-join after connecting. Channel-name characters
+	 * are URL-encoded: `#`, `&`, `^`, `$`, space, `?`, `=`, `+`, `%`,
+	 * `/` — everything else is allowed through verbatim. */
 	if (cfg.web_url && *cfg.web_url)
 	{
+		char web_join_url[1024];
+		if (channel && *channel)
+		{
+			char encoded[CHANNELLEN * 4];
+			const char *p;
+			size_t ei = 0;
+			for (p = channel; *p && ei + 4 < sizeof(encoded); p++)
+			{
+				unsigned char c = (unsigned char)*p;
+				if (c == '#' || c == '&' || c == '^' || c == '$' ||
+				    c == '?' || c == '=' || c == '+' || c == '%' ||
+				    c == '/' || c == ' ' || c < 0x21 || c > 0x7e)
+				{
+					snprintf(encoded + ei, sizeof(encoded) - ei,
+					         "%%%02X", c);
+					ei += 3;
+				} else {
+					encoded[ei++] = (char)c;
+				}
+			}
+			encoded[ei] = '\0';
+			snprintf(web_join_url, sizeof(web_join_url),
+			         "%s%schannel=%s",
+			         cfg.web_url,
+			         strchr(cfg.web_url, '?') ? "&" : "?",
+			         encoded);
+		} else {
+			strlcpy(web_join_url, cfg.web_url, sizeof(web_join_url));
+		}
 		n += snprintf(out + n, cap - n,
 		    "<a class=\"btn sec\" href=\"%s\" target=\"_blank\" rel=\"noopener noreferrer\">Join via Web</a>\n",
-		    html_escape(cfg.web_url));
+		    html_escape(web_join_url));
 	}
 
 	/* Manual-connect details: collapsed by default. Shows everything
