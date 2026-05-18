@@ -326,15 +326,21 @@ WhoisConfigDetails _whois_get_policy(Client *client, Client *target, const char 
 }
 
 /* Per-session WHOIS detail keys. Entries in the nvplist with these
- * names describe a SINGLE connection (its host/IP, umodes, TLS state,
- * client cert, geo, ASN, idle clock). When the queried account has
- * multiple live sessions and the querier is allowed to see
- * connection-level detail, we suppress these from the parent batch
- * and re-emit them once per session inside an
- * obby.world/whois-session sub-batch.  See doc/specs/whois-batch.md. */
+ * names describe a SINGLE connection (its host/IP, TLS state, client
+ * cert, geo, ASN, idle clock). When the queried account has multiple
+ * live sessions and the querier is allowed to see connection-level
+ * detail, we suppress these from the parent batch and re-emit them
+ * once per session inside an obby.world/whois-session sub-batch.
+ *
+ * `modes` (RPL_WHOISMODES 379) is intentionally NOT per-session
+ * anymore: the persistence module mirrors canonical's umodes and
+ * snomask onto every attached session via HOOKTYPE_UMODE_CHANGE, so
+ * all sessions share the same flags by construction. Emitting it
+ * once in the parent batch keeps the wire compact and reflects the
+ * account-level semantics.  See doc/specs/whois-batch.md. */
 static int whois_is_per_session_name(const char *name)
 {
-	static const char *names[] = { "modes", "realhost", "secure", "certfp", "geo", "asn", "idle", NULL };
+	static const char *names[] = { "realhost", "secure", "certfp", "geo", "asn", "idle", NULL };
 	int i;
 	if (!name)
 		return 0;
@@ -396,11 +402,10 @@ static void whois_emit_session_lines(Client *client, Client *target, Client *ses
 	           sess->user ? sess->user->realhost : "",
 	           sess->ip ? sess->ip : "");
 
-	sendto_one(client, mt,
-	           ":%s %d %s %s %s %s",
-	           me.name, RPL_WHOISMODES, client->name, target->name,
-	           get_usermode_string(sess),
-	           (sess->user && sess->user->snomask) ? sess->user->snomask : "");
+	/* RPL_WHOISMODES (379) is emitted once in the parent batch by
+	 * the unmodified nvplist path; not duplicated here.  Umodes are
+	 * synced canonical->sessions via HOOKTYPE_UMODE_CHANGE in
+	 * persistence.c, so every session has the same flags. */
 
 	if (sess->umodes & UMODE_SECURE)
 	{

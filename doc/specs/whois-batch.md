@@ -133,7 +133,6 @@ Inside the sub-batch the server emits whichever per-session
 numerics it has to disclose:
 
   - `RPL_WHOISHOST` (`378`) — the session's real hostname and IP
-  - `RPL_WHOISMODES` (`379`) — the session's umodes and snomask
   - `RPL_WHOISSECURE` (`671`) — the session's TLS state and cipher
   - `RPL_WHOISCERTFP` (`276`) — the session's TLS client certificate
     fingerprint, if any
@@ -145,9 +144,17 @@ numerics it has to disclose:
   - `RPL_WHOISASN` (`569`) — ASN / AS name for the session's IP, if
     available
 
+`RPL_WHOISMODES` (`379`) is intentionally NOT per-session. In an
+implementation that synchronises umode and snomask changes across
+every attached session (as obbyircd does via its persistence module),
+all sessions share identical flags by construction, so emitting `379`
+N times would be wire-level duplication for the same value. The
+server MUST emit `379` once inside the parent `obby.world/whois`
+batch alongside the other account-level numerics.
+
 The server SHOULD emit per-session numerics in ascending ordinal
-order and SHOULD NOT emit the same numeric outside the session
-sub-batches for the same query.
+order and SHOULD NOT emit the same per-session numeric outside the
+session sub-batches for the same query.
 
 Each sub-batch MUST be closed with `BATCH -<sub-ref>` before the
 parent batch is closed.
@@ -204,11 +211,11 @@ two-session account `Valware`:
     S: @batch=q1 :obby.t3ks.com 312 oper Valware obby.t3ks.com :ObbyNet hub
     S: @batch=q1 :obby.t3ks.com 313 oper Valware :is a network administrator
     S: @batch=q1 :obby.t3ks.com 319 oper Valware :@#opers @#general +#weather #lol
+    S: @batch=q1 :obby.t3ks.com 379 oper Valware +iSwx bcdfkoqsxBOS
     S: @batch=q1 :obby.t3ks.com 330 oper Valware Valware :is logged in as
 
     S: @batch=q1;obby.world/since=2026-05-18T08:12:33.000Z :obby.t3ks.com BATCH +q1s1 obby.world/whois-session 1 2
     S: @batch=q1s1 :obby.t3ks.com 378 oper Valware :is connecting from valware@bt-net.range31-104.btcentralplus.com 1.2.3.4
-    S: @batch=q1s1 :obby.t3ks.com 379 oper Valware +iSwx
     S: @batch=q1s1 :obby.t3ks.com 671 oper Valware :is using a Secure Connection [TLSv1.3-CHACHA20-POLY1305]
     S: @batch=q1s1 :obby.t3ks.com 276 oper Valware :has client certificate fingerprint a1b2c3d4e5f6...
     S: @batch=q1s1 :obby.t3ks.com 317 oper Valware 42 1747526400 :seconds idle, signon time
@@ -218,7 +225,6 @@ two-session account `Valware`:
 
     S: @batch=q1;obby.world/since=2026-05-18T11:47:02.000Z :obby.t3ks.com BATCH +q1s2 obby.world/whois-session 2 2
     S: @batch=q1s2 :obby.t3ks.com 378 oper Valware :is connecting from valware@cgnat-public.example 10.0.0.5
-    S: @batch=q1s2 :obby.t3ks.com 379 oper Valware +iwx
     S: @batch=q1s2 :obby.t3ks.com 671 oper Valware :is using a Secure Connection [TLSv1.3-AES-256-GCM]
     S: @batch=q1s2 :obby.t3ks.com 317 oper Valware 1207 1747549322 :seconds idle, signon time
     S: @batch=q1s2 :obby.t3ks.com 344 oper Valware US :is connecting from United States
