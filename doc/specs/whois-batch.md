@@ -1,0 +1,219 @@
+---
+title: "`obby.world/whois` Batch Type"
+layout: spec
+work-in-progress: true
+copyrights:
+  -
+    name: "Valerie Pond"
+    period: "2026"
+    email: "v.a.pond@outlook.com"
+---
+
+## Notes for implementing work-in-progress version
+
+This is a vendor-specific extension defined under the `obby.world/`
+namespace. Software implementing this specification MUST use the
+`obby.world/whois` and `obby.world/whois-session` batch type names
+verbatim. The IRCv3 `BATCH` extension is a prerequisite. If this
+extension is later promoted to an IRCv3 draft, the unprefixed name
+(e.g. `whois`) will be reserved by the IRCv3 spec; until then no
+unprefixed alias is implied.
+
+## Introduction
+
+`WHOIS` has remained a stream of independent numerics terminated by
+`RPL_ENDOFWHOIS` (`318`) since the original spec. As IRCds grew
+features that benefit from per-user disclosure — TLS state, GeoIP,
+custom metadata, multiple concurrent sessions for one account — the
+reply grew an open-ended set of numerics (`311`, `312`, `313`,
+`317`, `319`, `320`, `330`, `338`, `378`, `379`, `671`, `276`, …)
+with no structural relationship between them. RFC 2812 §3.6.2 also
+states that, with the exception of `RPL_WHOISCHANNELS` (`319`), each
+numeric MUST appear at most once per reply. This makes it difficult
+to cleanly disclose information that is inherently per-session (such
+as the IP, hostname, and TLS state of each connected client of a
+multi-session account).
+
+This extension adds two cooperating IRCv3 `BATCH` types,
+`obby.world/whois` and `obby.world/whois-session`, that wrap the
+existing `WHOIS` numerics so that:
+
+1. The full `WHOIS` reply is grouped under a single
+   `obby.world/whois` batch identified by the queried target's nick,
+   letting clients render it as a cohesive block (a profile card,
+   collapsible group, transient toast, etc.).
+2. Per-session details (`RPL_WHOISHOST` `378`, `RPL_WHOISMODES`
+   `379`, `RPL_WHOISSECURE` `671`, `RPL_WHOISCERTFP` `276`, and
+   vendor numerics carrying GeoIP / ASN / TLS information) for a
+   multi-session account are grouped under nested
+   `obby.world/whois-session` sub-batches, each tagged with a
+   1-based session ordinal, so the same numeric can appear once per
+   session without ambiguity to the receiving client.
+
+Numerics keep their existing semantics. Clients that have
+negotiated `batch` see the structure; clients that have not
+negotiated `batch` see the same numerics they always did. No new
+WHOIS numeric is introduced by this extension.
+
+## Implementation
+
+### Capability
+
+Servers that implement this extension MUST advertise the standard
+[`batch`][batch] capability and SHOULD support the
+`obby.world/whois` and `obby.world/whois-session` batch types.
+
+Clients that wish to receive batched WHOIS MUST negotiate `batch`.
+No additional capability needs to be negotiated; servers SHOULD use
+the batch types unconditionally for clients that have enabled
+`batch`.
+
+### `obby.world/whois` batch
+
+When a client that has negotiated `batch` issues `WHOIS` (or
+`WHOIS <server> <nick>`), the server MUST wrap all reply numerics
+emitted for that query, including `RPL_ENDOFWHOIS` (`318`), inside
+a single `obby.world/whois` batch:
+
+    :server BATCH +<ref> obby.world/whois <target-nick>
+    @batch=<ref> :server 311 <querier> <target-nick> <user> <host> * :<realname>
+    @batch=<ref> :server 312 <querier> <target-nick> <server-name> :<server-info>
+    @batch=<ref> :server 319 <querier> <target-nick> :<channel-list>
+    @batch=<ref> :server 317 <querier> <target-nick> <idle> <signon> :seconds idle, signon time
+    @batch=<ref> :server 318 <querier> <target-nick> :End of /WHOIS list.
+    :server BATCH -<ref>
+
+The single parameter on the `BATCH +<ref>` line is the queried
+target's nick, exactly as it appears in the contained `RPL_*`
+numerics. This lets clients deduplicate concurrent `WHOIS` queries
+by the parameter rather than by the batch reference.
+
+The server MUST NOT emit unbatched WHOIS numerics when both `batch`
+and an `obby.world/whois` batch are in scope for the same query.
+
+### `obby.world/whois-session` batch
+
+When the queried target has more than one connected session under
+its account (typically because the persistence / multi-client
+feature is in use) AND the querier has the privilege to see
+connection-level details (typically: the querier is the target, or
+is an IRC operator with the relevant access privilege), the server
+MAY emit one or more `obby.world/whois-session` sub-batches nested
+inside the parent `obby.world/whois` batch.
+
+A `obby.world/whois-session` batch carries a 1-based session
+ordinal as its first parameter, and an OPTIONAL count of total
+sessions as the second parameter:
+
+    @batch=<parent-ref> :server BATCH +<sub-ref> obby.world/whois-session <ordinal> [<total>]
+
+Nesting under the parent `obby.world/whois` batch is signalled by
+the `batch` message tag on both the opening and closing `BATCH`
+lines, per the IRCv3 [`batch`][batch] specification. The session
+ordinal is a server-assigned 1-based integer; the optional total
+allows clients to label each block (e.g. "Session 1 of 3"). The
+closing `BATCH -<sub-ref>` line MUST also carry the
+`@batch=<parent-ref>` tag.
+
+Inside the sub-batch the server emits whichever per-session
+numerics it has to disclose, in particular:
+
+  - `RPL_WHOISHOST` (`378`) carrying the session's real hostname
+    and IP (oper / self only)
+  - `RPL_WHOISMODES` (`379`) carrying the session's umodes (typically
+    identical across sessions but emitted under each for symmetry)
+  - `RPL_WHOISSECURE` (`671`) carrying that session's TLS state
+  - `RPL_WHOISCERTFP` (`276`) for any session whose client
+    presented a TLS client certificate
+  - Vendor numerics carrying GeoIP country, ASN, ASN org, idle, and
+    connect timestamp for that session
+
+The server SHOULD emit per-session numerics in ascending ordinal
+order and SHOULD NOT emit the same numeric outside the session
+sub-batches for the same query.
+
+Each sub-batch MUST be closed with `BATCH -<sub-ref>` before the
+parent batch is closed.
+
+### Compatibility with RFC 2812
+
+RFC 2812 §3.6.2 states that, with the exception of `RPL_WHOISCHANNELS`,
+each WHOIS numeric MUST appear only once. The modern IRC document at
+modern.ircdocs.horse drops this restriction. This extension takes
+advantage of the modern interpretation: under the sub-batch
+discriminator, repeated `RPL_WHOISHOST`, `RPL_WHOISMODES`, etc., are
+unambiguous because each is contained in a `obby.world/whois-session`
+sub-batch carrying a distinct ordinal. Clients that strictly parse RFC
+2812 may discard later occurrences of these numerics, but no
+deployed-client survey found such behaviour; in practice IRC clients
+stream-print unknown / repeated WHOIS lines verbatim.
+
+### Querier without `batch`
+
+A querier that has not negotiated `batch` MUST receive a legacy
+WHOIS reply. The server has two valid strategies:
+
+  1. **Single arbitrary session.** Emit one set of per-session
+     numerics for one arbitrarily chosen session (e.g. the most
+     recently active). This is the Ergo precedent.
+  2. **Concatenated text.** Collapse per-session detail into a few
+     human-readable lines that fit one occurrence of each numeric.
+
+Either is acceptable; this extension only governs the batched
+form.
+
+## Examples
+
+A querying operator who has negotiated `batch` doing a `WHOIS` of a
+two-session account `Valware`:
+
+    C: WHOIS Valware
+    S: :obby.t3ks.com BATCH +q1 obby.world/whois Valware
+    S: @batch=q1 :obby.t3ks.com 311 oper Valware valware bt-net.range31-104.btcentralplus.com * :Valerie Pond
+    S: @batch=q1 :obby.t3ks.com 312 oper Valware obby.t3ks.com :ObbyNet hub
+    S: @batch=q1 :obby.t3ks.com 313 oper Valware :is a network administrator
+    S: @batch=q1 :obby.t3ks.com 319 oper Valware :@#opers @#general +#weather #lol
+    S: @batch=q1 :obby.t3ks.com 330 oper Valware Valware :is logged in as
+    S: @batch=q1 :obby.t3ks.com 317 oper Valware 0 1747526400 :seconds idle, signon time
+
+    S: @batch=q1 :obby.t3ks.com BATCH +q1s1 obby.world/whois-session 1 2
+    S: @batch=q1s1 :obby.t3ks.com 378 oper Valware :is connecting from valware@bt-net.range31-104.btcentralplus.com 1.2.3.4
+    S: @batch=q1s1 :obby.t3ks.com 379 oper Valware :is using modes +iSwx
+    S: @batch=q1s1 :obby.t3ks.com 671 oper Valware :is using a secure connection [TLSv1.3-CHACHA20-POLY1305]
+    S: @batch=q1s1 :obby.t3ks.com 276 oper Valware :has client certificate fingerprint a1b2c3d4e5f6...
+    S: @batch=q1 :obby.t3ks.com BATCH -q1s1
+
+    S: @batch=q1 :obby.t3ks.com BATCH +q1s2 obby.world/whois-session 2 2
+    S: @batch=q1s2 :obby.t3ks.com 378 oper Valware :is connecting from valware@cgnat-public.example 10.0.0.5
+    S: @batch=q1s2 :obby.t3ks.com 379 oper Valware :is using modes +iwx
+    S: @batch=q1s2 :obby.t3ks.com 671 oper Valware :is using a secure connection [TLSv1.3-AES-256-GCM]
+    S: @batch=q1 :obby.t3ks.com BATCH -q1s2
+
+    S: @batch=q1 :obby.t3ks.com 318 oper Valware :End of /WHOIS list.
+    S: :obby.t3ks.com BATCH -q1
+
+The same `WHOIS` issued by a non-operator who has negotiated
+`batch`: the server elides the per-session sub-batches (because the
+operator gate is not satisfied) and emits one consolidated `378`,
+`320`, `671` for the canonical session inside the parent batch
+alongside the existing public numerics. The parent
+`obby.world/whois` batch is still used so the client can group the
+reply.
+
+## Design notes (non-normative)
+
+- Sub-batches were chosen over message-tag annotations on each
+  numeric because message tags inflate per-line bytes and require
+  recipient parsing for every line; sub-batches are a single
+  containment boundary the client reads once.
+- The session ordinal is a server-assigned 1-based integer per
+  query; the server is free to choose any stable ordering (e.g. by
+  session connect time). The ordinal is NOT a globally meaningful
+  session id and MUST NOT be relied on across separate `WHOIS`
+  queries.
+- Future per-session metadata (custom keys via `draft/metadata-2`,
+  TLS cipher suite details, presence indicators) can be added to
+  the per-session sub-batches as new vendor numerics or message
+  tags without changing the batch shape.
+
+[batch]: ../extensions/batch.html

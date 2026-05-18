@@ -297,6 +297,105 @@ WhoisConfigDetails _whois_get_policy(Client *client, Client *target, const char 
 	return WHOIS_CONFIG_DETAILS_NONE;
 }
 
+/* Per-session WHOIS detail keys. Entries in the nvplist with these
+ * names describe a SINGLE connection (its host/IP, umodes, TLS state,
+ * client cert, geo, ASN). When the queried account has multiple live
+ * sessions and the querier is allowed to see connection-level detail,
+ * we suppress these from the parent batch and re-emit them once per
+ * session inside an obby.world/whois-session sub-batch.  See
+ * doc/specs/whois-batch.md. */
+static int whois_is_per_session_name(const char *name)
+{
+	static const char *names[] = { "modes", "realhost", "secure", "certfp", "geo", "asn", NULL };
+	int i;
+	if (!name)
+		return 0;
+	for (i = 0; names[i]; i++)
+		if (!strcmp(name, names[i]))
+			return 1;
+	return 0;
+}
+
+/* Collect local clients sharing the target's account_canonical (the
+ * target's own canonical is included).  Returns total count even if
+ * it exceeds 'max' (caller's storage is bounded).  No-op when the
+ * persistence module isn't loaded -- the moddata won't exist. */
+static int whois_collect_session_clients(Client *target, Client **out, int max)
+{
+	ModDataInfo *canon_md = findmoddata_byname("account_canonical", MODDATATYPE_CLIENT);
+	Client *target_canon, *c;
+	int n = 0;
+
+	if (!canon_md)
+		return 0;
+	target_canon = moddata_client(target, canon_md).ptr;
+	if (!target_canon)
+		return 0;
+	list_for_each_entry(c, &lclient_list, lclient_node)
+	{
+		if (!IsUser(c))
+			continue;
+		if (moddata_client(c, canon_md).ptr != target_canon)
+			continue;
+		if (n < max)
+			out[n] = c;
+		n++;
+	}
+	return n;
+}
+
+static MessageTag *whois_batch_mtag(const char *batchid)
+{
+	MessageTag *m = safe_alloc(sizeof(MessageTag));
+	safe_strdup(m->name, "batch");
+	safe_strdup(m->value, batchid);
+	return m;
+}
+
+/* Emit per-session WHOIS numerics for one connected session under the
+ * queried account.  Each line is tagged @batch=batchid so it lands
+ * inside the obby.world/whois-session sub-batch. */
+static void whois_emit_session_lines(Client *client, Client *target, Client *sess,
+                                     const char *batchid)
+{
+	MessageTag *mt = whois_batch_mtag(batchid);
+	const char *fp;
+
+	sendto_one(client, mt,
+	           ":%s %d %s %s :is connecting from %s@%s %s",
+	           me.name, RPL_WHOISHOST, client->name, target->name,
+	           (sess->ident && strcmp(sess->ident, "unknown")) ? sess->ident : "*",
+	           (sess->user && sess->user->realhost) ? sess->user->realhost : "",
+	           sess->ip ? sess->ip : "");
+
+	sendto_one(client, mt,
+	           ":%s %d %s %s %s %s",
+	           me.name, RPL_WHOISMODES, client->name, target->name,
+	           get_usermode_string(sess),
+	           (sess->user && sess->user->snomask) ? sess->user->snomask : "");
+
+	if (sess->umodes & UMODE_SECURE)
+	{
+		const char *cipher = tls_get_cipher(sess);
+		if (cipher)
+			sendto_one(client, mt,
+			           ":%s %d %s %s :is using a Secure Connection [%s]",
+			           me.name, RPL_WHOISSECURE, client->name, target->name, cipher);
+		else
+			sendto_one(client, mt,
+			           ":%s %d %s %s :is using a Secure Connection",
+			           me.name, RPL_WHOISSECURE, client->name, target->name);
+	}
+
+	fp = moddata_client_get(sess, "certfp");
+	if (fp)
+		sendto_one(client, mt,
+		           ":%s %d %s %s :has client certificate fingerprint %s",
+		           me.name, RPL_WHOISCERTFP, client->name, target->name, fp);
+
+	free_message_tags(mt);
+}
+
 /* WHOIS command.
  * parv[1] = list of nicks (comma separated)
  */
@@ -331,7 +430,7 @@ CMD_FUNC(cmd_whois)
 	for (tmp = canonize(parv[1]); (nick = strtoken(&p, tmp, ",")); tmp = NULL)
 	{
 		unsigned char showchannel, wilds, hideoper; /* <- these are all boolean-alike */
-		NameValuePrioList *list = NULL, *e;
+		NameValuePrioList *list = NULL;
 		int policy; /* for temporary stuff */
 
 		if (MyUser(client) && (++ntargets > maxtargets))
@@ -668,10 +767,95 @@ CMD_FUNC(cmd_whois)
 
 		RunHook(HOOKTYPE_WHOIS, client, target, &list);
 
-		for (e = list; e; e = e->next)
-			sendto_one(client, NULL, "%s", e->value);
+		/* Emission.  Two paths:
+		 *   - client has negotiated `batch`: wrap reply in an
+		 *     obby.world/whois batch (and obby.world/whois-session
+		 *     sub-batches when target has multiple connected sessions
+		 *     and the querier is privileged).  RPL_ENDOFWHOIS rides
+		 *     inside the parent batch, so the trailing global 318
+		 *     emitted after the loop is suppressed.
+		 *   - no `batch`: legacy stream of numerics, plus the
+		 *     trailing 318 outside the loop. */
+		{
+			int use_batch = HasCapability(client, "batch");
+			char parent_batch[BATCHLEN+1];
+			Client *sessions[16];
+			int num_sessions = 0;
+			int per_session_emit = 0;
+			NameValuePrioList *li;
+
+			parent_batch[0] = '\0';
+			if (use_batch)
+			{
+				generate_batch_id(parent_batch);
+				sendto_one(client, NULL, ":%s BATCH +%s obby.world/whois %s",
+				           me.name, parent_batch, target->name);
+
+				if (target == client || IsOper(client))
+				{
+					num_sessions = whois_collect_session_clients(target, sessions,
+					        sizeof(sessions) / sizeof(sessions[0]));
+					if (num_sessions >= 2)
+						per_session_emit = 1;
+				}
+			}
+
+			for (li = list; li; li = li->next)
+			{
+				if (per_session_emit && whois_is_per_session_name(li->name))
+					continue;
+				if (use_batch)
+				{
+					MessageTag *mt = whois_batch_mtag(parent_batch);
+					sendto_one(client, mt, "%s", li->value);
+					free_message_tags(mt);
+				}
+				else
+				{
+					sendto_one(client, NULL, "%s", li->value);
+				}
+			}
+
+			if (per_session_emit)
+			{
+				int i;
+				int total = (num_sessions > (int)(sizeof(sessions)/sizeof(sessions[0])))
+				            ? (int)(sizeof(sessions)/sizeof(sessions[0])) : num_sessions;
+				for (i = 0; i < total; i++)
+				{
+					char sub_batch[BATCHLEN+1];
+					MessageTag *mt_outer;
+
+					generate_batch_id(sub_batch);
+
+					mt_outer = whois_batch_mtag(parent_batch);
+					sendto_one(client, mt_outer,
+					           ":%s BATCH +%s obby.world/whois-session %d %d",
+					           me.name, sub_batch, i + 1, total);
+					free_message_tags(mt_outer);
+
+					whois_emit_session_lines(client, target, sessions[i], sub_batch);
+
+					mt_outer = whois_batch_mtag(parent_batch);
+					sendto_one(client, mt_outer, ":%s BATCH -%s", me.name, sub_batch);
+					free_message_tags(mt_outer);
+				}
+			}
+
+			if (use_batch)
+			{
+				MessageTag *mt = whois_batch_mtag(parent_batch);
+				sendto_one(client, mt,
+				           ":%s %d %s %s :End of /WHOIS list.",
+				           me.name, RPL_ENDOFWHOIS, client->name, target->name);
+				free_message_tags(mt);
+
+				sendto_one(client, NULL, ":%s BATCH -%s", me.name, parent_batch);
+			}
+		}
 
 		free_nvplist(list);
 	}
-	sendnumeric(client, RPL_ENDOFWHOIS, querybuf);
+	if (!HasCapability(client, "batch"))
+		sendnumeric(client, RPL_ENDOFWHOIS, querybuf);
 }
