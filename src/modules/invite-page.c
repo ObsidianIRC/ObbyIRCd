@@ -45,6 +45,12 @@ struct {
 	int native_port;        /* port shown for "connect manually with a
 	                         * traditional client" — TLS-IRC. Falls
 	                         * back to irc_port when unset. */
+	char *web_url;          /* optional: when set, the splash renders
+	                         * a "Join via Web" secondary button that
+	                         * opens this URL in a new tab. The admin
+	                         * is responsible for what's at that URL
+	                         * (a static landing, hosted web client,
+	                         * etc.). */
 	char *default_channel;  /* optional: auto-prefill the channel form */
 	char *accent_color;     /* optional hex accent, defaults to #5865F2 */
 } cfg = { 0 };
@@ -90,6 +96,7 @@ MOD_UNLOAD()
 	safe_free(cfg.network_name);
 	safe_free(cfg.irc_host);
 	safe_free(cfg.default_channel);
+	safe_free(cfg.web_url);
 	safe_free(cfg.accent_color);
 	return MOD_SUCCESS;
 }
@@ -115,6 +122,7 @@ static int invite_configtest_set(ConfigFile *cf, ConfigEntry *ce, int type, int 
 		if (!strcmp(cep->name, "network-name") ||
 		    !strcmp(cep->name, "irc-host") ||
 		    !strcmp(cep->name, "default-channel") ||
+		    !strcmp(cep->name, "web-url") ||
 		    !strcmp(cep->name, "accent-color"))
 		{
 			if (!cep->value || !*cep->value)
@@ -165,6 +173,8 @@ static int invite_configrun_set(ConfigFile *cf, ConfigEntry *ce, int type)
 			safe_strdup(cfg.irc_host, cep->value);
 		else if (!strcmp(cep->name, "default-channel"))
 			safe_strdup(cfg.default_channel, cep->value);
+		else if (!strcmp(cep->name, "web-url"))
+			safe_strdup(cfg.web_url, cep->value);
 		else if (!strcmp(cep->name, "accent-color"))
 			safe_strdup(cfg.accent_color, cep->value);
 		else if (!strcmp(cep->name, "irc-port"))
@@ -478,6 +488,7 @@ static char *build_invite_html(const char *channel)
 	    " .icon{width:72px;height:72px;border-radius:16px;display:block;margin:0 auto 16px;object-fit:cover;background:#222530;box-shadow:0 4px 12px rgba(0,0,0,.3)}\n"
 	    " .btn{display:block;width:100%%;text-align:center;background:%s;color:#fff;text-decoration:none;font-weight:600;font-size:16px;padding:14px 18px;border-radius:10px;margin:0 0 12px;transition:filter .15s}\n"
 	    " .btn:hover{filter:brightness(1.1)}\n"
+	    " .btn.sec{background:#2a2d36;color:#e8e8ea}\n"
 	    " details{margin-top:18px;background:#11131a;border-radius:10px;border:1px solid #232631;text-align:left}\n"
 	    " summary{cursor:pointer;list-style:none;padding:12px 16px;font-size:13px;color:#a9aab2;user-select:none}\n"
 	    " summary::-webkit-details-marker{display:none}\n"
@@ -534,6 +545,18 @@ static char *build_invite_html(const char *channel)
 	n += snprintf(out + n, cap - n,
 	    "<a class=\"btn\" href=\"%s\">Open in IRC client</a>\n",
 	    ircs_link);
+
+	/* Optional secondary "Join via Web" button. Only renders when
+	 * set::invite-page::web-url is configured. The URL is opened in
+	 * a new tab as-is — the admin is responsible for what's there
+	 * (a static landing page, a hosted client, a deeplink router,
+	 * whatever). */
+	if (cfg.web_url && *cfg.web_url)
+	{
+		n += snprintf(out + n, cap - n,
+		    "<a class=\"btn sec\" href=\"%s\" target=\"_blank\" rel=\"noopener noreferrer\">Join via Web</a>\n",
+		    html_escape(cfg.web_url));
+	}
 
 	/* Manual-connect details: collapsed by default. Shows everything
 	 * a user would need to connect with another IRC client of their
