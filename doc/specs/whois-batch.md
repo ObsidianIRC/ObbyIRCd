@@ -114,9 +114,12 @@ inside the parent `obby.world/whois` batch.
 
 A `obby.world/whois-session` batch carries a 1-based session
 ordinal as its first parameter, and an OPTIONAL count of total
-sessions as the second parameter:
+sessions as the second parameter. The opening line additionally
+carries the vendor `obby.world/since` message tag, whose value is
+the ISO 8601 UTC timestamp at which this session's TCP connection
+registered with the server:
 
-    @batch=<parent-ref> :server BATCH +<sub-ref> obby.world/whois-session <ordinal> [<total>]
+    @batch=<parent-ref>;obby.world/since=<iso8601> :server BATCH +<sub-ref> obby.world/whois-session <ordinal> [<total>]
 
 Nesting under the parent `obby.world/whois` batch is signalled by
 the `batch` message tag on both the opening and closing `BATCH`
@@ -127,17 +130,20 @@ closing `BATCH -<sub-ref>` line MUST also carry the
 `@batch=<parent-ref>` tag.
 
 Inside the sub-batch the server emits whichever per-session
-numerics it has to disclose, in particular:
+numerics it has to disclose:
 
-  - `RPL_WHOISHOST` (`378`) carrying the session's real hostname
-    and IP (oper / self only)
-  - `RPL_WHOISMODES` (`379`) carrying the session's umodes (typically
-    identical across sessions but emitted under each for symmetry)
-  - `RPL_WHOISSECURE` (`671`) carrying that session's TLS state
-  - `RPL_WHOISCERTFP` (`276`) for any session whose client
-    presented a TLS client certificate
-  - Vendor numerics carrying GeoIP country, ASN, ASN org, idle, and
-    connect timestamp for that session
+  - `RPL_WHOISHOST` (`378`) — the session's real hostname and IP
+  - `RPL_WHOISMODES` (`379`) — the session's umodes and snomask
+  - `RPL_WHOISSECURE` (`671`) — the session's TLS state and cipher
+  - `RPL_WHOISCERTFP` (`276`) — the session's TLS client certificate
+    fingerprint, if any
+  - `RPL_WHOISIDLE` (`317`) — the session's idle time (seconds since
+    last activity on this connection) and signon time (when this
+    connection registered)
+  - `RPL_WHOISCOUNTRY` (`344`) — GeoIP country code / name for the
+    session's IP, if GeoIP data is available
+  - `RPL_WHOISASN` (`569`) — ASN / AS name for the session's IP, if
+    available
 
 The server SHOULD emit per-session numerics in ascending ordinal
 order and SHOULD NOT emit the same numeric outside the session
@@ -145,6 +151,20 @@ sub-batches for the same query.
 
 Each sub-batch MUST be closed with `BATCH -<sub-ref>` before the
 parent batch is closed.
+
+### Session-count summary
+
+When the queried account has two or more live sessions but the
+querier does not satisfy the per-session disclosure gate (i.e. the
+querier is neither the target nor an IRC operator), the server
+SHOULD emit a single `RPL_WHOISSPECIAL` (`320`) line inside the
+parent batch:
+
+    @batch=<parent-ref> :server 320 <querier> <target> :is connected from <N> sessions
+
+This lets the receiving client render a "multi-session" affordance
+(e.g. a small badge or summary) without exposing IPs, hosts, or TLS
+state of any individual session.
 
 ### Compatibility with RFC 2812
 
@@ -185,31 +205,49 @@ two-session account `Valware`:
     S: @batch=q1 :obby.t3ks.com 313 oper Valware :is a network administrator
     S: @batch=q1 :obby.t3ks.com 319 oper Valware :@#opers @#general +#weather #lol
     S: @batch=q1 :obby.t3ks.com 330 oper Valware Valware :is logged in as
-    S: @batch=q1 :obby.t3ks.com 317 oper Valware 0 1747526400 :seconds idle, signon time
 
-    S: @batch=q1 :obby.t3ks.com BATCH +q1s1 obby.world/whois-session 1 2
+    S: @batch=q1;obby.world/since=2026-05-18T08:12:33.000Z :obby.t3ks.com BATCH +q1s1 obby.world/whois-session 1 2
     S: @batch=q1s1 :obby.t3ks.com 378 oper Valware :is connecting from valware@bt-net.range31-104.btcentralplus.com 1.2.3.4
-    S: @batch=q1s1 :obby.t3ks.com 379 oper Valware :is using modes +iSwx
-    S: @batch=q1s1 :obby.t3ks.com 671 oper Valware :is using a secure connection [TLSv1.3-CHACHA20-POLY1305]
+    S: @batch=q1s1 :obby.t3ks.com 379 oper Valware +iSwx
+    S: @batch=q1s1 :obby.t3ks.com 671 oper Valware :is using a Secure Connection [TLSv1.3-CHACHA20-POLY1305]
     S: @batch=q1s1 :obby.t3ks.com 276 oper Valware :has client certificate fingerprint a1b2c3d4e5f6...
+    S: @batch=q1s1 :obby.t3ks.com 317 oper Valware 42 1747526400 :seconds idle, signon time
+    S: @batch=q1s1 :obby.t3ks.com 344 oper Valware GB :is connecting from United Kingdom
+    S: @batch=q1s1 :obby.t3ks.com 569 oper Valware 2856 :is connecting from AS2856 [British Telecommunications PLC]
     S: @batch=q1 :obby.t3ks.com BATCH -q1s1
 
-    S: @batch=q1 :obby.t3ks.com BATCH +q1s2 obby.world/whois-session 2 2
+    S: @batch=q1;obby.world/since=2026-05-18T11:47:02.000Z :obby.t3ks.com BATCH +q1s2 obby.world/whois-session 2 2
     S: @batch=q1s2 :obby.t3ks.com 378 oper Valware :is connecting from valware@cgnat-public.example 10.0.0.5
-    S: @batch=q1s2 :obby.t3ks.com 379 oper Valware :is using modes +iwx
-    S: @batch=q1s2 :obby.t3ks.com 671 oper Valware :is using a secure connection [TLSv1.3-AES-256-GCM]
+    S: @batch=q1s2 :obby.t3ks.com 379 oper Valware +iwx
+    S: @batch=q1s2 :obby.t3ks.com 671 oper Valware :is using a Secure Connection [TLSv1.3-AES-256-GCM]
+    S: @batch=q1s2 :obby.t3ks.com 317 oper Valware 1207 1747549322 :seconds idle, signon time
+    S: @batch=q1s2 :obby.t3ks.com 344 oper Valware US :is connecting from United States
+    S: @batch=q1s2 :obby.t3ks.com 569 oper Valware 15169 :is connecting from AS15169 [Google LLC]
     S: @batch=q1 :obby.t3ks.com BATCH -q1s2
 
     S: @batch=q1 :obby.t3ks.com 318 oper Valware :End of /WHOIS list.
     S: :obby.t3ks.com BATCH -q1
 
-The same `WHOIS` issued by a non-operator who has negotiated
-`batch`: the server elides the per-session sub-batches (because the
-operator gate is not satisfied) and emits one consolidated `378`,
-`320`, `671` for the canonical session inside the parent batch
-alongside the existing public numerics. The parent
-`obby.world/whois` batch is still used so the client can group the
-reply.
+The same `WHOIS` issued by a non-operator who has negotiated `batch`
+and `obby.world/whois`: the server elides the per-session
+sub-batches (because the operator gate is not satisfied) and emits
+one consolidated `378`, `379`, `671` for the canonical session
+inside the parent batch alongside the existing public numerics,
+plus a single `RPL_WHOISSPECIAL` line indicating the total session
+count:
+
+    C: WHOIS Valware
+    S: :obby.t3ks.com BATCH +q2 obby.world/whois Valware
+    S: @batch=q2 :obby.t3ks.com 311 user Valware valware bt-net.range31-104.btcentralplus.com * :Valerie Pond
+    S: @batch=q2 :obby.t3ks.com 319 user Valware :@#opers @#general +#weather #lol
+    S: @batch=q2 :obby.t3ks.com 312 user Valware obby.t3ks.com :ObbyNet hub
+    S: @batch=q2 :obby.t3ks.com 313 user Valware :is a network administrator
+    S: @batch=q2 :obby.t3ks.com 671 user Valware :is using a Secure Connection
+    S: @batch=q2 :obby.t3ks.com 320 user Valware :is connected from 2 sessions
+    S: @batch=q2 :obby.t3ks.com 330 user Valware Valware :is logged in as
+    S: @batch=q2 :obby.t3ks.com 317 user Valware 42 1747526400 :seconds idle, signon time
+    S: @batch=q2 :obby.t3ks.com 318 user Valware :End of /WHOIS list.
+    S: :obby.t3ks.com BATCH -q2
 
 ## Design notes (non-normative)
 

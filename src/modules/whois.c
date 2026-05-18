@@ -73,6 +73,8 @@ MOD_TEST()
 MOD_INIT()
 {
 	ClientCapabilityInfo cap;
+	ClientCapability *cap_handle;
+	MessageTagHandlerInfo mtag;
 
 	MARK_AS_OFFICIAL_MODULE(modinfo);
 	CommandAdd(modinfo->handle, "WHOIS", cmd_whois, MAXPARA, CMD_USER);
@@ -89,7 +91,17 @@ MOD_INIT()
 	 * the contract explicit.  See doc/specs/whois-batch.md. */
 	memset(&cap, 0, sizeof(cap));
 	cap.name = "obby.world/whois";
-	ClientCapabilityAdd(modinfo->handle, &cap, &CAP_OBBY_WHOIS);
+	cap_handle = ClientCapabilityAdd(modinfo->handle, &cap, &CAP_OBBY_WHOIS);
+
+	/* Vendor message tag carrying each session's connect time
+	 * (ISO 8601, UTC).  Rides on the obby.world/whois-session
+	 * BATCH+ line so clients can render "joined N minutes ago"
+	 * without consuming a numeric.  Delivery is gated on the
+	 * obby.world/whois cap. */
+	memset(&mtag, 0, sizeof(mtag));
+	mtag.name = "obby.world/since";
+	mtag.clicap_handler = cap_handle;
+	MessageTagHandlerAdd(modinfo->handle, &mtag);
 
 	return MOD_SUCCESS;
 }
@@ -315,14 +327,14 @@ WhoisConfigDetails _whois_get_policy(Client *client, Client *target, const char 
 
 /* Per-session WHOIS detail keys. Entries in the nvplist with these
  * names describe a SINGLE connection (its host/IP, umodes, TLS state,
- * client cert, geo, ASN). When the queried account has multiple live
- * sessions and the querier is allowed to see connection-level detail,
- * we suppress these from the parent batch and re-emit them once per
- * session inside an obby.world/whois-session sub-batch.  See
- * doc/specs/whois-batch.md. */
+ * client cert, geo, ASN, idle clock). When the queried account has
+ * multiple live sessions and the querier is allowed to see
+ * connection-level detail, we suppress these from the parent batch
+ * and re-emit them once per session inside an
+ * obby.world/whois-session sub-batch.  See doc/specs/whois-batch.md. */
 static int whois_is_per_session_name(const char *name)
 {
-	static const char *names[] = { "modes", "realhost", "secure", "certfp", "geo", "asn", NULL };
+	static const char *names[] = { "modes", "realhost", "secure", "certfp", "geo", "asn", "idle", NULL };
 	int i;
 	if (!name)
 		return 0;
@@ -408,6 +420,46 @@ static void whois_emit_session_lines(Client *client, Client *target, Client *ses
 		sendto_one(client, mt,
 		           ":%s %d %s %s :has client certificate fingerprint %s",
 		           me.name, RPL_WHOISCERTFP, client->name, target->name, fp);
+
+	/* Per-session idle clock + signon. Each session has its own
+	 * local->idle_since (last activity) and local->creationtime
+	 * (when this TCP connection registered). The canonical's
+	 * idle in the parent batch is suppressed via the per-session
+	 * detail filter; this is the only 317 emitted for this query
+	 * when sub-batches are in use. */
+	if (sess->local)
+	{
+		sendto_one(client, mt,
+		           ":%s %d %s %s %lld %lld :seconds idle, signon time",
+		           me.name, RPL_WHOISIDLE, client->name, target->name,
+		           (long long)(TStime() - sess->local->idle_since),
+		           (long long)sess->local->creationtime);
+	}
+
+	/* Per-session geo / ASN.  Each session connects from one IP,
+	 * which may map to a distinct country / ASN from other
+	 * sessions of the same account.  Read GeoIP moddata via
+	 * findmoddata_byname so whois.c stays decoupled from
+	 * geoip_base; if geoip isn't loaded, silently skip. */
+	{
+		ModDataInfo *geo_md = findmoddata_byname("geoip", MODDATATYPE_CLIENT);
+		GeoIPResult *geo = geo_md ? (GeoIPResult *)moddata_client(sess, geo_md).ptr : NULL;
+		if (geo)
+		{
+			if (geo->country_code)
+				sendto_one(client, mt,
+				           ":%s %d %s %s %s :is connecting from %s",
+				           me.name, RPL_WHOISCOUNTRY, client->name, target->name,
+				           geo->country_code,
+				           geo->country_name ? geo->country_name : "");
+			if (geo->asn)
+				sendto_one(client, mt,
+				           ":%s %d %s %s %u :is connecting from AS%u [%s]",
+				           me.name, RPL_WHOISASN, client->name, target->name,
+				           geo->asn, geo->asn,
+				           geo->asname ? geo->asname : "UNKNOWN");
+		}
+	}
 
 	free_message_tags(mt);
 }
@@ -813,13 +865,14 @@ CMD_FUNC(cmd_whois)
 				sendto_one(client, NULL, ":%s BATCH +%s obby.world/whois %s",
 				           me.name, parent_batch, target->name);
 
-				if (target == client || IsOper(client))
-				{
-					num_sessions = whois_collect_session_clients(target, sessions,
-					        sizeof(sessions) / sizeof(sessions[0]));
-					if (num_sessions >= 2)
-						per_session_emit = 1;
-				}
+				/* Always count sessions when batch is on so we
+				 * can emit either per-session sub-batches (for
+				 * privileged queriers) or a privacy-preserving
+				 * session-count summary (for everyone else). */
+				num_sessions = whois_collect_session_clients(target, sessions,
+				        sizeof(sessions) / sizeof(sessions[0]));
+				if (num_sessions >= 2 && (target == client || IsOper(client)))
+					per_session_emit = 1;
 			}
 
 			for (li = list; li; li = li->next)
@@ -845,23 +898,53 @@ CMD_FUNC(cmd_whois)
 				            ? (int)(sizeof(sessions)/sizeof(sessions[0])) : num_sessions;
 				for (i = 0; i < total; i++)
 				{
+					Client *sess = sessions[i];
 					char sub_batch[BATCHLEN+1];
 					MessageTag *mt_outer;
+					MessageTag *mt_since = NULL;
 
 					generate_batch_id(sub_batch);
 
+					/* Sub-batch open line carries @batch=parent
+					 * (to be inside parent batch) AND a vendor
+					 * obby.world/since=ISO8601 tag pinning when
+					 * this session connected. */
 					mt_outer = whois_batch_mtag(parent_batch);
+					if (sess->local)
+					{
+						mt_since = safe_alloc(sizeof(MessageTag));
+						safe_strdup(mt_since->name, "obby.world/since");
+						safe_strdup(mt_since->value, timestamp_iso8601(sess->local->creationtime));
+						AddListItem(mt_since, mt_outer);
+					}
 					sendto_one(client, mt_outer,
 					           ":%s BATCH +%s obby.world/whois-session %d %d",
 					           me.name, sub_batch, i + 1, total);
 					free_message_tags(mt_outer);
 
-					whois_emit_session_lines(client, target, sessions[i], sub_batch);
+					whois_emit_session_lines(client, target, sess, sub_batch);
 
 					mt_outer = whois_batch_mtag(parent_batch);
 					sendto_one(client, mt_outer, ":%s BATCH -%s", me.name, sub_batch);
 					free_message_tags(mt_outer);
 				}
+			}
+			else if (use_batch && num_sessions >= 2)
+			{
+				/* Querier doesn't get to see per-session detail
+				 * (not target, not oper), but the account does
+				 * have multiple live sessions.  Give them a
+				 * single privacy-preserving line so the client
+				 * can render a "multi-session" affordance
+				 * without exposing IPs / hosts / TLS.  The line
+				 * is a RPL_WHOISSPECIAL (320) so existing
+				 * clients render it as ordinary whois text. */
+				MessageTag *mt = whois_batch_mtag(parent_batch);
+				sendto_one(client, mt,
+				           ":%s %d %s %s :is connected from %d sessions",
+				           me.name, RPL_WHOISSPECIAL, client->name, target->name,
+				           num_sessions);
+				free_message_tags(mt);
 			}
 
 			if (use_batch)
