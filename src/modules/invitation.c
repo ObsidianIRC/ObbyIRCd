@@ -595,9 +595,13 @@ static void inv_do_create(Client *client, const char *channel_raw)
  *
  * Wire format: one line per row, plus a final NOTE terminator.
  *
- *   :server INVITELINK ENTRY <share-id> <channel|*> <created-iso8601> <redeem-count>
+ *   :server INVITELINK ENTRY <share-id> <channel|*> <created-iso8601> <redeem-count> :<url>
  *   ...
- *   :server NOTE INVITELINK LIST_END * :End of invitation list. */
+ *   :server NOTE INVITELINK LIST_END * :End of invitation list.
+ *
+ * The trailing :<url> repeats the share-id with the configured
+ * set::invitation::base-url prefix so a client can render a copy-to-
+ * clipboard button without having to rebuild the URL itself. */
 static void inv_do_list(Client *client)
 {
 	const char *account = inv_owner_for(client);
@@ -640,11 +644,16 @@ static void inv_do_list(Client *client)
 		int         created  = sqlite3_column_int(stmt, 2);
 		int         redeems  = sqlite3_column_int(stmt, 3);
 		const char *iso      = timestamp_iso8601((time_t)created);
+		char url_buf[512];
+		if (cfg.base_url && *cfg.base_url)
+			snprintf(url_buf, sizeof(url_buf), "%s%s", cfg.base_url, share_id);
+		else
+			snprintf(url_buf, sizeof(url_buf), "%s", share_id);
 		sendto_one(client, NULL,
-		    ":%s INVITELINK ENTRY %s %s %s %d",
+		    ":%s INVITELINK ENTRY %s %s %s %d :%s",
 		    me.name, share_id,
 		    (channel && *channel) ? channel : "*",
-		    iso, redeems);
+		    iso, redeems, url_buf);
 		count++;
 	}
 	sqlite3_finalize(stmt);
