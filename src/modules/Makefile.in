@@ -98,6 +98,7 @@ MODULES= \
 	metadata.so \
 	metadata-db.so \
 	filehost.so \
+	invite-page.so \
 	authtoken.so \
 	smtp.so \
 	emoji.so \
