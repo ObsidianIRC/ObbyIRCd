@@ -55,6 +55,7 @@ static int invite_configtest_set(ConfigFile *cf, ConfigEntry *ce, int type, int 
 static int invite_configrun_set(ConfigFile *cf, ConfigEntry *ce, int type);
 static int invite_configtest_listen(ConfigFile *cf, ConfigEntry *ce, int type, int *errs);
 static int invite_configrun_listen_ex(ConfigFile *cf, ConfigEntry *ce, int type, void *ptr);
+static void invite_client_handshake(Client *client);
 static int invite_handle_request(Client *client, WebRequest *web);
 static int invite_handle_body(Client *client, WebRequest *web, const char *buf, int len);
 static void invite_send_html(Client *client, int status, const char *html);
@@ -201,7 +202,23 @@ static int invite_configrun_listen_ex(ConfigFile *cf, ConfigEntry *ce, int type,
 		l->webserver = safe_alloc(sizeof(WebServer));
 	l->webserver->handle_request = invite_handle_request;
 	l->webserver->handle_body = invite_handle_body;
+	/* Replace the default IRC handshake so it doesn't emit the
+	 * "*** Looking up your hostname..." / "*** Found your hostname"
+	 * NOTICEs into the TCP stream BEFORE the HTTP request comes in.
+	 * Those raw bytes land in front of our HTTP/1.1 status line and
+	 * curl reports "Received HTTP/0.9 when not allowed".  Browsers
+	 * may render them as garbage or simply fail to parse the page.
+	 * Same fix pushbot uses for its WS listener. */
+	l->start_handshake = invite_client_handshake;
 	return 1;
+}
+
+static void invite_client_handshake(Client *client)
+{
+	client->status = CLIENT_STATUS_UNKNOWN;
+	RunHook(HOOKTYPE_HANDSHAKE, client);
+	if (!IsDead(client))
+		fd_setselect(client->local->fd, FD_SELECT_READ, read_packet, client);
 }
 
 /* ===================================================================
@@ -271,13 +288,19 @@ static void url_decode(char *dst, const char *src, size_t maxlen)
 	dst[di] = '\0';
 }
 
-/** Minimal HTML escape into a static buffer. */
+/** Minimal HTML escape.  Returns a pointer into a rotating ring of
+ * static buffers so it's safe to call multiple times within a single
+ * printf-family expression (which evaluates its args in unspecified
+ * order).  4 slots is enough for the snprintfs in this module. */
 static const char *html_escape(const char *s)
 {
-	static char buf[1024];
+	static char rings[4][1024];
+	static int slot = 0;
+	char *buf = rings[slot];
 	size_t i = 0;
-	if (!s) return "";
-	while (*s && i + 7 < sizeof(buf))
+	slot = (slot + 1) & 3;
+	if (!s) { buf[0] = '\0'; return buf; }
+	while (*s && i + 7 < sizeof(rings[0]))
 	{
 		switch (*s)
 		{
