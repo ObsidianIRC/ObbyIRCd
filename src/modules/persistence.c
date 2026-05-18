@@ -144,6 +144,7 @@ static void add_session(PersistEntry *e, Client *client);
 static void remove_session(PersistEntry *e, Client *client);
 static void promote_session(PersistEntry *e);
 static void setup_session(Client *client, PersistEntry *e);
+static void notify_existing_sessions_of_new(PersistEntry *e, Client *new_sess);
 static int persistence_effective(Client *client, PersistEntry *e);
 static void send_status(Client *client, PersistEntry *e);
 static const char *pref_to_str(int pref);
@@ -820,6 +821,90 @@ static void promote_session(PersistEntry *e)
 }
 
 /*
+ * Notify canonical + every existing session that a new session has
+ * attached to the account.  Emitted as an IRCv3 standard-replies NOTE
+ * so clients with the standard-replies cap render it as a banner,
+ * while clients without the cap still see the trailing description.
+ *
+ * Positional context params are stable: <ip> <country-code> <asn>
+ * <iso8601-since>.  Missing GeoIP fields are emitted as "*" so client
+ * parsers never have to guess at param availability.  The new session
+ * itself is NOT notified -- it knows it just connected.
+ */
+static void notify_existing_sessions_of_new(PersistEntry *e, Client *new_sess)
+{
+	PersistSession *s;
+	const char *new_ip = (new_sess && new_sess->ip) ? new_sess->ip : "*";
+	const char *country_code = "*";
+	const char *country_name = NULL;
+	char asn_buf[24] = "*";
+	const char *asname = NULL;
+	ModDataInfo *geo_md;
+	GeoIPResult *geo = NULL;
+	const char *since;
+	char human[512];
+
+	if (!e || !new_sess)
+		return;
+
+	geo_md = findmoddata_byname("geoip", MODDATATYPE_CLIENT);
+	if (geo_md)
+		geo = (GeoIPResult *)moddata_client(new_sess, geo_md).ptr;
+
+	if (geo)
+	{
+		if (geo->country_code)
+			country_code = geo->country_code;
+		if (geo->country_name)
+			country_name = geo->country_name;
+		if (geo->asn)
+		{
+			snprintf(asn_buf, sizeof(asn_buf), "%u", geo->asn);
+			asname = geo->asname;
+		}
+	}
+
+	since = timestamp_iso8601(TStime());
+
+	/* Build a human-readable description from whichever fields we
+	 * actually have.  Clients without standard-replies rendering
+	 * still get a meaningful single-line message. */
+	if (country_name && asname)
+		snprintf(human, sizeof(human),
+		         "A new session attached to your account from %s (%s, AS%s %s)",
+		         new_ip, country_name, asn_buf, asname);
+	else if (country_name)
+		snprintf(human, sizeof(human),
+		         "A new session attached to your account from %s (%s)",
+		         new_ip, country_name);
+	else
+		snprintf(human, sizeof(human),
+		         "A new session attached to your account from %s",
+		         new_ip);
+
+	/* Canonical first (the user's primary client) */
+	if (e->canonical && e->canonical != new_sess &&
+	    !IsDead(e->canonical) && MyConnect(e->canonical))
+	{
+		sendto_one(e->canonical, NULL,
+		           ":%s NOTE PERSISTENCE NEW_SESSION %s %s %s %s :%s",
+		           me.name, new_ip, country_code, asn_buf, since, human);
+	}
+
+	/* Every other already-attached session */
+	for (s = e->sessions; s; s = s->next)
+	{
+		if (!s->client || s->client == new_sess)
+			continue;
+		if (IsDead(s->client) || !MyConnect(s->client))
+			continue;
+		sendto_one(s->client, NULL,
+		           ":%s NOTE PERSISTENCE NEW_SESSION %s %s %s %s :%s",
+		           me.name, new_ip, country_code, asn_buf, since, human);
+	}
+}
+
+/*
  * Complete the setup of a session client after registration (376).
  * Removes it from the nick hash (so find_client returns canonical),
  * marks it invisible, and sends synthetic channel JOINs.
@@ -841,6 +926,12 @@ static void setup_session(Client *client, PersistEntry *e)
 	}
 
 	add_session(e, client);
+
+	/* Notify canonical + already-attached sessions that a new one
+	 * has joined the account.  IRCv3 standard-replies NOTE so
+	 * standard-replies-aware clients render it as a banner; others
+	 * still see the description text. */
+	notify_existing_sessions_of_new(e, client);
 
 	/* Send synthetic JOINs for each of the canonical's channels */
 	for (mb = e->canonical->user->channel; mb; mb = mb->next)
