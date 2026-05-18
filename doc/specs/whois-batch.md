@@ -59,14 +59,25 @@ WHOIS numeric is introduced by this extension.
 
 ### Capability
 
-Servers that implement this extension MUST advertise the standard
-[`batch`][batch] capability and SHOULD support the
-`obby.world/whois` and `obby.world/whois-session` batch types.
+This extension defines a single client capability:
 
-Clients that wish to receive batched WHOIS MUST negotiate `batch`.
-No additional capability needs to be negotiated; servers SHOULD use
-the batch types unconditionally for clients that have enabled
-`batch`.
+    obby.world/whois
+
+Servers that implement this extension MUST advertise this capability
+and MUST also advertise the standard [`batch`][batch] capability,
+which `obby.world/whois` depends on.
+
+Clients that wish to receive batched WHOIS MUST negotiate BOTH
+`batch` and `obby.world/whois`. Servers MUST NOT emit
+`obby.world/whois` or `obby.world/whois-session` batches to clients
+that have not negotiated this capability, even if the client has
+negotiated `batch`. This is intentional: although the IRCv3
+[`batch`][batch] specification requires consumers to tolerate
+unknown batch types, the per-session sub-batch path emits multiple
+`RPL_WHOISHOST` / `RPL_WHOISMODES` / `RPL_WHOISSECURE` numerics
+per `WHOIS`, and strict RFC 2812 §3.6.2 parsers may discard the
+duplicates. The explicit opt-in lets the server give legacy
+clients exactly one of each numeric.
 
 ### `obby.world/whois` batch
 

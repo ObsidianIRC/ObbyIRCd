@@ -53,6 +53,7 @@ struct WhoisConfig {
 
 /* Global variables */
 WhoisConfig *whoisconfig = NULL;
+static long CAP_OBBY_WHOIS = 0L;
 
 /* Forward declarations */
 WhoisConfigDetails _whois_get_policy(Client *client, Client *target, const char *name);
@@ -71,10 +72,25 @@ MOD_TEST()
 
 MOD_INIT()
 {
+	ClientCapabilityInfo cap;
+
 	MARK_AS_OFFICIAL_MODULE(modinfo);
 	CommandAdd(modinfo->handle, "WHOIS", cmd_whois, MAXPARA, CMD_USER);
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, whois_config_run);
 	whois_config_setdefaults();
+
+	/* Vendor cap opt-in for obby.world/whois + obby.world/whois-session
+	 * batch types.  Without this cap, clients that have only negotiated
+	 * the base `batch` cap continue to get legacy unwrapped numerics --
+	 * we do NOT emit a vendor batch type they didn't ask for, even
+	 * though IRCv3 BATCH requires consumers to tolerate unknown types.
+	 * The sub-batch path emits multiple 378/379/671 per WHOIS, which
+	 * strict RFC 2812 parsers would discard; gating on this cap makes
+	 * the contract explicit.  See doc/specs/whois-batch.md. */
+	memset(&cap, 0, sizeof(cap));
+	cap.name = "obby.world/whois";
+	ClientCapabilityAdd(modinfo->handle, &cap, &CAP_OBBY_WHOIS);
+
 	return MOD_SUCCESS;
 }
 
@@ -364,8 +380,8 @@ static void whois_emit_session_lines(Client *client, Client *target, Client *ses
 	sendto_one(client, mt,
 	           ":%s %d %s %s :is connecting from %s@%s %s",
 	           me.name, RPL_WHOISHOST, client->name, target->name,
-	           (sess->ident && strcmp(sess->ident, "unknown")) ? sess->ident : "*",
-	           (sess->user && sess->user->realhost) ? sess->user->realhost : "",
+	           strcmp(sess->ident, "unknown") ? sess->ident : "*",
+	           sess->user ? sess->user->realhost : "",
 	           sess->ip ? sess->ip : "");
 
 	sendto_one(client, mt,
@@ -777,7 +793,13 @@ CMD_FUNC(cmd_whois)
 		 *   - no `batch`: legacy stream of numerics, plus the
 		 *     trailing 318 outside the loop. */
 		{
-			int use_batch = HasCapability(client, "batch");
+			/* Vendor batch types only when the client has opted in
+			 * with the obby.world/whois cap (which also requires the
+			 * base `batch` cap to be negotiated -- we don't emit
+			 * BATCH frames to non-batch clients regardless of the
+			 * vendor cap). */
+			int use_batch = HasCapability(client, "batch") &&
+			                HasCapability(client, "obby.world/whois");
 			char parent_batch[BATCHLEN+1];
 			Client *sessions[16];
 			int num_sessions = 0;
@@ -856,6 +878,10 @@ CMD_FUNC(cmd_whois)
 
 		free_nvplist(list);
 	}
-	if (!HasCapability(client, "batch"))
+	/* The trailing global 318 is suppressed only for clients that
+	 * actually opted into obby.world/whois -- each parent batch
+	 * already contains its own 318.  Clients without the vendor cap
+	 * still get the legacy single trailing 318. */
+	if (!(HasCapability(client, "batch") && HasCapability(client, "obby.world/whois")))
 		sendnumeric(client, RPL_ENDOFWHOIS, querybuf);
 }
