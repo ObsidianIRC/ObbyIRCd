@@ -731,8 +731,10 @@ int blacklist_start_check(Client *client, int recheck)
 		if (recheck && !bl->recheck)
 			continue; /* blacklist::recheck is no */
 
-		/* Check if user is exempt (then don't bother checking) */
-		if (user_allowed_by_security_group(client, bl->except))
+		/* Check if user is exempt (then don't bother checking).
+		 * Account-aware: if any session of the user's account is in
+		 * the except group, skip blacklist for every session. */
+		if (user_allowed_by_security_group_account(client, bl->except))
 			continue;
 
 		/* Initiate blacklist requests */

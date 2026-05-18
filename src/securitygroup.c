@@ -998,6 +998,72 @@ int user_allowed_by_security_group(Client *client, SecurityGroup *s)
  * @param secgroupname	The name of the security-group to check against
  * @retval 1 if user is allowed by security-group, 0 if not.
  */
+/** Account-aware (union-across-sessions) variant of
+ * user_allowed_by_security_group.  Returns 1 if `client` itself
+ * matches the group OR any other LOCAL client sharing the same
+ * `account_canonical` moddata pointer matches.
+ *
+ * Use this for security-group rendering (WHOIS, JSON log) and for
+ * trust-bypass decisions (anti-flood policy lookup, anti-spam
+ * exceptions, blacklist exceptions, TKL bans:except, etc.) where a
+ * multi-session account legitimately spans different IPs / TLS
+ * states / transports and the user expects "if I'm reachable via TLS
+ * through one of my devices, treat my account as TLS-using".
+ *
+ * Per-connection security boundaries (allow blocks, oper class
+ * match, denychannel match, vhost match, TKL ban match, crule match,
+ * webserver proxy match, nick conf match) keep using the plain
+ * user_allowed_by_security_group: those decisions apply to one
+ * specific TCP connection's properties and aggregating would let
+ * one session's trust state leak into another's gating decision.
+ *
+ * Falls back to per-connection evaluation when the persistence
+ * module isn't loaded (no account_canonical moddata registered) or
+ * the client has no canonical pointer (no persistence account
+ * attached yet -- pre-SASL, pre-001 paths). */
+int user_allowed_by_security_group_account(Client *client, SecurityGroup *s)
+{
+	ModDataInfo *canon_md;
+	Client *canonical, *c;
+
+	if (!s) return 0;
+	if (user_allowed_by_security_group(client, s)) return 1;
+
+	canon_md = findmoddata_byname("account_canonical", MODDATATYPE_CLIENT);
+	if (!canon_md) return 0;
+	canonical = moddata_client(client, canon_md).ptr;
+	if (!canonical) return 0;
+
+	list_for_each_entry(c, &lclient_list, lclient_node)
+	{
+		if (!IsUser(c) || c == client) continue;
+		if (moddata_client(c, canon_md).ptr != canonical) continue;
+		if (user_allowed_by_security_group(c, s)) return 1;
+	}
+	return 0;
+}
+
+int user_allowed_by_security_group_account_name(Client *client, const char *secgroupname)
+{
+	ModDataInfo *canon_md;
+	Client *canonical, *c;
+
+	if (user_allowed_by_security_group_name(client, secgroupname)) return 1;
+
+	canon_md = findmoddata_byname("account_canonical", MODDATATYPE_CLIENT);
+	if (!canon_md) return 0;
+	canonical = moddata_client(client, canon_md).ptr;
+	if (!canonical) return 0;
+
+	list_for_each_entry(c, &lclient_list, lclient_node)
+	{
+		if (!IsUser(c) || c == client) continue;
+		if (moddata_client(c, canon_md).ptr != canonical) continue;
+		if (user_allowed_by_security_group_name(c, secgroupname)) return 1;
+	}
+	return 0;
+}
+
 int user_allowed_by_security_group_name(Client *client, const char *secgroupname)
 {
 	SecurityGroup *s;
@@ -1024,6 +1090,12 @@ int user_allowed_by_security_group_name(Client *client, const char *secgroupname
 
 /** Get comma separated list of matching security groups for 'client'.
  * This is usually only used for displaying purposes.
+ *
+ * Aggregates across the account's sessions when the client has a
+ * persistence-attached canonical: a group is listed if ANY of the
+ * canonical / sessions matches. This matches the multi-session
+ * rendering semantics WHOIS and JSON log use.
+ *
  * @returns string like "unknown-users,tls-users" from a static buffer.
  */
 const char *get_security_groups(Client *client)
@@ -1038,7 +1110,8 @@ const char *get_security_groups(Client *client)
 	 * in the linked list, hence the special code here,
 	 * and again later in the for loop to skip it.
 	 */
-	if (known_users && user_allowed_by_security_group(client, known_users))
+	if (known_users &&
+	    user_allowed_by_security_group_account(client, known_users))
 		strlcat(buf, "known-users,", sizeof(buf));
 	else
 		strlcat(buf, "unknown-users,", sizeof(buf));
@@ -1046,7 +1119,7 @@ const char *get_security_groups(Client *client)
 	for (s = securitygroups; s; s = s->next)
 	{
 		if (strcmp(s->name, "known-users") &&
-		    user_allowed_by_security_group(client, s))
+		    user_allowed_by_security_group_account(client, s))
 		{
 			strlcat(buf, s->name, sizeof(buf));
 			strlcat(buf, ",", sizeof(buf));

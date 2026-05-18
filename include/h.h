@@ -1361,6 +1361,15 @@ extern void set_security_group_defaults(void);
 extern int user_allowed_by_security_group(Client *client, SecurityGroup *s);
 extern int user_allowed_by_security_group_context(Client *client, SecurityGroup *s, crule_context *context);
 extern int user_allowed_by_security_group_name(Client *client, const char *secgroupname);
+/* Account-aware (union-across-sessions) variants of the helpers
+ * above.  Match if EITHER `client` itself matches OR any other local
+ * client sharing the same `account_canonical` moddata pointer
+ * matches.  Used for security-group rendering and trust-bypass
+ * decisions where multi-session accounts should be treated as one
+ * unit; per-connection security boundaries (allow / oper / deny /
+ * vhost / tkl-ban / crule / etc.) keep using the plain helpers above. */
+extern int user_allowed_by_security_group_account(Client *client, SecurityGroup *s);
+extern int user_allowed_by_security_group_account_name(Client *client, const char *secgroupname);
 extern const char *get_security_groups(Client *client);
 extern int test_match_item(ConfigFile *conf, ConfigEntry *cep, int *errors);
 extern int conf_match_item(ConfigFile *conf, ConfigEntry *cep, SecurityGroup **block);

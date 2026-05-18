@@ -187,13 +187,17 @@ void json_expand_client_security_groups(json_t *parent, Client *client)
 	 * in the linked list, hence the special code here,
 	 * and again later in the for loop to skip it.
 	 */
-	if (user_allowed_by_security_group_name(client, "known-users"))
+	/* Account-aware: a multi-session account is reported as a member
+	 * of a group if any of its sessions matches. Matches the WHOIS
+	 * rendering. */
+	if (user_allowed_by_security_group_account_name(client, "known-users"))
 		json_array_append_new(child, json_string_unreal("known-users"));
 	else
 		json_array_append_new(child, json_string_unreal("unknown-users"));
 
 	for (s = securitygroups; s; s = s->next)
-		if (strcmp(s->name, "known-users") && user_allowed_by_security_group(client, s))
+		if (strcmp(s->name, "known-users") &&
+		    user_allowed_by_security_group_account(client, s))
 			json_array_append_new(child, json_string_unreal(s->name));
 }
 

@@ -454,7 +454,8 @@ int _spamreport(Client *client, const char *ip, NameValuePrioList *details, cons
 	if (!s)
 		return 0; /* NOTFOUND */
 
-	if (s->except && client && user_allowed_by_security_group(client, s->except))
+	if (s->except && client &&
+	    user_allowed_by_security_group_account(client, s->except))
 		return 0;
 	// NOTE: 'except' is bypassed for manual SPAMREPORT with an ip and no client.
 

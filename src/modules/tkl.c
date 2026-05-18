@@ -3488,9 +3488,12 @@ static int find_tkl_exception_matcher(Client *client, int ban_type, TKL *except_
 	if (!tkl_banexception_matches_type(except_tkl, ban_type))
 		return 0;
 
-	/* For config file except ban { } we use security groups instead of simple user/host */
+	/* For config file except ban { } we use security groups instead
+	 * of simple user/host.  Account-aware: any session of the user
+	 * matching the except group exempts every session.  The BAN side
+	 * (serverban->match below) intentionally stays per-connection. */
 	if (except_tkl->ptr.banexception->match)
-		return user_allowed_by_security_group(client, except_tkl->ptr.banexception->match);
+		return user_allowed_by_security_group_account(client, except_tkl->ptr.banexception->match);
 
 	tkl_uhost(except_tkl, uhost, sizeof(uhost), NO_SOFT_PREFIX);
 

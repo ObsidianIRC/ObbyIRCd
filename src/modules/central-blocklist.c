@@ -790,8 +790,9 @@ int cbl_is_handshake_finished(Client *client)
 	if (!(client->user && *client->user->username && client->name[0] && IsNotSpoof(client)))
 		return 1;
 
-	/* User is exempt */
-	if (user_allowed_by_security_group(client, cfg.except))
+	/* User is exempt -- account-aware: any session in the except
+	 * group means the user is trusted across all their sessions. */
+	if (user_allowed_by_security_group_account(client, cfg.except))
 		return 1;
 
 	if (!json_object_get(CBL(client)->handshake, "client"))

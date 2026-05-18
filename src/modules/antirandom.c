@@ -905,7 +905,7 @@ static void free_stuff(void)
 /** Is this user exempt from antirandom interventions? */
 static int is_exempt(Client *client)
 {
-	if (user_allowed_by_security_group(client, cfg.except))
+	if (user_allowed_by_security_group_account(client, cfg.except))
 		return 1;
 
 	if (find_tkl_exception(TKL_ANTIRANDOM, client))

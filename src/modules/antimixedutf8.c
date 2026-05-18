@@ -76,7 +76,11 @@ int antimixedutf8_check(Client *client, TextAnalysis *txa, const char **errmsg)
 {
 	int score, retval;
 
-	if (!txa || !MyUser(client) || user_allowed_by_security_group(client, cfg.except))
+	/* Trust the whole account: if any session of a multi-session
+	 * user matches the except group, skip the check on every
+	 * session.  Mirrors the WHOIS rendering semantics. */
+	if (!txa || !MyUser(client) ||
+	    user_allowed_by_security_group_account(client, cfg.except))
 		return HOOK_CONTINUE;
 
 	if ((txa->antimixedutf8_points >= cfg.score) && !find_tkl_exception(TKL_ANTIMIXEDUTF8, client))

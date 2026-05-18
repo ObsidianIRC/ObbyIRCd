@@ -12201,17 +12201,20 @@ DynamicSetOption *get_setting_for_user(Client *client, SetOption opt)
 
 	for (sg = securitygroups; sg; sg = sg->next)
 	{
-		/* Special caching for 'known-users' */
+		/* Special caching for 'known-users'.  Account-aware: the
+		 * lighter anti-flood policy applies if ANY session of the
+		 * account is in known-users; otherwise the strict policy
+		 * applies. */
 		if (!strcmp(sg->name, "known-users"))
 		{
-			in_known_users = user_allowed_by_security_group(client, sg);
+			in_known_users = user_allowed_by_security_group_account(client, sg);
 			if (in_known_users)
 			{
 				if (sg->settings.isset[opt])
 					return &sg->settings.settings[opt];
 			}
 		} else
-		if (user_allowed_by_security_group(client, sg) &&
+		if (user_allowed_by_security_group_account(client, sg) &&
 		    sg->settings.isset[opt])
 		{
 			return &sg->settings.settings[opt];
