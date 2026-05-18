@@ -99,6 +99,7 @@ MODULES= \
 	metadata-db.so \
 	filehost.so \
 	invite-page.so \
+	invitation.so \
 	authtoken.so \
 	smtp.so \
 	emoji.so \
@@ -167,6 +168,18 @@ account-recovery.so: account-recovery.c $(INCLUDES)
 memo.so: memo.c $(INCLUDES)
 	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
 		-o memo.so memo.c -lsqlite3
+
+# invitation opens its own SQLite handle on obsidian.db so it doesn't
+# need a hard link-time dep on account-registration.so's symbols.
+invitation.so: invitation.c $(INCLUDES)
+	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
+		-o invitation.so invitation.c -lsqlite3
+
+# invite-page reads the invitations table for its /i/<share-id> route
+# directly via its own sqlite handle (same DB file, separate handle).
+invite-page.so: invite-page.c $(INCLUDES)
+	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
+		-o invite-page.so invite-page.c -lsqlite3
 
 # read-marker also lives in obsidian.db
 read-marker.so: read-marker.c $(INCLUDES)

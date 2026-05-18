@@ -25,6 +25,71 @@
  * (C) 2026 Valerie Pond / ObsidianIRC contributors. GPLv2+
  */
 #include "unrealircd.h"
+#include "obsidian.h"
+#include <sqlite3.h>
+
+/* invite-page opens its own SQLite handle to obsidian.db.  The
+ * invitation module also opens its own handle to the same file --
+ * SQLite handles concurrent connections natively, so no cross-module
+ * symbol dependency is required and either module can be loaded
+ * independently of the other.  This handle is lazily opened on the
+ * first /i/<share-id> request that needs it; if the database file
+ * doesn't exist or the invitations table hasn't been created (i.e.
+ * the invitation module isn't loaded), /i/ paths just 404. */
+static sqlite3 *ipdb = NULL;
+
+static int ipdb_open(void)
+{
+	if (ipdb) return 1;
+	if (sqlite3_open(OBSIDIAN_DB, &ipdb) != SQLITE_OK)
+	{
+		if (ipdb) { sqlite3_close(ipdb); ipdb = NULL; }
+		return 0;
+	}
+	sqlite3_exec(ipdb, "PRAGMA busy_timeout = 1000;", NULL, NULL, NULL);
+	return 1;
+}
+
+/* Look up a share-id.  Returns 1 if the row was found.  Sets
+ * *out_valid to 1 iff the inviter's account is still registered. */
+static int lookup_share_id(const char *share_id,
+                           char *out_inviter, size_t out_inviter_sz,
+                           char *out_channel, size_t out_channel_sz,
+                           int *out_valid)
+{
+	sqlite3_stmt *stmt;
+	int found = 0;
+
+	if (out_inviter && out_inviter_sz) out_inviter[0] = '\0';
+	if (out_channel && out_channel_sz) out_channel[0] = '\0';
+	if (out_valid) *out_valid = 0;
+	if (!share_id || !*share_id) return 0;
+	if (!ipdb_open()) return 0;
+
+	if (sqlite3_prepare_v2(ipdb,
+	    "SELECT i.inviter_account, COALESCE(i.channel,''), "
+	    "       CASE WHEN a.name IS NOT NULL THEN 1 ELSE 0 END "
+	    "FROM invitations i "
+	    "LEFT JOIN accounts a ON LOWER(a.name) = LOWER(i.inviter_account) "
+	    "WHERE i.share_id = ?",
+	    -1, &stmt, NULL) != SQLITE_OK)
+		return 0;
+	sqlite3_bind_text(stmt, 1, share_id, -1, SQLITE_STATIC);
+	if (sqlite3_step(stmt) == SQLITE_ROW)
+	{
+		const char *inv = (const char *)sqlite3_column_text(stmt, 0);
+		const char *ch  = (const char *)sqlite3_column_text(stmt, 1);
+		int v = sqlite3_column_int(stmt, 2);
+		if (inv && out_inviter && out_inviter_sz)
+			strlcpy(out_inviter, inv, out_inviter_sz);
+		if (ch && out_channel && out_channel_sz)
+			strlcpy(out_channel, ch, out_channel_sz);
+		if (out_valid) *out_valid = v ? 1 : 0;
+		found = 1;
+	}
+	sqlite3_finalize(stmt);
+	return found;
+}
 
 ModuleHeader MOD_HEADER = {
 	"invite-page",
@@ -68,7 +133,9 @@ static int invite_handle_request(Client *client, WebRequest *web);
 static int invite_handle_body(Client *client, WebRequest *web, const char *buf, int len);
 static void invite_send_html(Client *client, int status, const char *html);
 static void invite_send_redirect(Client *client, const char *target);
-static char *build_invite_html(const char *channel /* NULL or "#foo" */);
+static char *build_invite_html(const char *channel /* NULL or "#foo" */,
+                               const char *inviter /* NULL or account name */);
+static char *build_expired_html(void);
 
 /* ===================================================================
  * Module lifecycle
@@ -356,9 +423,46 @@ static int invite_handle_request(Client *client, WebRequest *web)
 
 	if (!strcmp(path, "/"))
 	{
-		char *html = build_invite_html(NULL);
+		char *html = build_invite_html(NULL, NULL);
 		invite_send_html(client, 200, html);
 		safe_free(html);
+		return 0;
+	}
+
+	/* /i/<share-id> -- referrer-attributed invite link minted by the
+	 * INVITATION command.  Resolve the share-id via the invitation
+	 * module's dlsym'd lookup function; if invitation.so isn't
+	 * loaded, /i/ paths 404 like any other unknown route. */
+	if (!strncmp(path, "/i/", 3) && path[3])
+	{
+		char share_id[64];
+		char inviter[NICKLEN + 1] = "";
+		char channel[CHANNELLEN + 4] = "";
+		int valid = 0;
+		int found = 0;
+		size_t L;
+
+		url_decode(share_id, path + 3, sizeof(share_id));
+		L = strlen(share_id);
+		while (L && (share_id[L-1] == '/' || share_id[L-1] == '\n' || share_id[L-1] == '\r'))
+			share_id[--L] = '\0';
+
+		found = lookup_share_id(share_id, inviter, sizeof(inviter),
+		                        channel, sizeof(channel), &valid);
+
+		if (!found || !valid)
+		{
+			char *html = build_expired_html();
+			invite_send_html(client, found ? 410 : 404, html);
+			safe_free(html);
+			return 0;
+		}
+
+		{
+			char *html = build_invite_html(channel[0] ? channel : NULL, inviter);
+			invite_send_html(client, 200, html);
+			safe_free(html);
+		}
 		return 0;
 	}
 
@@ -395,7 +499,7 @@ static int invite_handle_request(Client *client, WebRequest *web)
 			snprintf(channel, sizeof(channel), "#%s", decoded);
 
 		{
-			char *html = build_invite_html(channel);
+			char *html = build_invite_html(channel, NULL);
 			invite_send_html(client, 200, html);
 			safe_free(html);
 		}
@@ -423,7 +527,7 @@ static int invite_handle_body(Client *client, WebRequest *web, const char *buf, 
 /* Allocate ~4KB into a fresh buffer; caller frees. Argument is the
  * channel including its # / & / ^ / $ prefix, or NULL for the
  * generic "join the network" view. */
-static char *build_invite_html(const char *channel)
+static char *build_invite_html(const char *channel, const char *inviter)
 {
 	const char *net = cfg.network_name ? cfg.network_name : "this network";
 	const char *host = cfg.irc_host;
@@ -485,6 +589,8 @@ static char *build_invite_html(const char *channel)
 	    " h1 .net{color:%s}\n"
 	    " .sub{color:#9a9aa3;margin:0 0 28px;font-size:14px;line-height:1.5}\n"
 	    " .chan{display:inline-flex;align-items:center;gap:6px;background:#222530;color:#fff;font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:14px;padding:4px 10px;border-radius:8px;margin:0 4px}\n"
+	    " .by{margin:-4px 0 12px;font-size:13px;color:#a9aab2}\n"
+	    " .by strong{color:#fff}\n"
 	    " .icon{width:72px;height:72px;border-radius:16px;display:block;margin:0 auto 16px;object-fit:cover;background:#222530;box-shadow:0 4px 12px rgba(0,0,0,.3)}\n"
 	    " .btn{display:block;width:100%%;text-align:center;background:%s;color:#fff;text-decoration:none;font-weight:600;font-size:16px;padding:14px 18px;border-radius:10px;margin:0 0 12px;transition:filter .15s}\n"
 	    " .btn:hover{filter:brightness(1.1)}\n"
@@ -525,6 +631,16 @@ static char *build_invite_html(const char *channel)
 	n += snprintf(out + n, cap - n,
 	    "<h1>You're invited to <span class=\"net\">%s</span></h1>\n",
 	    html_escape(net));
+
+	/* Inviter byline (referrer-attributed /i/ flow). When present
+	 * the page reads "Invited by <name>" above the rest of the
+	 * sub-text. */
+	if (inviter && *inviter)
+	{
+		n += snprintf(out + n, cap - n,
+		    "<p class=\"by\">Invited by <strong>%s</strong></p>\n",
+		    html_escape(inviter));
+	}
 
 	if (channel)
 	{
@@ -591,5 +707,44 @@ static char *build_invite_html(const char *channel)
 	    html_escape(host), native_port,
 	    channel ? ", run the join command above" : "");
 
+	return out;
+}
+
+/* Standalone "this invite link has expired" page, served when /i/<share-id>
+ * either has an unknown id (404) or the inviter's account no longer
+ * exists in the accounts table (410 Gone). */
+static char *build_expired_html(void)
+{
+	const char *accent = cfg.accent_color ? cfg.accent_color : "#5865F2";
+	const char *icon = NETWORK_ICON;
+	char *out;
+	size_t cap = 4096;
+	int n;
+
+	out = safe_alloc(cap);
+	n = snprintf(out, cap,
+	    "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+	    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+	    "<title>Invitation expired</title>"
+	    "<style>"
+	    " *{box-sizing:border-box}"
+	    " body{margin:0;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:#0d0e10;color:#e8e8ea;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}"
+	    " .card{max-width:420px;width:100%%;background:#181a1f;border-radius:16px;padding:36px 32px;box-shadow:0 20px 60px rgba(0,0,0,.4);border-top:3px solid %s;text-align:center}"
+	    " .icon{width:64px;height:64px;border-radius:14px;display:block;margin:0 auto 16px;object-fit:cover;background:#222530;filter:grayscale(.5) opacity(.7)}"
+	    " h1{margin:0 0 10px;font-size:20px;font-weight:600;color:#fff}"
+	    " p{margin:0;color:#9a9aa3;font-size:14px;line-height:1.5}"
+	    "</style></head><body><div class=\"card\">",
+	    accent);
+	if (n < 0 || (size_t)n >= cap) return out;
+	if (icon && *icon)
+	{
+		n += snprintf(out + n, cap - n,
+		    "<img class=\"icon\" src=\"%s\" alt=\"\" referrerpolicy=\"no-referrer\">",
+		    html_escape(icon));
+	}
+	n += snprintf(out + n, cap - n,
+	    "<h1>This invitation has expired</h1>"
+	    "<p>The link is no longer valid. The person who created it may no longer have an account on this network.</p>"
+	    "</div></body></html>");
 	return out;
 }
