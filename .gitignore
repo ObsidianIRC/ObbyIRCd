@@ -3,6 +3,7 @@ aclocal.m4
 autom4te.cache
 config.log
 conftest.*
+!tests/**/conftest.py
 config.settings
 extras/pcre2*
 extras/c-ares*
