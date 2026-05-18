@@ -173,6 +173,35 @@ This lets the receiving client render a "multi-session" affordance
 (e.g. a small badge or summary) without exposing IPs, hosts, or TLS
 state of any individual session.
 
+### `obby.world/whois-security-groups` sub-batch
+
+The legacy WHOIS form crams every security-group the target is in
+into a single `320` line as a comma-separated string in the trailing
+("`is in security-groups: known-users,tls-users,websocket-users`"),
+which forces client renderers to either show it as one wall of text
+or split the string heuristically. To give clients a structured
+list, servers emitting the parent `obby.world/whois` batch MUST
+replace the comma-joined `320` line with a nested
+`obby.world/whois-security-groups` sub-batch containing one `320`
+line per group, where the trailing carries only the group name:
+
+    @batch=<parent-ref> :server BATCH +<sg-ref> obby.world/whois-security-groups <count>
+    @batch=<sg-ref> :server 320 <querier> <target> :<group-1>
+    @batch=<sg-ref> :server 320 <querier> <target> :<group-2>
+    ...
+    @batch=<parent-ref> :server BATCH -<sg-ref>
+
+The first parameter of the BATCH open line is the integer count of
+groups. The first group MUST be either `known-users` or
+`unknown-users` (the synthetic "this account is recognised" marker
+that the legacy form leads with).
+
+Security-group membership is evaluated against the target's
+canonical client, so the membership is account-level: every session
+of the account observes the same group set. The legacy
+comma-joined `320` line is NOT emitted to cap-on clients; non-cap
+clients (no `obby.world/whois`) continue to receive it unchanged.
+
 ### Compatibility with RFC 2812
 
 RFC 2812 §3.6.2 states that, with the exception of `RPL_WHOISCHANNELS`,

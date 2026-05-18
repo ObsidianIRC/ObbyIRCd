@@ -505,6 +505,20 @@ CMD_FUNC(cmd_whois)
 		unsigned char showchannel, wilds, hideoper; /* <- these are all boolean-alike */
 		NameValuePrioList *list = NULL;
 		int policy; /* for temporary stuff */
+		/* Structured security-groups list for the obby.world/whois-
+		 * security-groups sub-batch.  Populated alongside the legacy
+		 * nvplist entries when the querier has the obby.world/whois
+		 * cap; emitted as a separate sub-batch inside the parent
+		 * obby.world/whois batch (one line per group, machine-
+		 * readable).  Non-cap clients keep getting the legacy
+		 * comma-separated single-line 320. */
+		struct sg_node {
+			char name[64];
+			struct sg_node *next;
+		} *sg_head = NULL, *sg_tail = NULL;
+		int sg_count = 0;
+		int want_sg_batch = HasCapability(client, "obby.world/whois") &&
+		                    HasCapability(client, "batch");
 
 		if (MyUser(client) && (++ntargets > maxtargets))
 		{
@@ -749,49 +763,88 @@ CMD_FUNC(cmd_whois)
 			}
 		}
 
-		/* The following code deals with security-groups */
+		/* Collect security-groups the target is in.  Two emission
+		 * paths share the same membership computation:
+		 *   - Legacy clients (no obby.world/whois cap): one or more
+		 *     `:server 320 ... :is in security-groups: a,b,c` lines
+		 *     (existing behaviour).
+		 *   - obby.world/whois cap clients: a structured
+		 *     `obby.world/whois-security-groups` sub-batch with one
+		 *     320 line per group (machine-parseable).  The legacy
+		 *     nvplist entries are not added in this case so the line
+		 *     doesn't appear twice. */
 		policy = whois_get_policy(client, target, "security-groups");
 		if ((policy > WHOIS_CONFIG_DETAILS_NONE) && !IsULine(target))
 		{
 			SecurityGroup *s;
-			int security_groups_whois_lines = 0;
 
-			mlen = strlen(me.name) + strlen(client->name) + 10 + strlen(target->name) + strlen("is in security-groups: ");
+			/* "known-users" / "unknown-users" is reported first as a
+			 * synthetic group: existing whois output convention. */
+			const char *known_label =
+			    user_allowed_by_security_group_name(target, "known-users")
+			        ? "known-users"
+			        : "unknown-users";
 
-			if (user_allowed_by_security_group_name(target, "known-users"))
-				strlcpy(buf, "known-users,", sizeof(buf));
-			else
-				strlcpy(buf, "unknown-users,", sizeof(buf));
-			len = strlen(buf);
-
-			for (s = securitygroups; s; s = s->next)
+			if (want_sg_batch)
 			{
-				if (len + strlen(s->name) > (size_t)BUFSIZE - 4 - mlen)
+				struct sg_node *n = safe_alloc(sizeof(struct sg_node));
+				strlcpy(n->name, known_label, sizeof(n->name));
+				if (!sg_head) sg_head = n;
+				else sg_tail->next = n;
+				sg_tail = n;
+				sg_count++;
+				for (s = securitygroups; s; s = s->next)
+				{
+					if (!strcmp(s->name, "known-users")) continue;
+					if (!user_allowed_by_security_group(target, s)) continue;
+					n = safe_alloc(sizeof(struct sg_node));
+					strlcpy(n->name, s->name, sizeof(n->name));
+					if (!sg_head) sg_head = n;
+					else sg_tail->next = n;
+					sg_tail = n;
+					sg_count++;
+				}
+			}
+			else
+			{
+				int security_groups_whois_lines = 0;
+
+				mlen = strlen(me.name) + strlen(client->name) + 10 +
+				       strlen(target->name) + strlen("is in security-groups: ");
+
+				strlcpy(buf, known_label, sizeof(buf));
+				strlcat(buf, ",", sizeof(buf));
+				len = strlen(buf);
+
+				for (s = securitygroups; s; s = s->next)
+				{
+					if (len + strlen(s->name) > (size_t)BUFSIZE - 4 - mlen)
+					{
+						buf[len-1] = '\0';
+						add_nvplist_numeric_fmt(&list, -15000-security_groups_whois_lines, "security-groups",
+						                        target, RPL_WHOISSPECIAL,
+									"%s :is in security-groups: %s", target->name, buf);
+						security_groups_whois_lines++;
+						*buf = '\0';
+						len = 0;
+					}
+					if (strcmp(s->name, "known-users") && user_allowed_by_security_group(target, s))
+					{
+						strcpy(buf + len, s->name);
+						len += strlen(buf+len);
+						strcpy(buf + len, ",");
+						len++;
+					}
+				}
+
+				if (*buf)
 				{
 					buf[len-1] = '\0';
 					add_nvplist_numeric_fmt(&list, -15000-security_groups_whois_lines, "security-groups",
-					                        target, RPL_WHOISSPECIAL,
+					                        client, RPL_WHOISSPECIAL,
 								"%s :is in security-groups: %s", target->name, buf);
 					security_groups_whois_lines++;
-					*buf = '\0';
-					len = 0;
 				}
-				if (strcmp(s->name, "known-users") && user_allowed_by_security_group(target, s))
-				{
-					strcpy(buf + len, s->name);
-					len += strlen(buf+len);
-					strcpy(buf + len, ",");
-					len++;
-				}
-			}
-
-			if (*buf)
-			{
-				buf[len-1] = '\0';
-				add_nvplist_numeric_fmt(&list, -15000-security_groups_whois_lines, "security-groups",
-				                        client, RPL_WHOISSPECIAL,
-							"%s :is in security-groups: %s", target->name, buf);
-				security_groups_whois_lines++;
 			}
 		}
 		if (MyUser(target) && IsShunned(target) && (whois_get_policy(client, target, "shunned") > WHOIS_CONFIG_DETAILS_NONE))
@@ -952,6 +1005,46 @@ CMD_FUNC(cmd_whois)
 				free_message_tags(mt);
 			}
 
+			/* obby.world/whois-security-groups sub-batch: one 320
+			 * line per group as machine-parseable trailing.  Nested
+			 * inside the parent obby.world/whois batch via the
+			 * @batch tag, same as the session sub-batches.  Only
+			 * emitted when use_batch is true; legacy clients got
+			 * the comma-separated form earlier as a regular nvplist
+			 * entry. */
+			if (use_batch && sg_head)
+			{
+				char sg_batch[BATCHLEN+1];
+				MessageTag *mt_outer;
+				MessageTag *mt_inner;
+				struct sg_node *n;
+				char count_buf[16];
+
+				generate_batch_id(sg_batch);
+				snprintf(count_buf, sizeof(count_buf), "%d", sg_count);
+
+				mt_outer = whois_batch_mtag(parent_batch);
+				sendto_one(client, mt_outer,
+				           ":%s BATCH +%s obby.world/whois-security-groups %s",
+				           me.name, sg_batch, count_buf);
+				free_message_tags(mt_outer);
+
+				mt_inner = whois_batch_mtag(sg_batch);
+				for (n = sg_head; n; n = n->next)
+				{
+					sendto_one(client, mt_inner,
+					           ":%s %d %s %s :%s",
+					           me.name, RPL_WHOISSPECIAL, client->name,
+					           target->name, n->name);
+				}
+				free_message_tags(mt_inner);
+
+				mt_outer = whois_batch_mtag(parent_batch);
+				sendto_one(client, mt_outer,
+				           ":%s BATCH -%s", me.name, sg_batch);
+				free_message_tags(mt_outer);
+			}
+
 			if (use_batch)
 			{
 				MessageTag *mt = whois_batch_mtag(parent_batch);
@@ -961,6 +1054,16 @@ CMD_FUNC(cmd_whois)
 				free_message_tags(mt);
 
 				sendto_one(client, NULL, ":%s BATCH -%s", me.name, parent_batch);
+			}
+
+			/* Free the structured security-groups list */
+			{
+				struct sg_node *n, *next;
+				for (n = sg_head; n; n = next)
+				{
+					next = n->next;
+					safe_free(n);
+				}
 			}
 		}
 
