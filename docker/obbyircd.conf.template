@@ -58,6 +58,7 @@ include "snomasks.default.conf";
 include "help/help.conf";
 include "badwords.conf";
 include "spamfilter.conf";
+include "custom-modules.conf";
 
 loadmodule "cloak_sha256";
 
