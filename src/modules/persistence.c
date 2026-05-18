@@ -126,6 +126,9 @@ static CommandOverride *ovr_join = NULL;
 static CommandOverride *ovr_part = NULL;
 static CommandOverride *ovr_away = NULL;
 static CommandOverride *ovr_nick = NULL;
+static CommandOverride *ovr_mode = NULL;
+static CommandOverride *ovr_setname = NULL;
+static CommandOverride *ovr_oper = NULL;
 
 /* ===================================================================
  * Forward declarations
@@ -161,6 +164,8 @@ static int persist_local_join(Client *client, Channel *channel, MessageTag *mtag
 static int persist_local_part(Client *client, Channel *channel, MessageTag *mtags, const char *comment);
 static int persist_local_nickchange(Client *client, MessageTag *mtags, const char *newnick);
 static int persist_local_kick(Client *client, Client *victim, Channel *channel, MessageTag *mtags, const char *comment);
+static int persist_umode_change(Client *client, long oldumodes, long newumodes);
+static void sync_umodes_to_session(Client *canonical, Client *sess);
 static int persist_configrun(ConfigFile *cf, ConfigEntry *ce, int type);
 static int persist_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs);
 CMD_FUNC(cmd_persistence);
@@ -170,6 +175,7 @@ CMD_OVERRIDE_FUNC(session_join_override);
 CMD_OVERRIDE_FUNC(session_part_override);
 CMD_OVERRIDE_FUNC(session_away_override);
 CMD_OVERRIDE_FUNC(session_nick_override);
+CMD_OVERRIDE_FUNC(session_canonical_swap_override);
 EVENT(ghost_cleanup_event);
 EVENT(persist_save_event);
 
@@ -276,6 +282,11 @@ MOD_INIT()
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_PART, 0, persist_local_part);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_KICK, 0, persist_local_kick);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_NICKCHANGE, 0, persist_local_nickchange);
+	/* Mirror canonical umode/snomask changes onto every attached
+	 * session.  Without this, a /MODE +i on the user's primary
+	 * client only flips canonical's umodes; the sessions keep their
+	 * stale flags and the UI on those clients never updates. */
+	HookAdd(modinfo->handle, HOOKTYPE_UMODE_CHANGE, 0, persist_umode_change);
 
 	EventAdd(modinfo->handle, "persist_cleanup", ghost_cleanup_event, NULL,
 	         PERSIST_CLEANUP_INTERVAL_MS, 0);
@@ -300,6 +311,16 @@ MOD_LOAD()
 	ovr_part = CommandOverrideAdd(modinfo->handle, "PART", 0, session_part_override);
 	ovr_away = CommandOverrideAdd(modinfo->handle, "AWAY", 0, session_away_override);
 	ovr_nick = CommandOverrideAdd(modinfo->handle, "NICK", 0, session_nick_override);
+	/* MODE / SETNAME / OPER on a session must run as the canonical
+	 * client so the change applies to the account's network-visible
+	 * identity (and so cmd_umode doesn't trip ERR_USERSDONTMATCH
+	 * because find_user(parv[1]) hits the canonical, not the
+	 * session, since session nicks are removed from the hash).
+	 * Umode + oper privilege changes then sync back to every
+	 * session via the HOOKTYPE_UMODE_CHANGE handler. */
+	ovr_mode = CommandOverrideAdd(modinfo->handle, "MODE", 0, session_canonical_swap_override);
+	ovr_setname = CommandOverrideAdd(modinfo->handle, "SETNAME", 0, session_canonical_swap_override);
+	ovr_oper = CommandOverrideAdd(modinfo->handle, "OPER", 0, session_canonical_swap_override);
 	away_notify_cap = ClientCapabilityBit("away-notify");
 	persist_load_db();
 	return MOD_SUCCESS;
@@ -926,6 +947,13 @@ static void setup_session(Client *client, PersistEntry *e)
 	}
 
 	add_session(e, client);
+
+	/* Mirror canonical's current umodes + snomask onto the new
+	 * session.  Without this, the session inherits whatever umodes
+	 * it had at registration (typically just +i forced by the
+	 * persistence path), and the user sees stale state on their
+	 * second/third client. */
+	sync_umodes_to_session(e->canonical, client);
 
 	/* Notify canonical + already-attached sessions that a new one
 	 * has joined the account.  IRCv3 standard-replies NOTE so
@@ -1602,6 +1630,102 @@ CMD_OVERRIDE_FUNC(session_nick_override)
 	if (is_session_client(client))
 		return; /* Silently block: session nicks are managed by the module */
 	CALL_NEXT_COMMAND_OVERRIDE();
+}
+
+/* MODE / SETNAME / OPER from a session: dispatch as the canonical so
+ * the change applies to the account's network-visible identity.
+ *
+ * Why this is needed for MODE specifically: a session client has its
+ * own Client* (real TCP connection) but its NICK in the hash table
+ * was removed at attach time -- canonical owns the slot.  When a
+ * session sends `MODE Valware +i`, cmd_umode does
+ * find_user("Valware") which returns the canonical, then checks
+ * `acptr != client` and trips ERR_USERSDONTMATCH (502).  Swapping
+ * client to canonical before the next handler runs makes the
+ * permission check pass; the resulting umode change fires
+ * HOOKTYPE_UMODE_CHANGE, and persist_umode_change mirrors the new
+ * umodes/snomask onto every session (including the originator).
+ *
+ * SETNAME and OPER follow the same pattern: the change should be
+ * account-level, applied via the canonical, and propagated.  Sessions
+ * inherit OPER status automatically since the umode-change hook
+ * carries UMODE_OPER along with everything else. */
+CMD_OVERRIDE_FUNC(session_canonical_swap_override)
+{
+	if (is_session_client(client))
+	{
+		PersistEntry *e = find_entry_for_session(client);
+		if (e && e->canonical && IsUser(e->canonical) && !IsDead(e->canonical))
+			client = e->canonical;
+		else
+			return;
+	}
+	CALL_NEXT_COMMAND_OVERRIDE();
+}
+
+/* ===================================================================
+ * Sync canonical's umodes / snomask onto every attached session
+ * =================================================================== */
+
+/* Mirror canonical's umodes + snomask onto a single session, emitting
+ * a `:canonical MODE canonical +-xyz` line to that session if its
+ * effective umodes change so the session's UI updates. Idempotent. */
+static void sync_umodes_to_session(Client *canonical, Client *sess)
+{
+	long old;
+	char buf[512];
+
+	if (!canonical || !sess || !canonical->user || !sess->user)
+		return;
+	if (sess == canonical || IsDead(sess) || !MyConnect(sess))
+		return;
+
+	old = sess->umodes;
+	sess->umodes = canonical->umodes;
+
+	/* Mirror snomask string */
+	if (canonical->user->snomask)
+		safe_strdup(sess->user->snomask, canonical->user->snomask);
+	else
+		safe_free(sess->user->snomask);
+
+	/* Build the +/- diff from the session's previous umodes to the
+	 * new (canonical's) ones and emit a MODE line so the session's
+	 * client UI sees the change. ALL_UMODES so the user sees every
+	 * mode they actually have (cmd_umode uses the same mask when
+	 * notifying the user about their own MODE). */
+	build_umode_string(sess, old, ALL_UMODES, buf);
+	if (*buf)
+	{
+		sendto_one(sess, NULL, ":%s MODE %s :%s",
+		           canonical->name, canonical->name, buf);
+	}
+
+	/* Snomask change has no separate MODE letter — push RPL_SNOMASK
+	 * so an oper session sees their updated snomask. */
+	if (canonical->user->snomask && IsOper(sess))
+		sendnumeric(sess, RPL_SNOMASK, canonical->user->snomask);
+}
+
+/* HOOKTYPE_UMODE_CHANGE handler. Fires whenever any client's umodes
+ * change (cmd_umode, svsmode, oper-up, etc.). When the changing
+ * client is the canonical of a persistence account, mirror the new
+ * umodes onto every attached session. */
+static int persist_umode_change(Client *client, long oldumodes, long newumodes)
+{
+	PersistEntry *e;
+	PersistSession *sess;
+
+	if (!client || !client->user || !IsLoggedIn(client))
+		return 0;
+	e = find_entry(client->user->account);
+	if (!e || e->canonical != client || !e->sessions)
+		return 0;
+
+	for (sess = e->sessions; sess; sess = sess->next)
+		sync_umodes_to_session(client, sess->client);
+
+	return 0;
 }
 
 /* ===================================================================
