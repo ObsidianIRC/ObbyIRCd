@@ -4,14 +4,14 @@
  * Adds two IRC commands and a small SQLite table for tracking
  * inviter -> invitee attribution:
  *
- *   INVITATION [<channel>]
+ *   INVITELINK [<channel>]
  *       Issued by a logged-in user.  Mints a random share-id, stores
  *       it against the inviter's account, and replies with the
  *       full invite URL (uses set::invitation::base-url for the
  *       prefix).  Issuing user MUST have an account if
  *       set::invitation::require-registered is enabled (default).
  *
- *   INVCODE <share-id>
+ *   INVITECODE <share-id>
  *       Issued by a client BEFORE the REGISTER command, when the
  *       user is about to create an account from an invite link.
  *       Stashes the share-id on the client's connection as
@@ -53,7 +53,7 @@ static sqlite3 *inv_db = NULL;
 ModuleHeader MOD_HEADER = {
 	"invitation",
 	"1.0",
-	"INVITATION + INVCODE commands; tracks inviter -> invitee attribution",
+	"INVITELINK + INVITECODE commands; tracks inviter -> invitee attribution",
 	"obbyircd",
 	"unrealircd-6",
 };
@@ -65,7 +65,7 @@ ModuleHeader MOD_HEADER = {
 #define INVITATION_SHARE_ID_LEN 12
 
 static struct {
-	int require_registered; /* gate INVITATION command behind login */
+	int require_registered; /* gate INVITELINK command behind login */
 	int single_use_default;
 	int max_per_account;
 	char *base_url;         /* e.g. 'https://invite.example.com:6661/i/' */
@@ -76,7 +76,7 @@ static struct {
 	.base_url = NULL,
 };
 
-/* Per-client moddata: the share-id the client claimed via INVCODE,
+/* Per-client moddata: the share-id the client claimed via INVITECODE,
  * pending application on HOOKTYPE_ACCOUNT_LOGIN. */
 static ModDataInfo *pending_md = NULL;
 static long CAP_INVITATION = 0L;
@@ -122,8 +122,8 @@ MOD_INIT()
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_QUIT, 0, invitation_local_quit);
 	HookAdd(modinfo->handle, HOOKTYPE_WHOIS, 0, invitation_whois);
 
-	CommandAdd(modinfo->handle, "INVITATION", cmd_invitation, MAXPARA, CMD_USER);
-	CommandAdd(modinfo->handle, "INVCODE", cmd_invcode, MAXPARA, CMD_USER | CMD_UNREGISTERED);
+	CommandAdd(modinfo->handle, "INVITELINK", cmd_invitation, MAXPARA, CMD_USER);
+	CommandAdd(modinfo->handle, "INVITECODE", cmd_invcode, MAXPARA, CMD_USER | CMD_UNREGISTERED);
 
 	memset(&mdi, 0, sizeof(mdi));
 	mdi.name = "invitation_pending";
@@ -137,7 +137,7 @@ MOD_INIT()
 	}
 
 	/* Advertise capability so clients know the server supports the
-	 * INVCODE / INVITATION protocol. */
+	 * INVITECODE / INVITELINK protocol. */
 	memset(&cap, 0, sizeof(cap));
 	cap.name = "obby.world/invitation";
 	ClientCapabilityAdd(modinfo->handle, &cap, &CAP_INVITATION);
@@ -396,15 +396,15 @@ int invitation_lookup_v1(const char *share_id, char *out_inviter, size_t out_inv
 }
 
 /* ===================================================================
- * INVITATION command dispatcher
+ * INVITELINK command dispatcher
  *
  * Syntax:
- *   INVITATION                       -- alias for LIST
- *   INVITATION LIST
- *   INVITATION CREATE [<channel>]
- *   INVITATION DELETE <share-id>
+ *   INVITELINK                       -- alias for LIST
+ *   INVITELINK LIST
+ *   INVITELINK CREATE [<channel>]
+ *   INVITELINK DELETE <share-id>
  *
- * Backward compat: `INVITATION <#channel>` (first arg starts with a
+ * Backward compat: `INVITELINK <#channel>` (first arg starts with a
  * channel sigil) is treated as CREATE so existing scripts that
  * predate the subcommand split keep working.
  * =================================================================== */
@@ -451,7 +451,7 @@ CMD_FUNC(cmd_invitation)
 		if (parc < 3 || BadPtr(parv[2]))
 		{
 			sendto_one(client, NULL,
-			    ":%s FAIL INVITATION INVALID_PARAMS :Syntax: /INVITATION DELETE <share-id>",
+			    ":%s FAIL INVITELINK INVALID_PARAMS :Syntax: /INVITELINK DELETE <share-id>",
 			    me.name);
 			return;
 		}
@@ -460,7 +460,7 @@ CMD_FUNC(cmd_invitation)
 	}
 
 	sendto_one(client, NULL,
-	    ":%s FAIL INVITATION INVALID_PARAMS :Subcommand must be CREATE, LIST, or DELETE.",
+	    ":%s FAIL INVITELINK INVALID_PARAMS :Subcommand must be CREATE, LIST, or DELETE.",
 	    me.name);
 }
 
@@ -491,7 +491,7 @@ static void inv_do_create(Client *client, const char *channel_raw)
 	if (!account)
 	{
 		sendto_one(client, NULL,
-		    ":%s FAIL INVITATION NOT_AUTHORISED :You must be logged in to create invitations.",
+		    ":%s FAIL INVITELINK NOT_AUTHORISED :You must be logged in to create invitations.",
 		    me.name);
 		return;
 	}
@@ -502,14 +502,14 @@ static void inv_do_create(Client *client, const char *channel_raw)
 		    *channel_raw != '^' && *channel_raw != '$')
 		{
 			sendto_one(client, NULL,
-			    ":%s FAIL INVITATION INVALID_CHANNEL %s :Channel must start with # & ^ or $.",
+			    ":%s FAIL INVITELINK INVALID_CHANNEL %s :Channel must start with # & ^ or $.",
 			    me.name, channel_raw);
 			return;
 		}
 		if (strlen(channel_raw) > CHANNELLEN)
 		{
 			sendto_one(client, NULL,
-			    ":%s FAIL INVITATION INVALID_CHANNEL :Channel name too long.",
+			    ":%s FAIL INVITELINK INVALID_CHANNEL :Channel name too long.",
 			    me.name);
 			return;
 		}
@@ -520,7 +520,7 @@ static void inv_do_create(Client *client, const char *channel_raw)
 	    invitation_count_for_account(account) >= cfg.max_per_account)
 	{
 		sendto_one(client, NULL,
-		    ":%s FAIL INVITATION QUOTA_EXCEEDED :You have reached the max %d invitations.",
+		    ":%s FAIL INVITELINK QUOTA_EXCEEDED :You have reached the max %d invitations.",
 		    me.name, cfg.max_per_account);
 		return;
 	}
@@ -528,7 +528,7 @@ static void inv_do_create(Client *client, const char *channel_raw)
 	if (!inv_db)
 	{
 		sendto_one(client, NULL,
-		    ":%s FAIL INVITATION SERVER_BUG :Invitation database unavailable.",
+		    ":%s FAIL INVITELINK SERVER_BUG :Invitation database unavailable.",
 		    me.name);
 		return;
 	}
@@ -563,7 +563,7 @@ static void inv_do_create(Client *client, const char *channel_raw)
 		if (!inserted)
 		{
 			sendto_one(client, NULL,
-			    ":%s FAIL INVITATION SERVER_BUG :Failed to record invitation.",
+			    ":%s FAIL INVITELINK SERVER_BUG :Failed to record invitation.",
 			    me.name);
 			return;
 		}
@@ -577,27 +577,27 @@ static void inv_do_create(Client *client, const char *channel_raw)
 	/* Machine-readable parameter-positional reply. */
 	if (channel)
 		sendto_one(client, NULL,
-		    ":%s INVITATION %s %s :%s",
+		    ":%s INVITELINK %s %s :%s",
 		    me.name, share_id, channel, url_buf);
 	else
 		sendto_one(client, NULL,
-		    ":%s INVITATION %s * :%s",
+		    ":%s INVITELINK %s * :%s",
 		    me.name, share_id, url_buf);
 
 	/* IRCv3 standard-replies NOTE so cap-aware clients can render
 	 * the link nicely. */
 	sendto_one(client, NULL,
-	    ":%s NOTE INVITATION CREATED %s %s :Invitation link: %s",
+	    ":%s NOTE INVITELINK CREATED %s %s :Invitation link: %s",
 	    me.name, share_id, channel ? channel : "*", url_buf);
 }
 
-/* INVITATION LIST: enumerate the caller's invitations.
+/* INVITELINK LIST: enumerate the caller's invitations.
  *
  * Wire format: one line per row, plus a final NOTE terminator.
  *
- *   :server INVITATION ENTRY <share-id> <channel|*> <created-iso8601> <redeem-count>
+ *   :server INVITELINK ENTRY <share-id> <channel|*> <created-iso8601> <redeem-count>
  *   ...
- *   :server NOTE INVITATION LIST_END * :End of invitation list. */
+ *   :server NOTE INVITELINK LIST_END * :End of invitation list. */
 static void inv_do_list(Client *client)
 {
 	const char *account = inv_owner_for(client);
@@ -607,14 +607,14 @@ static void inv_do_list(Client *client)
 	if (!account)
 	{
 		sendto_one(client, NULL,
-		    ":%s FAIL INVITATION NOT_AUTHORISED :You must be logged in to list invitations.",
+		    ":%s FAIL INVITELINK NOT_AUTHORISED :You must be logged in to list invitations.",
 		    me.name);
 		return;
 	}
 	if (!inv_db)
 	{
 		sendto_one(client, NULL,
-		    ":%s FAIL INVITATION SERVER_BUG :Invitation database unavailable.",
+		    ":%s FAIL INVITELINK SERVER_BUG :Invitation database unavailable.",
 		    me.name);
 		return;
 	}
@@ -628,7 +628,7 @@ static void inv_do_list(Client *client)
 	    -1, &stmt, NULL) != SQLITE_OK)
 	{
 		sendto_one(client, NULL,
-		    ":%s FAIL INVITATION SERVER_BUG :Database error.", me.name);
+		    ":%s FAIL INVITELINK SERVER_BUG :Database error.", me.name);
 		return;
 	}
 	sqlite3_bind_text(stmt, 1, account, -1, SQLITE_STATIC);
@@ -641,7 +641,7 @@ static void inv_do_list(Client *client)
 		int         redeems  = sqlite3_column_int(stmt, 3);
 		const char *iso      = timestamp_iso8601((time_t)created);
 		sendto_one(client, NULL,
-		    ":%s INVITATION ENTRY %s %s %s %d",
+		    ":%s INVITELINK ENTRY %s %s %s %d",
 		    me.name, share_id,
 		    (channel && *channel) ? channel : "*",
 		    iso, redeems);
@@ -650,11 +650,11 @@ static void inv_do_list(Client *client)
 	sqlite3_finalize(stmt);
 
 	sendto_one(client, NULL,
-	    ":%s NOTE INVITATION LIST_END * :End of invitation list (%d %s).",
+	    ":%s NOTE INVITELINK LIST_END * :End of invitation list (%d %s).",
 	    me.name, count, count == 1 ? "entry" : "entries");
 }
 
-/* INVITATION DELETE <share-id> -- caller must own the share-id
+/* INVITELINK DELETE <share-id> -- caller must own the share-id
  * (LOWER-cased account match).  IRC operators can delete anyone's
  * invitation via the same command. */
 static void inv_do_delete(Client *client, const char *share_id)
@@ -666,14 +666,14 @@ static void inv_do_delete(Client *client, const char *share_id)
 	if (!account)
 	{
 		sendto_one(client, NULL,
-		    ":%s FAIL INVITATION NOT_AUTHORISED :You must be logged in to delete invitations.",
+		    ":%s FAIL INVITELINK NOT_AUTHORISED :You must be logged in to delete invitations.",
 		    me.name);
 		return;
 	}
 	if (!inv_db)
 	{
 		sendto_one(client, NULL,
-		    ":%s FAIL INVITATION SERVER_BUG :Invitation database unavailable.",
+		    ":%s FAIL INVITELINK SERVER_BUG :Invitation database unavailable.",
 		    me.name);
 		return;
 	}
@@ -685,7 +685,7 @@ static void inv_do_delete(Client *client, const char *share_id)
 		    -1, &stmt, NULL) != SQLITE_OK)
 		{
 			sendto_one(client, NULL,
-			    ":%s FAIL INVITATION SERVER_BUG :Database error.", me.name);
+			    ":%s FAIL INVITELINK SERVER_BUG :Database error.", me.name);
 			return;
 		}
 		sqlite3_bind_text(stmt, 1, share_id, -1, SQLITE_STATIC);
@@ -697,7 +697,7 @@ static void inv_do_delete(Client *client, const char *share_id)
 		    -1, &stmt, NULL) != SQLITE_OK)
 		{
 			sendto_one(client, NULL,
-			    ":%s FAIL INVITATION SERVER_BUG :Database error.", me.name);
+			    ":%s FAIL INVITELINK SERVER_BUG :Database error.", me.name);
 			return;
 		}
 		sqlite3_bind_text(stmt, 1, share_id, -1, SQLITE_STATIC);
@@ -711,13 +711,13 @@ static void inv_do_delete(Client *client, const char *share_id)
 	if (affected <= 0)
 	{
 		sendto_one(client, NULL,
-		    ":%s FAIL INVITATION NOT_FOUND %s :No matching invitation owned by you.",
+		    ":%s FAIL INVITELINK NOT_FOUND %s :No matching invitation owned by you.",
 		    me.name, share_id);
 		return;
 	}
 
 	sendto_one(client, NULL,
-	    ":%s NOTE INVITATION DELETED %s :Invitation deleted.",
+	    ":%s NOTE INVITELINK DELETED %s :Invitation deleted.",
 	    me.name, share_id);
 
 	/* Also delete the redemption history rows for tidy bookkeeping. */
@@ -732,7 +732,7 @@ static void inv_do_delete(Client *client, const char *share_id)
 }
 
 /* ===================================================================
- * INVCODE command (pre-REGISTER)
+ * INVITECODE command (pre-REGISTER)
  * =================================================================== */
 
 static void pending_md_free(ModData *md)
@@ -754,7 +754,7 @@ CMD_FUNC(cmd_invcode)
 	if (parc < 2 || BadPtr(parv[1]))
 	{
 		sendto_one(client, NULL,
-		    ":%s FAIL INVCODE INVALID_PARAMS :Syntax: /INVCODE <share-id>", me.name);
+		    ":%s FAIL INVITECODE INVALID_PARAMS :Syntax: /INVITECODE <share-id>", me.name);
 		return;
 	}
 	code = parv[1];
@@ -762,7 +762,7 @@ CMD_FUNC(cmd_invcode)
 	if (IsLoggedIn(client))
 	{
 		sendto_one(client, NULL,
-		    ":%s FAIL INVCODE ALREADY_REGISTERED :Invite codes are only consumed during account registration.",
+		    ":%s FAIL INVITECODE ALREADY_REGISTERED :Invite codes are only consumed during account registration.",
 		    me.name);
 		return;
 	}
@@ -771,14 +771,14 @@ CMD_FUNC(cmd_invcode)
 	                          channel, sizeof(channel), &valid))
 	{
 		sendto_one(client, NULL,
-		    ":%s FAIL INVCODE INVALID_CODE %s :Unknown invitation code.",
+		    ":%s FAIL INVITECODE INVALID_CODE %s :Unknown invitation code.",
 		    me.name, code);
 		return;
 	}
 	if (!valid)
 	{
 		sendto_one(client, NULL,
-		    ":%s FAIL INVCODE EXPIRED %s :This invitation has expired (inviter account no longer registered).",
+		    ":%s FAIL INVITECODE EXPIRED %s :This invitation has expired (inviter account no longer registered).",
 		    me.name, code);
 		return;
 	}
@@ -791,7 +791,7 @@ CMD_FUNC(cmd_invcode)
 	}
 
 	sendto_one(client, NULL,
-	    ":%s NOTE INVCODE ACCEPTED %s %s :Invitation code accepted; proceed with REGISTER.",
+	    ":%s NOTE INVITECODE ACCEPTED %s %s :Invitation code accepted; proceed with REGISTER.",
 	    me.name, code, channel[0] ? channel : "*");
 }
 
@@ -850,7 +850,7 @@ static int invitation_account_login(Client *client, MessageTag *mtags)
 			sqlite3_finalize(stmt);
 		}
 
-		unreal_log(ULOG_INFO, "invitation", "INVITATION_REDEEMED", client,
+		unreal_log(ULOG_INFO, "invitation", "INVITELINK_REDEEMED", client,
 		           "Account $account registered via invitation $code",
 		           log_data_string("account", account),
 		           log_data_string("code", code));
