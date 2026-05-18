@@ -270,6 +270,7 @@ static void invitation_create_tables(void)
 	    "  share_id TEXT PRIMARY KEY,"
 	    "  inviter_account TEXT NOT NULL,"
 	    "  channel TEXT,"
+	    "  description TEXT,"
 	    "  created_at INTEGER NOT NULL,"
 	    "  single_use INTEGER NOT NULL DEFAULT 0"
 	    ");"
@@ -290,6 +291,13 @@ static void invitation_create_tables(void)
 		             errmsg ? errmsg : "(unknown)");
 		sqlite3_free(errmsg);
 	}
+	/* Migration: existing pre-description deployments have an
+	 * `invitations` table without the description column.  Add it
+	 * idempotently -- SQLite errors with "duplicate column" if the
+	 * column already exists, which we silently swallow. */
+	sqlite3_exec(inv_db,
+	    "ALTER TABLE invitations ADD COLUMN description TEXT;",
+	    NULL, NULL, NULL);
 }
 
 /* Returns 1 if an account row exists in the accounts table.  Used to
@@ -409,7 +417,7 @@ int invitation_lookup_v1(const char *share_id, char *out_inviter, size_t out_inv
  * predate the subcommand split keep working.
  * =================================================================== */
 
-static void inv_do_create(Client *client, const char *channel);
+static void inv_do_create(Client *client, const char *channel, const char *description);
 static void inv_do_list(Client *client);
 static void inv_do_delete(Client *client, const char *share_id);
 
@@ -431,13 +439,51 @@ CMD_FUNC(cmd_invitation)
 
 	if (!strcasecmp(sub, "CREATE_LEGACY"))
 	{
-		inv_do_create(client, parv[1]);
+		/* Legacy: INVITELINK <#channel> -- no description argument
+		 * was possible in this form.  Preserved for back-compat. */
+		inv_do_create(client, parv[1], NULL);
 		return;
 	}
 	if (!strcasecmp(sub, "CREATE"))
 	{
-		const char *channel = (parc >= 3 && !BadPtr(parv[2])) ? parv[2] : NULL;
-		inv_do_create(client, channel);
+		/* INVITELINK CREATE [<channel>|*] [:<description>]
+		 *
+		 *   parv[2] = channel ("*" means generic) or absent
+		 *   parv[3] = optional human-readable description (trailing)
+		 *
+		 * Backward-compat shorthand: when parv[2] is a single
+		 * trailing param that doesn't start with a channel sigil
+		 * we treat it as the description with no channel. */
+		const char *channel = NULL;
+		const char *description = NULL;
+		if (parc >= 3 && !BadPtr(parv[2]))
+		{
+			char first = parv[2][0];
+			if (first == '#' || first == '&' || first == '^' || first == '$')
+			{
+				channel = parv[2];
+				if (parc >= 4 && !BadPtr(parv[3]))
+					description = parv[3];
+			}
+			else if (!strcmp(parv[2], "*"))
+			{
+				if (parc >= 4 && !BadPtr(parv[3]))
+					description = parv[3];
+			}
+			else if (parc == 3)
+			{
+				/* `INVITELINK CREATE :Description text` */
+				description = parv[2];
+			}
+			else
+			{
+				sendto_one(client, NULL,
+				    ":%s FAIL INVITELINK INVALID_CHANNEL %s :Channel must start with # & ^ $ or be \"*\".",
+				    me.name, parv[2]);
+				return;
+			}
+		}
+		inv_do_create(client, channel, description);
 		return;
 	}
 	if (!strcasecmp(sub, "LIST"))
@@ -479,10 +525,17 @@ static const char *inv_owner_for(Client *client)
 	return client->name;
 }
 
-static void inv_do_create(Client *client, const char *channel_raw)
+/* Reasonable cap on free-form invite descriptions.  Long enough for
+ * a sentence-and-a-half, short enough that a malicious user can't
+ * stuff a giant blob into the SQLite row. */
+#define INVITELINK_DESCRIPTION_MAX 200
+
+static void inv_do_create(Client *client, const char *channel_raw,
+                          const char *description_raw)
 {
 	const char *account;
 	const char *channel = NULL;
+	const char *description = NULL;
 	char share_id[INVITATION_SHARE_ID_LEN + 1];
 	char url_buf[512];
 	sqlite3_stmt *stmt;
@@ -516,6 +569,32 @@ static void inv_do_create(Client *client, const char *channel_raw)
 		channel = channel_raw;
 	}
 
+	if (description_raw && *description_raw)
+	{
+		if (strlen(description_raw) > INVITELINK_DESCRIPTION_MAX)
+		{
+			sendto_one(client, NULL,
+			    ":%s FAIL INVITELINK INVALID_DESCRIPTION :Description too long (max %d).",
+			    me.name, INVITELINK_DESCRIPTION_MAX);
+			return;
+		}
+		/* Reject control characters so the trailing on the wire
+		 * stays parseable and stored rows don't contain CR/LF that
+		 * could fracture later IRC lines. */
+		{
+			const char *p;
+			for (p = description_raw; *p; p++)
+				if ((unsigned char)*p < 0x20)
+				{
+					sendto_one(client, NULL,
+					    ":%s FAIL INVITELINK INVALID_DESCRIPTION :Description may not contain control characters.",
+					    me.name);
+					return;
+				}
+		}
+		description = description_raw;
+	}
+
 	if (cfg.max_per_account > 0 &&
 	    invitation_count_for_account(account) >= cfg.max_per_account)
 	{
@@ -544,8 +623,8 @@ static void inv_do_create(Client *client, const char *channel_raw)
 			generate_share_id(share_id, sizeof(share_id));
 
 			if (sqlite3_prepare_v2(inv_db,
-			    "INSERT INTO invitations (share_id, inviter_account, channel, created_at, single_use) "
-			    "VALUES (?, ?, ?, ?, ?)",
+			    "INSERT INTO invitations (share_id, inviter_account, channel, description, created_at, single_use) "
+			    "VALUES (?, ?, ?, ?, ?, ?)",
 			    -1, &stmt, NULL) != SQLITE_OK)
 				break;
 			sqlite3_bind_text(stmt, 1, share_id, -1, SQLITE_STATIC);
@@ -554,8 +633,12 @@ static void inv_do_create(Client *client, const char *channel_raw)
 				sqlite3_bind_text(stmt, 3, channel, -1, SQLITE_STATIC);
 			else
 				sqlite3_bind_null(stmt, 3);
-			sqlite3_bind_int(stmt, 4, (int)TStime());
-			sqlite3_bind_int(stmt, 5, cfg.single_use_default ? 1 : 0);
+			if (description)
+				sqlite3_bind_text(stmt, 4, description, -1, SQLITE_STATIC);
+			else
+				sqlite3_bind_null(stmt, 4);
+			sqlite3_bind_int(stmt, 5, (int)TStime());
+			sqlite3_bind_int(stmt, 6, cfg.single_use_default ? 1 : 0);
 			if (sqlite3_step(stmt) == SQLITE_DONE)
 				inserted = 1;
 			sqlite3_finalize(stmt);
@@ -595,13 +678,17 @@ static void inv_do_create(Client *client, const char *channel_raw)
  *
  * Wire format: one line per row, plus a final NOTE terminator.
  *
- *   :server INVITELINK ENTRY <share-id> <channel|*> <created-iso8601> <redeem-count> :<url>
+ *   :server INVITELINK ENTRY <share-id> <channel|*> <created-iso8601> <redeem-count> <url> [:<description>]
  *   ...
  *   :server NOTE INVITELINK LIST_END * :End of invitation list.
  *
- * The trailing :<url> repeats the share-id with the configured
+ * The <url> positional repeats the share-id with the configured
  * set::invitation::base-url prefix so a client can render a copy-to-
- * clipboard button without having to rebuild the URL itself. */
+ * clipboard button without having to rebuild the URL itself.
+ *
+ * The optional :<description> trailing carries the human-readable
+ * label the user supplied to INVITELINK CREATE.  Omitted when the
+ * row has no description. */
 static void inv_do_list(Client *client)
 {
 	const char *account = inv_owner_for(client);
@@ -625,7 +712,8 @@ static void inv_do_list(Client *client)
 
 	if (sqlite3_prepare_v2(inv_db,
 	    "SELECT i.share_id, COALESCE(i.channel,''), i.created_at, "
-	    "       (SELECT COUNT(*) FROM invitation_redemptions r WHERE r.share_id = i.share_id) "
+	    "       (SELECT COUNT(*) FROM invitation_redemptions r WHERE r.share_id = i.share_id), "
+	    "       COALESCE(i.description,'') "
 	    "FROM invitations i "
 	    "WHERE LOWER(i.inviter_account) = LOWER(?) "
 	    "ORDER BY i.created_at DESC",
@@ -643,17 +731,25 @@ static void inv_do_list(Client *client)
 		const char *channel  = (const char *)sqlite3_column_text(stmt, 1);
 		int         created  = sqlite3_column_int(stmt, 2);
 		int         redeems  = sqlite3_column_int(stmt, 3);
+		const char *descr    = (const char *)sqlite3_column_text(stmt, 4);
 		const char *iso      = timestamp_iso8601((time_t)created);
 		char url_buf[512];
 		if (cfg.base_url && *cfg.base_url)
 			snprintf(url_buf, sizeof(url_buf), "%s%s", cfg.base_url, share_id);
 		else
 			snprintf(url_buf, sizeof(url_buf), "%s", share_id);
-		sendto_one(client, NULL,
-		    ":%s INVITELINK ENTRY %s %s %s %d :%s",
-		    me.name, share_id,
-		    (channel && *channel) ? channel : "*",
-		    iso, redeems, url_buf);
+		if (descr && *descr)
+			sendto_one(client, NULL,
+			    ":%s INVITELINK ENTRY %s %s %s %d %s :%s",
+			    me.name, share_id,
+			    (channel && *channel) ? channel : "*",
+			    iso, redeems, url_buf, descr);
+		else
+			sendto_one(client, NULL,
+			    ":%s INVITELINK ENTRY %s %s %s %d %s",
+			    me.name, share_id,
+			    (channel && *channel) ? channel : "*",
+			    iso, redeems, url_buf);
 		count++;
 	}
 	sqlite3_finalize(stmt);
