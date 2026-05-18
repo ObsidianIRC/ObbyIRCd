@@ -151,6 +151,12 @@ else
     echo "Reusing existing config (delete $FIRST_RUN_MARKER to regenerate)"
 fi
 
+# Splice the custom-modules include into already-rendered configs so
+# pre-existing conf volumes pick up the loadmodule wiring.
+if [ -f "$CONFIG_FILE" ] && ! grep -q '^include "custom-modules.conf";' "$CONFIG_FILE"; then
+    printf '\ninclude "custom-modules.conf";\n' >> "$CONFIG_FILE"
+fi
+
 # obbyscript autoloads every *.js it finds in $CONFDIR/scripts/.
 # Make sure the directory exists so the module doesn't log a warning
 # on every restart even when the operator hasn't placed any scripts.
@@ -163,8 +169,10 @@ chown obbyircd:obbyircd "$DATA_DIR" "$LOGS_DIR" "$TLS_DIR" 2>/dev/null || true
 chown obbyircd:obbyircd "$CONF_DIR/scripts" 2>/dev/null || true
 chown obbyircd:obbyircd "$OPER_PASSWORD_FILE" 2>/dev/null || true
 
-# Compile any user-dropped custom modules.  Failures are logged and
-# the server still starts.
+# Rewritten every boot so removed sources don't leave dangling
+# loadmodule lines.
+CUSTOM_MOD_CONF="$CONF_DIR/custom-modules.conf"
+: > "$CUSTOM_MOD_CONF.tmp"
 if [ -d "$CUSTOM_MOD_DIR" ]; then
     for src in "$CUSTOM_MOD_DIR"/*.c; do
         [ -f "$src" ] || continue
@@ -177,11 +185,14 @@ if [ -d "$CUSTOM_MOD_DIR" ]; then
             -I"$SOURCE_TREE/include" -I"$SOURCE_TREE" \
             $(pkg-config --cflags openssl 2>/dev/null || true); then
             echo "  -> $out"
+            echo "loadmodule \"third/${modname}\";" >> "$CUSTOM_MOD_CONF.tmp"
         else
             echo "  WARNING: $modname failed to compile, skipping"
         fi
     done
 fi
+mv "$CUSTOM_MOD_CONF.tmp" "$CUSTOM_MOD_CONF"
+chown obbyircd:obbyircd "$CUSTOM_MOD_CONF" 2>/dev/null || true
 
 cd /home/obbyircd/obby
 
