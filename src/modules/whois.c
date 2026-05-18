@@ -188,6 +188,14 @@ static void whois_config_setdefaults(void)
 
 	whois_config_add("security-groups", WHOIS_CONFIG_USER_OPER, WHOIS_CONFIG_DETAILS_FULL);
 
+	/* "Referred by <inviter>" line emitted by the invitation module
+	 * via HOOKTYPE_WHOIS.  Default: self + oper see it, everyone
+	 * else doesn't.  Leaks social-graph info if broadcast publicly,
+	 * but the user themselves should know who vouched for them and
+	 * opers want it for moderation context. */
+	whois_config_add("referral", WHOIS_CONFIG_USER_SELF, WHOIS_CONFIG_DETAILS_FULL);
+	whois_config_add("referral", WHOIS_CONFIG_USER_OPER, WHOIS_CONFIG_DETAILS_FULL);
+
 	whois_config_add("geo", WHOIS_CONFIG_USER_OPER, WHOIS_CONFIG_DETAILS_FULL);
 
 	whois_config_add("asn", WHOIS_CONFIG_USER_OPER, WHOIS_CONFIG_DETAILS_FULL);

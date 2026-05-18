@@ -90,6 +90,7 @@ static int invitation_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int 
 static int invitation_configrun(ConfigFile *cf, ConfigEntry *ce, int type);
 static int invitation_account_login(Client *client, MessageTag *mtags);
 static int invitation_local_quit(Client *client, MessageTag *mtags, const char *comment);
+static int invitation_whois(Client *client, Client *target, NameValuePrioList **list);
 static void pending_md_free(ModData *md);
 static void invitation_create_tables(void);
 static int generate_share_id(char *out, size_t n);
@@ -119,6 +120,7 @@ MOD_INIT()
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, invitation_configrun);
 	HookAdd(modinfo->handle, HOOKTYPE_ACCOUNT_LOGIN, 0, invitation_account_login);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_QUIT, 0, invitation_local_quit);
+	HookAdd(modinfo->handle, HOOKTYPE_WHOIS, 0, invitation_whois);
 
 	CommandAdd(modinfo->handle, "INVITATION", cmd_invitation, MAXPARA, CMD_USER);
 	CommandAdd(modinfo->handle, "INVCODE", cmd_invcode, MAXPARA, CMD_USER | CMD_UNREGISTERED);
@@ -394,10 +396,90 @@ int invitation_lookup_v1(const char *share_id, char *out_inviter, size_t out_inv
 }
 
 /* ===================================================================
- * INVITATION command
+ * INVITATION command dispatcher
+ *
+ * Syntax:
+ *   INVITATION                       -- alias for LIST
+ *   INVITATION LIST
+ *   INVITATION CREATE [<channel>]
+ *   INVITATION DELETE <share-id>
+ *
+ * Backward compat: `INVITATION <#channel>` (first arg starts with a
+ * channel sigil) is treated as CREATE so existing scripts that
+ * predate the subcommand split keep working.
  * =================================================================== */
 
+static void inv_do_create(Client *client, const char *channel);
+static void inv_do_list(Client *client);
+static void inv_do_delete(Client *client, const char *share_id);
+
 CMD_FUNC(cmd_invitation)
+{
+	const char *sub;
+
+	if (!MyUser(client))
+		return;
+
+	/* Resolve the effective subcommand. */
+	if (parc < 2 || BadPtr(parv[1]))
+		sub = "LIST";
+	else if (parv[1][0] == '#' || parv[1][0] == '&' ||
+	         parv[1][0] == '^' || parv[1][0] == '$')
+		sub = "CREATE_LEGACY"; /* dispatched below */
+	else
+		sub = parv[1];
+
+	if (!strcasecmp(sub, "CREATE_LEGACY"))
+	{
+		inv_do_create(client, parv[1]);
+		return;
+	}
+	if (!strcasecmp(sub, "CREATE"))
+	{
+		const char *channel = (parc >= 3 && !BadPtr(parv[2])) ? parv[2] : NULL;
+		inv_do_create(client, channel);
+		return;
+	}
+	if (!strcasecmp(sub, "LIST"))
+	{
+		inv_do_list(client);
+		return;
+	}
+	if (!strcasecmp(sub, "DELETE") || !strcasecmp(sub, "DEL") ||
+	    !strcasecmp(sub, "REMOVE"))
+	{
+		if (parc < 3 || BadPtr(parv[2]))
+		{
+			sendto_one(client, NULL,
+			    ":%s FAIL INVITATION INVALID_PARAMS :Syntax: /INVITATION DELETE <share-id>",
+			    me.name);
+			return;
+		}
+		inv_do_delete(client, parv[2]);
+		return;
+	}
+
+	sendto_one(client, NULL,
+	    ":%s FAIL INVITATION INVALID_PARAMS :Subcommand must be CREATE, LIST, or DELETE.",
+	    me.name);
+}
+
+/* Helper: return the calling client's "owner account" string for
+ * invitation rows.  Logged-in users use their account; everyone else
+ * uses their nick when require-registered is off.  Returns NULL when
+ * the caller isn't allowed to mint/own invitations. */
+static const char *inv_owner_for(Client *client)
+{
+	const char *acct = (client->user && IsLoggedIn(client)) ?
+	    client->user->account : NULL;
+	if (acct && *acct)
+		return acct;
+	if (cfg.require_registered)
+		return NULL;
+	return client->name;
+}
+
+static void inv_do_create(Client *client, const char *channel_raw)
 {
 	const char *account;
 	const char *channel = NULL;
@@ -405,43 +487,33 @@ CMD_FUNC(cmd_invitation)
 	char url_buf[512];
 	sqlite3_stmt *stmt;
 
-	if (!MyUser(client))
-		return;
-
-	account = (client->user && IsLoggedIn(client)) ? client->user->account : NULL;
-	if (cfg.require_registered && (!account || !*account))
+	account = inv_owner_for(client);
+	if (!account)
 	{
 		sendto_one(client, NULL,
 		    ":%s FAIL INVITATION NOT_AUTHORISED :You must be logged in to create invitations.",
 		    me.name);
 		return;
 	}
-	if (!account || !*account)
-	{
-		/* Allow anonymous invites when require-registered is off,
-		 * but stamp them against the literal nick.  Probably not
-		 * what most admins want; leaving it as a knob. */
-		account = client->name;
-	}
 
-	if (parc > 1 && parv[1] && *parv[1])
+	if (channel_raw && *channel_raw)
 	{
-		const char *c = parv[1];
-		if (*c != '#' && *c != '&' && *c != '^' && *c != '$')
+		if (*channel_raw != '#' && *channel_raw != '&' &&
+		    *channel_raw != '^' && *channel_raw != '$')
 		{
 			sendto_one(client, NULL,
 			    ":%s FAIL INVITATION INVALID_CHANNEL %s :Channel must start with # & ^ or $.",
-			    me.name, c);
+			    me.name, channel_raw);
 			return;
 		}
-		if (strlen(c) > CHANNELLEN)
+		if (strlen(channel_raw) > CHANNELLEN)
 		{
 			sendto_one(client, NULL,
 			    ":%s FAIL INVITATION INVALID_CHANNEL :Channel name too long.",
 			    me.name);
 			return;
 		}
-		channel = c;
+		channel = channel_raw;
 	}
 
 	if (cfg.max_per_account > 0 &&
@@ -502,7 +574,7 @@ CMD_FUNC(cmd_invitation)
 	else
 		snprintf(url_buf, sizeof(url_buf), "%s", share_id);
 
-	/* Machine-readable reply (parsable parameters first) */
+	/* Machine-readable parameter-positional reply. */
 	if (channel)
 		sendto_one(client, NULL,
 		    ":%s INVITATION %s %s :%s",
@@ -517,6 +589,146 @@ CMD_FUNC(cmd_invitation)
 	sendto_one(client, NULL,
 	    ":%s NOTE INVITATION CREATED %s %s :Invitation link: %s",
 	    me.name, share_id, channel ? channel : "*", url_buf);
+}
+
+/* INVITATION LIST: enumerate the caller's invitations.
+ *
+ * Wire format: one line per row, plus a final NOTE terminator.
+ *
+ *   :server INVITATION ENTRY <share-id> <channel|*> <created-iso8601> <redeem-count>
+ *   ...
+ *   :server NOTE INVITATION LIST_END * :End of invitation list. */
+static void inv_do_list(Client *client)
+{
+	const char *account = inv_owner_for(client);
+	sqlite3_stmt *stmt;
+	int count = 0;
+
+	if (!account)
+	{
+		sendto_one(client, NULL,
+		    ":%s FAIL INVITATION NOT_AUTHORISED :You must be logged in to list invitations.",
+		    me.name);
+		return;
+	}
+	if (!inv_db)
+	{
+		sendto_one(client, NULL,
+		    ":%s FAIL INVITATION SERVER_BUG :Invitation database unavailable.",
+		    me.name);
+		return;
+	}
+
+	if (sqlite3_prepare_v2(inv_db,
+	    "SELECT i.share_id, COALESCE(i.channel,''), i.created_at, "
+	    "       (SELECT COUNT(*) FROM invitation_redemptions r WHERE r.share_id = i.share_id) "
+	    "FROM invitations i "
+	    "WHERE LOWER(i.inviter_account) = LOWER(?) "
+	    "ORDER BY i.created_at DESC",
+	    -1, &stmt, NULL) != SQLITE_OK)
+	{
+		sendto_one(client, NULL,
+		    ":%s FAIL INVITATION SERVER_BUG :Database error.", me.name);
+		return;
+	}
+	sqlite3_bind_text(stmt, 1, account, -1, SQLITE_STATIC);
+
+	while (sqlite3_step(stmt) == SQLITE_ROW)
+	{
+		const char *share_id = (const char *)sqlite3_column_text(stmt, 0);
+		const char *channel  = (const char *)sqlite3_column_text(stmt, 1);
+		int         created  = sqlite3_column_int(stmt, 2);
+		int         redeems  = sqlite3_column_int(stmt, 3);
+		const char *iso      = timestamp_iso8601((time_t)created);
+		sendto_one(client, NULL,
+		    ":%s INVITATION ENTRY %s %s %s %d",
+		    me.name, share_id,
+		    (channel && *channel) ? channel : "*",
+		    iso, redeems);
+		count++;
+	}
+	sqlite3_finalize(stmt);
+
+	sendto_one(client, NULL,
+	    ":%s NOTE INVITATION LIST_END * :End of invitation list (%d %s).",
+	    me.name, count, count == 1 ? "entry" : "entries");
+}
+
+/* INVITATION DELETE <share-id> -- caller must own the share-id
+ * (LOWER-cased account match).  IRC operators can delete anyone's
+ * invitation via the same command. */
+static void inv_do_delete(Client *client, const char *share_id)
+{
+	const char *account = inv_owner_for(client);
+	sqlite3_stmt *stmt;
+	int affected = 0;
+
+	if (!account)
+	{
+		sendto_one(client, NULL,
+		    ":%s FAIL INVITATION NOT_AUTHORISED :You must be logged in to delete invitations.",
+		    me.name);
+		return;
+	}
+	if (!inv_db)
+	{
+		sendto_one(client, NULL,
+		    ":%s FAIL INVITATION SERVER_BUG :Invitation database unavailable.",
+		    me.name);
+		return;
+	}
+
+	if (IsOper(client))
+	{
+		if (sqlite3_prepare_v2(inv_db,
+		    "DELETE FROM invitations WHERE share_id = ?",
+		    -1, &stmt, NULL) != SQLITE_OK)
+		{
+			sendto_one(client, NULL,
+			    ":%s FAIL INVITATION SERVER_BUG :Database error.", me.name);
+			return;
+		}
+		sqlite3_bind_text(stmt, 1, share_id, -1, SQLITE_STATIC);
+	}
+	else
+	{
+		if (sqlite3_prepare_v2(inv_db,
+		    "DELETE FROM invitations WHERE share_id = ? AND LOWER(inviter_account) = LOWER(?)",
+		    -1, &stmt, NULL) != SQLITE_OK)
+		{
+			sendto_one(client, NULL,
+			    ":%s FAIL INVITATION SERVER_BUG :Database error.", me.name);
+			return;
+		}
+		sqlite3_bind_text(stmt, 1, share_id, -1, SQLITE_STATIC);
+		sqlite3_bind_text(stmt, 2, account, -1, SQLITE_STATIC);
+	}
+
+	if (sqlite3_step(stmt) == SQLITE_DONE)
+		affected = sqlite3_changes(inv_db);
+	sqlite3_finalize(stmt);
+
+	if (affected <= 0)
+	{
+		sendto_one(client, NULL,
+		    ":%s FAIL INVITATION NOT_FOUND %s :No matching invitation owned by you.",
+		    me.name, share_id);
+		return;
+	}
+
+	sendto_one(client, NULL,
+	    ":%s NOTE INVITATION DELETED %s :Invitation deleted.",
+	    me.name, share_id);
+
+	/* Also delete the redemption history rows for tidy bookkeeping. */
+	if (sqlite3_prepare_v2(inv_db,
+	    "DELETE FROM invitation_redemptions WHERE share_id = ?",
+	    -1, &stmt, NULL) == SQLITE_OK)
+	{
+		sqlite3_bind_text(stmt, 1, share_id, -1, SQLITE_STATIC);
+		sqlite3_step(stmt);
+		sqlite3_finalize(stmt);
+	}
 }
 
 /* ===================================================================
@@ -660,6 +872,53 @@ static int invitation_local_quit(Client *client, MessageTag *mtags, const char *
 			safe_free(md->str);
 			md->str = NULL;
 		}
+	}
+	return 0;
+}
+
+/* ===================================================================
+ * WHOIS referral line
+ *
+ * Adds ":target :was referred by <inviter>" to the WHOIS reply when
+ * the target has an attribution row in invitation_redemptions.
+ * Gated through set::whois-details::referral.  Default policy in
+ * whois.c is self + oper full (everyone none) -- the referral leaks
+ * social-graph info so we don't broadcast it.
+ * =================================================================== */
+static int invitation_whois(Client *client, Client *target, NameValuePrioList **list)
+{
+	const char *target_account;
+	sqlite3_stmt *stmt;
+	char inviter[NICKLEN + 1] = "";
+
+	if (!inv_db || !target->user) return 0;
+	target_account = target->user->account;
+	if (!target_account || !*target_account || !strcmp(target_account, "0"))
+		return 0;
+	if (whois_get_policy(client, target, "referral") <= WHOIS_CONFIG_DETAILS_NONE)
+		return 0;
+
+	if (sqlite3_prepare_v2(inv_db,
+	    "SELECT i.inviter_account "
+	    "FROM invitation_redemptions r "
+	    "JOIN invitations i ON i.share_id = r.share_id "
+	    "WHERE LOWER(r.account_name) = LOWER(?) "
+	    "ORDER BY r.redeemed_at ASC LIMIT 1",
+	    -1, &stmt, NULL) != SQLITE_OK)
+		return 0;
+	sqlite3_bind_text(stmt, 1, target_account, -1, SQLITE_STATIC);
+	if (sqlite3_step(stmt) == SQLITE_ROW)
+	{
+		const char *inv = (const char *)sqlite3_column_text(stmt, 0);
+		if (inv) strlcpy(inviter, inv, sizeof(inviter));
+	}
+	sqlite3_finalize(stmt);
+
+	if (*inviter)
+	{
+		add_nvplist_numeric_fmt(list, -10000, "referral", client, RPL_WHOISSPECIAL,
+		                        "%s :was referred by %s",
+		                        target->name, inviter);
 	}
 	return 0;
 }
