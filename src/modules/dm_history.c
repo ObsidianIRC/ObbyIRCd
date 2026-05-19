@@ -346,19 +346,63 @@ static int dmh_resolve_bound(const char *timestamp, const char *msgid,
 	return 0;
 }
 
-/* Send one stored line wrapped in the chathistory batch. */
-static void dmh_send_line(Client *client, const char *line, const char *batchid)
+/* Build the mtag list every replayed line needs:
+ *   - time=<ISO-8601 ms>: required for the client to surface server-time
+ *     instead of "now" against history rows
+ *   - msgid=<id>: lets the client dedupe a history row against an in-memory
+ *     copy of the same message; without it, the client appends and the user
+ *     sees the same line twice
+ *   - batch=<id>: links the line to the CHATHISTORY batch we're sending
+ * Returns a fresh MessageTag* the caller must free_message_tags(). */
+static MessageTag *dmh_build_mtags(const char *msgid, long long ts_ms,
+                                    const char *batchid)
 {
-	if (BadPtr(batchid))
+	MessageTag *head = NULL;
+
+	/* time tag -- ISO-8601 with millisecond precision, UTC. */
 	{
-		sendto_one(client, NULL, "%s", line);
-		return;
+		time_t secs = (time_t)(ts_ms / 1000);
+		int ms = (int)(ts_ms % 1000);
+		struct tm t;
+		gmtime_r(&secs, &t);
+		char buf[40];
+		snprintf(buf, sizeof(buf),
+		         "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+		         t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+		         t.tm_hour, t.tm_min, t.tm_sec, ms);
+		MessageTag *m = safe_alloc(sizeof(MessageTag));
+		safe_strdup(m->name, "time");
+		safe_strdup(m->value, buf);
+		AddListItem(m, head);
 	}
-	MessageTag *m = safe_alloc(sizeof(MessageTag));
-	safe_strdup(m->name, "batch");
-	safe_strdup(m->value, batchid);
-	sendto_one(client, m, "%s", line);
-	free_message_tags(m);
+
+	if (msgid && *msgid)
+	{
+		MessageTag *m = safe_alloc(sizeof(MessageTag));
+		safe_strdup(m->name, "msgid");
+		safe_strdup(m->value, msgid);
+		AddListItem(m, head);
+	}
+
+	if (batchid && *batchid)
+	{
+		MessageTag *m = safe_alloc(sizeof(MessageTag));
+		safe_strdup(m->name, "batch");
+		safe_strdup(m->value, batchid);
+		AddListItem(m, head);
+	}
+
+	return head;
+}
+
+/* Send one stored line with reconstructed time/msgid/batch mtags. */
+static void dmh_send_line_with_tags(Client *client, const char *line,
+                                     const char *msgid, long long ts_ms,
+                                     const char *batchid)
+{
+	MessageTag *mtags = dmh_build_mtags(msgid, ts_ms, batchid);
+	sendto_one(client, mtags, "%s", line);
+	free_message_tags(mtags);
 }
 
 /* Open a chathistory BATCH for the given target and return its id in
@@ -453,7 +497,7 @@ static void dmh_send_history(Client *client, const char *target_nick,
 		{
 			sqlite3_stmt *st = NULL;
 			const char *q =
-				"SELECT line FROM dm_history "
+				"SELECT line, msgid, ts_ms FROM dm_history "
 				"WHERE account_a=? AND account_b=? AND ts_ms<? "
 				"ORDER BY ts_ms DESC LIMIT ?";
 			if (sqlite3_prepare_v2(dmh_db, q, -1, &st, NULL) == SQLITE_OK)
@@ -462,19 +506,26 @@ static void dmh_send_history(Client *client, const char *target_nick,
 				sqlite3_bind_text(st, 2, acc_b, -1, SQLITE_TRANSIENT);
 				sqlite3_bind_int64(st, 3, a_ms);
 				sqlite3_bind_int(st, 4, half);
-				/* Collect into a temporary array and emit in reverse. */
 				char *lines[DMH_MAX_LIMIT];
+				char *msgids[DMH_MAX_LIMIT];
+				long long tss[DMH_MAX_LIMIT];
 				int n = 0;
 				while (sqlite3_step(st) == SQLITE_ROW && n < DMH_MAX_LIMIT)
 				{
 					const unsigned char *l = sqlite3_column_text(st, 0);
-					lines[n++] = strdup((const char *)l);
+					const unsigned char *mid = sqlite3_column_text(st, 1);
+					lines[n] = strdup((const char *)l);
+					msgids[n] = mid ? strdup((const char *)mid) : NULL;
+					tss[n] = sqlite3_column_int64(st, 2);
+					n++;
 				}
 				sqlite3_finalize(st);
 				for (int i = n - 1; i >= 0; i--)
 				{
-					dmh_send_line(client, lines[i], batch);
+					dmh_send_line_with_tags(client, lines[i],
+					                        msgids[i], tss[i], batch);
 					free(lines[i]);
+					if (msgids[i]) free(msgids[i]);
 				}
 			}
 		}
@@ -482,7 +533,7 @@ static void dmh_send_history(Client *client, const char *target_nick,
 		{
 			sqlite3_stmt *st = NULL;
 			const char *q =
-				"SELECT line FROM dm_history "
+				"SELECT line, msgid, ts_ms FROM dm_history "
 				"WHERE account_a=? AND account_b=? AND ts_ms>=? "
 				"ORDER BY ts_ms ASC LIMIT ?";
 			if (sqlite3_prepare_v2(dmh_db, q, -1, &st, NULL) == SQLITE_OK)
@@ -494,7 +545,11 @@ static void dmh_send_history(Client *client, const char *target_nick,
 				while (sqlite3_step(st) == SQLITE_ROW)
 				{
 					const unsigned char *l = sqlite3_column_text(st, 0);
-					dmh_send_line(client, (const char *)l, batch);
+					const unsigned char *mid = sqlite3_column_text(st, 1);
+					long long ts = sqlite3_column_int64(st, 2);
+					dmh_send_line_with_tags(client, (const char *)l,
+					                        mid ? (const char *)mid : NULL,
+					                        ts, batch);
 				}
 				sqlite3_finalize(st);
 			}
@@ -510,7 +565,7 @@ static void dmh_send_history(Client *client, const char *target_nick,
 		long long lo = a_ms < b_ms ? a_ms : b_ms;
 		long long hi = a_ms < b_ms ? b_ms : a_ms;
 		snprintf(query, sizeof(query),
-		         "SELECT line, ts_ms FROM dm_history "
+		         "SELECT line, msgid, ts_ms FROM dm_history "
 		         "WHERE account_a=? AND account_b=? "
 		         "  AND ts_ms>=%lld AND ts_ms<=%lld "
 		         "ORDER BY ts_ms ASC LIMIT %d",
@@ -519,23 +574,15 @@ static void dmh_send_history(Client *client, const char *target_nick,
 	else if (use_a_lt)
 	{
 		snprintf(query, sizeof(query),
-		         "SELECT line, ts_ms FROM dm_history "
+		         "SELECT line, msgid, ts_ms FROM dm_history "
 		         "WHERE account_a=? AND account_b=? AND ts_ms<%lld "
 		         "ORDER BY ts_ms %s LIMIT %d",
 		         a_ms, sql_order_inner, limit);
 	}
-	else if (use_a_gt && filter->cmd == HFC_LATEST)
+	else if (use_a_gt) /* LATEST anchored or AFTER */
 	{
 		snprintf(query, sizeof(query),
-		         "SELECT line, ts_ms FROM dm_history "
-		         "WHERE account_a=? AND account_b=? AND ts_ms>%lld "
-		         "ORDER BY ts_ms %s LIMIT %d",
-		         a_ms, sql_order_inner, limit);
-	}
-	else if (use_a_gt) /* AFTER */
-	{
-		snprintf(query, sizeof(query),
-		         "SELECT line, ts_ms FROM dm_history "
+		         "SELECT line, msgid, ts_ms FROM dm_history "
 		         "WHERE account_a=? AND account_b=? AND ts_ms>%lld "
 		         "ORDER BY ts_ms %s LIMIT %d",
 		         a_ms, sql_order_inner, limit);
@@ -543,7 +590,7 @@ static void dmh_send_history(Client *client, const char *target_nick,
 	else /* LATEST with no anchor -> grab tail */
 	{
 		snprintf(query, sizeof(query),
-		         "SELECT line, ts_ms FROM dm_history "
+		         "SELECT line, msgid, ts_ms FROM dm_history "
 		         "WHERE account_a=? AND account_b=? "
 		         "ORDER BY ts_ms %s LIMIT %d",
 		         sql_order_inner, limit);
@@ -562,16 +609,24 @@ static void dmh_send_history(Client *client, const char *target_nick,
 		/* We pulled most-recent-N descending; flip to ascending for
 		 * the client so messages render top-to-bottom in time order. */
 		char *lines[DMH_MAX_LIMIT];
+		char *msgids[DMH_MAX_LIMIT];
+		long long tss[DMH_MAX_LIMIT];
 		int n = 0;
 		while (sqlite3_step(st) == SQLITE_ROW && n < DMH_MAX_LIMIT)
 		{
 			const unsigned char *l = sqlite3_column_text(st, 0);
-			lines[n++] = strdup((const char *)l);
+			const unsigned char *mid = sqlite3_column_text(st, 1);
+			lines[n] = strdup((const char *)l);
+			msgids[n] = mid ? strdup((const char *)mid) : NULL;
+			tss[n] = sqlite3_column_int64(st, 2);
+			n++;
 		}
 		for (int i = n - 1; i >= 0; i--)
 		{
-			dmh_send_line(client, lines[i], batch);
+			dmh_send_line_with_tags(client, lines[i],
+			                        msgids[i], tss[i], batch);
 			free(lines[i]);
+			if (msgids[i]) free(msgids[i]);
 		}
 	}
 	else
@@ -579,7 +634,11 @@ static void dmh_send_history(Client *client, const char *target_nick,
 		while (sqlite3_step(st) == SQLITE_ROW)
 		{
 			const unsigned char *l = sqlite3_column_text(st, 0);
-			dmh_send_line(client, (const char *)l, batch);
+			const unsigned char *mid = sqlite3_column_text(st, 1);
+			long long ts = sqlite3_column_int64(st, 2);
+			dmh_send_line_with_tags(client, (const char *)l,
+			                        mid ? (const char *)mid : NULL,
+			                        ts, batch);
 		}
 	}
 	sqlite3_finalize(st);
