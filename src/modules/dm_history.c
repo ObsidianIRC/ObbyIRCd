@@ -46,6 +46,7 @@ ModuleHeader MOD_HEADER
 
 static sqlite3 *dmh_db = NULL;
 static CommandOverride *dmh_ovr = NULL;
+static CommandOverride *dmh_redact_ovr = NULL;
 
 /* Forward decls */
 static int dmh_open_db(void);
@@ -54,6 +55,7 @@ static int dmh_ensure_schema(void);
 static int dmh_usermsg(Client *client, Client *to, MessageTag *mtags,
                        const char *text, SendType sendtype);
 CMD_OVERRIDE_FUNC(dmh_chathistory_override);
+CMD_OVERRIDE_FUNC(dmh_redact_override);
 
 MOD_INIT()
 {
@@ -85,6 +87,16 @@ MOD_LOAD()
 		             "is chathistory.so loaded ahead of dm_history.so?");
 		return MOD_FAILED;
 	}
+	/* REDACT override -- gives draft/message-redaction a DM code path
+	 * alongside the channel path the upstream redact.so handles. */
+	dmh_redact_ovr = CommandOverrideAdd(modinfo->handle, "REDACT", 0,
+	                                    dmh_redact_override);
+	if (!dmh_redact_ovr)
+	{
+		config_error("dm_history: CommandOverrideAdd(REDACT) failed -- "
+		             "is redact.so loaded ahead of dm_history.so?");
+		return MOD_FAILED;
+	}
 	return MOD_SUCCESS;
 }
 
@@ -93,6 +105,9 @@ MOD_UNLOAD()
 	if (dmh_ovr)
 		CommandOverrideDel(dmh_ovr);
 	dmh_ovr = NULL;
+	if (dmh_redact_ovr)
+		CommandOverrideDel(dmh_redact_ovr);
+	dmh_redact_ovr = NULL;
 	dmh_close_db();
 	return MOD_SUCCESS;
 }
@@ -934,4 +949,192 @@ CMD_OVERRIDE_FUNC(dmh_chathistory_override)
 
 	free(other_acc);
 	dmh_filter_free(filter);
+}
+
+/* ------------------------------------------------------------------
+ * REDACT override -- DM redactions for account-holders
+ * ------------------------------------------------------------------ */
+
+/* Send a REDACT line to a single recipient if they have negotiated
+ * draft/message-redaction.  If `with_reason` is set, includes the
+ * trailing reason. */
+static void dmh_send_redact_one(Client *recipient, Client *sender,
+                                 const char *target_nick,
+                                 const char *msgid, const char *reason)
+{
+	if (!recipient || !MyConnect(recipient))
+		return;
+	if (!HasCapability(recipient, "draft/message-redaction"))
+		return;
+	if (reason && *reason)
+	{
+		sendto_prefix_one(recipient, sender, NULL,
+		                  ":%s REDACT %s %s :%s",
+		                  sender->name, target_nick, msgid, reason);
+	}
+	else
+	{
+		sendto_prefix_one(recipient, sender, NULL,
+		                  ":%s REDACT %s %s",
+		                  sender->name, target_nick, msgid);
+	}
+}
+
+/* Send REDACT to every currently-connected client whose account
+ * matches `account`.  Used to fan a DM redact out to all of the
+ * sender's sessions AND all of the recipient's sessions.  The
+ * `sender_client` is the actual originating Client; we still
+ * deliver to that one (the user expects to see the redact landed
+ * in the conversation they triggered it from). */
+static void dmh_fan_redact_to_account(Client *sender_client,
+                                       const char *account,
+                                       const char *target_nick,
+                                       const char *msgid,
+                                       const char *reason)
+{
+	Client *acptr;
+	list_for_each_entry(acptr, &lclient_list, lclient_node)
+	{
+		if (!IsUser(acptr) || !IsLoggedIn(acptr))
+			continue;
+		if (strcasecmp(acptr->user->account, account))
+			continue;
+		dmh_send_redact_one(acptr, sender_client, target_nick, msgid, reason);
+	}
+}
+
+CMD_OVERRIDE_FUNC(dmh_redact_override)
+{
+	if (!MyUser(client) || parc < 3 || BadPtr(parv[1]) || BadPtr(parv[2]))
+	{
+		CALL_NEXT_COMMAND_OVERRIDE();
+		return;
+	}
+
+	/* Channel target -> hand straight off to upstream redact.so. */
+	const char *target = parv[1];
+	if (target[0] == '#' || target[0] == '&' ||
+	    target[0] == '^' || target[0] == '$')
+	{
+		CALL_NEXT_COMMAND_OVERRIDE();
+		return;
+	}
+
+	/* Nick target: only account-holders can REDACT a DM, since we
+	 * only have history for messages between two account-holders. */
+	if (!IsLoggedIn(client))
+	{
+		sendto_one(client, NULL,
+		           ":%s FAIL REDACT REDACT_FORBIDDEN %s %s "
+		           ":You must be logged in to redact DMs",
+		           me.name, parv[1], parv[2]);
+		return;
+	}
+
+	char *other_acc = dmh_account_for_target(target);
+	if (!other_acc)
+	{
+		/* Could be offline / unregistered.  Fall back to upstream so
+		 * the user gets the existing error path. */
+		CALL_NEXT_COMMAND_OVERRIDE();
+		return;
+	}
+
+	const char *acc_a, *acc_b;
+	dmh_pair(client->user->account, other_acc, &acc_a, &acc_b);
+
+	/* Look up the row.  We need sender_account + line so we can both
+	 * authorise (sender or oper) and broadcast back the right
+	 * source nick on the REDACT line. */
+	sqlite3_stmt *st = NULL;
+	const char *q =
+		"SELECT sender_account, line FROM dm_history "
+		"WHERE account_a=? AND account_b=? AND msgid=?";
+	if (sqlite3_prepare_v2(dmh_db, q, -1, &st, NULL) != SQLITE_OK)
+	{
+		free(other_acc);
+		sendto_one(client, NULL,
+		           ":%s FAIL REDACT UNKNOWN_MSGID %s %s "
+		           ":Internal error looking up message",
+		           me.name, parv[1], parv[2]);
+		return;
+	}
+	sqlite3_bind_text(st, 1, acc_a, -1, SQLITE_TRANSIENT);
+	sqlite3_bind_text(st, 2, acc_b, -1, SQLITE_TRANSIENT);
+	sqlite3_bind_text(st, 3, parv[2], -1, SQLITE_TRANSIENT);
+
+	int rc = sqlite3_step(st);
+	if (rc != SQLITE_ROW)
+	{
+		sqlite3_finalize(st);
+		free(other_acc);
+		sendto_one(client, NULL,
+		           ":%s FAIL REDACT UNKNOWN_MSGID %s %s "
+		           ":This message does not exist or is too old",
+		           me.name, parv[1], parv[2]);
+		return;
+	}
+	const char *sender_account = (const char *)sqlite3_column_text(st, 0);
+	const char *line = (const char *)sqlite3_column_text(st, 1);
+	char *sender_account_dup = sender_account ? strdup(sender_account) : NULL;
+	char *line_dup = line ? strdup(line) : NULL;
+	sqlite3_finalize(st);
+
+	/* Authorise: requester is sender, OR has chat:redact oper perm. */
+	int is_oper =
+		ValidatePermissionsForPath("chat:redact", client, NULL, NULL, NULL);
+	int is_sender = sender_account_dup
+		? !strcasecmp(sender_account_dup, client->user->account)
+		: 0;
+	if (!is_sender && !is_oper)
+	{
+		sendto_one(client, NULL,
+		           ":%s FAIL REDACT REDACT_FORBIDDEN %s %s "
+		           ":You can only redact your own DMs",
+		           me.name, parv[1], parv[2]);
+		if (sender_account_dup) free(sender_account_dup);
+		if (line_dup) free(line_dup);
+		free(other_acc);
+		return;
+	}
+
+	/* Delete the row.  We physically remove rather than mark redacted
+	 * so a subsequent CHATHISTORY LATEST doesn't replay the redacted
+	 * content. */
+	{
+		sqlite3_stmt *del = NULL;
+		const char *dq =
+			"DELETE FROM dm_history "
+			"WHERE account_a=? AND account_b=? AND msgid=?";
+		if (sqlite3_prepare_v2(dmh_db, dq, -1, &del, NULL) == SQLITE_OK)
+		{
+			sqlite3_bind_text(del, 1, acc_a, -1, SQLITE_TRANSIENT);
+			sqlite3_bind_text(del, 2, acc_b, -1, SQLITE_TRANSIENT);
+			sqlite3_bind_text(del, 3, parv[2], -1, SQLITE_TRANSIENT);
+			sqlite3_step(del);
+			sqlite3_finalize(del);
+		}
+	}
+
+	const char *reason = (parc >= 4 && !BadPtr(parv[3])) ? parv[3] : NULL;
+
+	/* Broadcast to every connected session of both parties.  We
+	 * deliberately don't limit to MyConnect(client) because the user
+	 * almost certainly cares about the redact appearing in their
+	 * other sessions (desktop + mobile etc.) -- same UX as the
+	 * channel path via sendto_channel.
+	 *
+	 * The wire line is identical for both sides: source is the
+	 * REDACT requester, target is `parv[1]` (the original recipient
+	 * nick).  Either party can identify which DM conversation to
+	 * apply this to from {source, target} -- one of those two
+	 * nicks is themselves; the other is the partner. */
+	dmh_fan_redact_to_account(client, client->user->account,
+	                          parv[1], parv[2], reason);
+	dmh_fan_redact_to_account(client, other_acc,
+	                          parv[1], parv[2], reason);
+
+	if (sender_account_dup) free(sender_account_dup);
+	if (line_dup) free(line_dup);
+	free(other_acc);
 }
