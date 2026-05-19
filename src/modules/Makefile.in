@@ -105,6 +105,7 @@ MODULES= \
 	emoji.so \
 	account-recovery.so \
 	read-marker.so \
+	dm_history.so \
 	cmdslist.so \
 	named-modes.so \
 	member-roles.so \
@@ -185,6 +186,13 @@ invite-page.so: invite-page.c $(INCLUDES)
 read-marker.so: read-marker.c $(INCLUDES)
 	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
 		-o read-marker.so read-marker.c -lsqlite3
+
+# dm_history persists DMs between account-holders so CHATHISTORY can
+# replay them on reconnect (Ergo-style).  Its own sqlite handle on
+# obsidian.db, no link-time dep on account-registration.so.
+dm_history.so: dm_history.c $(INCLUDES)
+	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
+		-o dm_history.so dm_history.c -lsqlite3
 
 # voice-channels needs jansson for the Unix-socket bridge JSON.
 # Use @JANSSON_LIBS@ from configure -- system jansson via pkg-config
