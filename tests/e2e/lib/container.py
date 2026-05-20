@@ -1,17 +1,10 @@
 import os
 import secrets
 import shutil
-import string
 import subprocess
 import tempfile
 import time
 from pathlib import Path
-
-ALNUM = string.ascii_letters + string.digits
-
-
-def _cloak():
-    return "".join(secrets.choice(ALNUM) for _ in range(96))
 
 
 class IrcdContainer:
@@ -37,9 +30,6 @@ class IrcdContainer:
             "OPER_PASSWORD": secrets.token_hex(8),
             "SSL_PORT": "6697",
             "WS_PORT": "8080",
-            "CLOAK_KEY1": _cloak(),
-            "CLOAK_KEY2": _cloak(),
-            "CLOAK_KEY3": _cloak(),
         }
         env.update(extra)
         return env
