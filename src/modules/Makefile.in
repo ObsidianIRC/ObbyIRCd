@@ -106,6 +106,7 @@ MODULES= \
 	account-recovery.so \
 	read-marker.so \
 	dm_history.so \
+	webpush.so \
 	cmdslist.so \
 	named-modes.so \
 	member-roles.so \
@@ -193,6 +194,13 @@ read-marker.so: read-marker.c $(INCLUDES)
 dm_history.so: dm_history.c $(INCLUDES)
 	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
 		-o dm_history.so dm_history.c -lsqlite3
+
+# webpush stores per-account Web Push subscriptions in obsidian.db and
+# POSTs notification jobs to the hosted-backend (which owns the VAPID
+# private key + does the RFC 8291 encryption).
+webpush.so: webpush.c $(INCLUDES)
+	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
+		-o webpush.so webpush.c -lsqlite3
 
 # voice-channels needs jansson for the Unix-socket bridge JSON.
 # Use @JANSSON_LIBS@ from configure -- system jansson via pkg-config
