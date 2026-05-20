@@ -25,7 +25,7 @@ services:
       - path: .env
         required: false
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost ${WS_PORT:-8080}"]
+      test: ["CMD-SHELL", "nc -z localhost $${WS_PORT:-8080}"]
       interval: 5s
       timeout: 5s
       retries: 6

@@ -362,8 +362,8 @@ Multi-stage:
 - runtime: `alpine:3.20` + `ca-certificates sqlite-libs tzdata`
 
 Exposes `8080` (HTTP) and `3478/udp` (TURN). Mounts:
-`backend_data`, `backend_images`, and `obbyircd_voice_bridge` (shared
-with the IRCd).
+`obby_api_data`, `obby_api_images`, and `voice-bridge` (shared with
+the IRCd).
 
 ## 10. Coolify deployment topology — h4ks
 

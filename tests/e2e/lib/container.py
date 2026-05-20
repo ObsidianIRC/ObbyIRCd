@@ -71,11 +71,11 @@ class IrcdContainer:
         return int(out.splitlines()[0].rsplit(":", 1)[1])
 
     def logs(self) -> str:
-        r = subprocess.run(
+        result = subprocess.run(
             ["docker", "logs", self.name],
             capture_output=True, text=True,
         )
-        return r.stdout + r.stderr
+        return result.stdout + result.stderr
 
     def wait_ready(self, timeout=120):
         deadline = time.time() + timeout

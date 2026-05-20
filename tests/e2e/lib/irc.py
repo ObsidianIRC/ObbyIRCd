@@ -38,7 +38,7 @@ class IrcClient:
     async def expect(self, predicate, timeout: float = 15) -> str:
         if isinstance(predicate, str):
             needle = predicate
-            predicate = lambda l: needle in l
+            predicate = lambda line: needle in line
         deadline = asyncio.get_event_loop().time() + timeout
         while True:
             remain = deadline - asyncio.get_event_loop().time()

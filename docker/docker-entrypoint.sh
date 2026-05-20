@@ -153,7 +153,7 @@ fi
 
 # Splice the custom-modules include into already-rendered configs so
 # pre-existing conf volumes pick up the loadmodule wiring.
-if [ -f "$CONFIG_FILE" ] && ! grep -q '^include "custom-modules.conf";' "$CONFIG_FILE"; then
+if [ -f "$CONFIG_FILE" ] && ! grep -qE '^[[:space:]]*include[[:space:]]+["'\'']custom-modules\.conf["'\'']' "$CONFIG_FILE"; then
     printf '\ninclude "custom-modules.conf";\n' >> "$CONFIG_FILE"
 fi
 
