@@ -403,9 +403,20 @@ static void json_append_string(char *dst, size_t dstsize, const char *src)
 	dst[len] = '\0';
 }
 
-/* POST one push to the backend.  Fire-and-forget: we don't currently
- * prune subscriptions on 404/410 (TODO), so dead endpoints just fail
- * silently in the backend. */
+/* Result callback: only surfaces failures.  Successful pushes are
+ * silent to avoid log spam (one line per delivered message). */
+static void wp_push_result_cb(OutgoingWebRequest *request,
+                              OutgoingWebResponse *response)
+{
+	if (response->errorbuf)
+		unreal_log(ULOG_WARNING, "webpush", "WP_SEND_FAILED", NULL,
+		           "push POST to backend failed: $err",
+		           log_data_string("err", response->errorbuf));
+}
+
+/* POST one push to the backend.  Fire-and-forget; the result callback
+ * logs transport failures.  (TODO: prune subscriptions on a 404/410
+ * from the push service, which the backend relays in its JSON body.) */
 static void wp_send_push(const char *endpoint, const char *p256dh,
                          const char *auth, const char *payload)
 {
@@ -444,7 +455,7 @@ static void wp_send_push(const char *endpoint, const char *p256dh,
 	req->http_method = HTTP_METHOD_POST;
 	safe_strdup(req->body, body);
 	req->headers = headers;
-	req->callback = download_complete_dontcare;
+	req->callback = wp_push_result_cb;
 	req->max_redirects = 0;
 	req->connect_timeout = 5;
 	req->transfer_timeout = 10;
