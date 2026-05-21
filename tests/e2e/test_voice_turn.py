@@ -16,6 +16,7 @@ PLACEHOLDER_TURN = {
     "password": "placeholderpw",
     "ttl": 60,
 }
+TURN_KEY = "turn"  # SFU envelope uses lowercase per voice.go json tag
 
 
 def _ircd(env: dict | None = None) -> IrcdContainer:
@@ -41,7 +42,7 @@ def _parse_rtc_payload(line: str) -> dict:
 
 
 async def _push_joined(stub: BridgeStub, to_nick: str, turn=PLACEHOLDER_TURN):
-    payload = {"type": "joined", "channel": "^vc", "account": to_nick, "TURN": turn}
+    payload = {"type": "joined", "channel": "^vc", "account": to_nick, TURN_KEY: turn}
     await stub.send_frame({"op": "signal", "to": to_nick, "payload": payload})
 
 
@@ -58,7 +59,7 @@ async def test_passthrough_when_unconfigured():
                 await _push_joined(stub, "passt")
                 line = await cli.expect(lambda line: "+obsidianirc/rtc" in line, timeout=15)
             payload = _parse_rtc_payload(line)
-            assert payload["TURN"] == PLACEHOLDER_TURN
+            assert payload[TURN_KEY] == PLACEHOLDER_TURN
     finally:
         ircd.down()
 
@@ -86,7 +87,7 @@ async def _run_rewrite_scenario(secret: str, nick: str):
                 await _push_joined(stub, nick)
                 line = await cli.expect(lambda line: "+obsidianirc/rtc" in line, timeout=15)
             payload = _parse_rtc_payload(line)
-            t = payload["TURN"]
+            t = payload[TURN_KEY]
             assert t["urls"] == urls
             assert t["ttl"] == ttl
             expiry_str, _, account = t["username"].partition(":")

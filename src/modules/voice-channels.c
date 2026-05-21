@@ -512,7 +512,7 @@ static void maybe_rewrite_turn(json_t *payload, const char *to)
 		return;
 	if (!payload || !json_is_object(payload))
 		return;
-	if (!json_object_get(payload, "TURN"))
+	if (!json_object_get(payload, "turn"))
 		return;
 
 	const char *account = NULL;
@@ -525,7 +525,7 @@ static void maybe_rewrite_turn(json_t *payload, const char *to)
 	json_t *fresh = account && *account ? mint_turn_creds(account) : NULL;
 	if (fresh)
 	{
-		json_object_set_new(payload, "TURN", fresh);
+		json_object_set_new(payload, "turn", fresh);
 		return;
 	}
 
@@ -534,7 +534,7 @@ static void maybe_rewrite_turn(json_t *payload, const char *to)
 	unreal_log(ULOG_WARNING, "voice", "TURN_REWRITE_FAILED", NULL,
 	           "voice-channels: external TURN configured but mint failed; "
 	           "stripping placeholder TURN from envelope");
-	json_object_del(payload, "TURN");
+	json_object_del(payload, "turn");
 }
 
 /* ===================================================================
