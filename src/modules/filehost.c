@@ -127,6 +127,15 @@ MOD_LOAD()
 	if (cfg.has_hosts)
 	{
 		ISupport *is;
+		/* This in-house uploader is account-gated (clients mint a
+		 * draft/authtoken Bearer), so it is not the tokenless standard
+		 * draft/FILEHOST -- advertise it under the vendor token. */
+		if (!(is = ISupportAdd(modinfo->handle, "obby.world/FILEHOST", cfg.isupport_line)))
+			return MOD_FAILED;
+		/* Transition shim: keep advertising draft/FILEHOST too so clients
+		 * built before the vendor rename keep finding the uploader. Drop
+		 * once those are gone and draft/FILEHOST is reserved for the
+		 * standard tokenless (external) filehost config. */
 		if (!(is = ISupportAdd(modinfo->handle, "draft/FILEHOST", cfg.isupport_line)))
 			return MOD_FAILED;
 	}

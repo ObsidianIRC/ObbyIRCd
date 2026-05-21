@@ -194,10 +194,14 @@ ISupport *ISupportAdd(Module *module, const char *token, const char *value)
 	 * https://modern.ircdocs.horse/#rplisupport-005
 	 * https://github.com/ircdocs/modern-irc/issues/250
 	 * - Valware
+	 *
+	 * Also allow '.' so vendor-namespaced tokens (e.g.
+	 * obby.world/FILEHOST) can mirror the IRCv3 vendored cap/tag
+	 * naming convention.
 	 */
 	for (c = token; c && *c; c++)
 	{
-		if (!isalnum(*c) && *c != '/')
+		if (!isalnum(*c) && *c != '/' && *c != '.')
 		{
 			if (module)
 				module->errorcode = MODERR_INVALID;
