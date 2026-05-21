@@ -34,7 +34,10 @@
 #include <sys/un.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 #include <jansson.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
 
 ModuleHeader MOD_HEADER = {
 	"voice-channels",
@@ -62,8 +65,16 @@ static int is_voice_or_stream_channel(const char *name)
 /* Configurable via env var or set::voice-bridge-socket "<path>"; in obbyircd.conf. */
 static char *cfg_bridge_socket = NULL;
 
+/* draft-uberti-behave-turn-rest (coturn use-auth-secret). */
+static char **cfg_turn_urls = NULL;
+static int    cfg_turn_url_count = 0;
+static char  *cfg_turn_secret = NULL;
+static long   cfg_turn_ttl = 21600;
+
 /* CAP bit assigned by ClientCapabilityAdd; gates ^channel JOIN. */
 static long CAP_OBSIDIANIRC_VOICE = 0L;
+
+static void maybe_rewrite_turn(json_t *payload, const char *to);
 
 /* ===================================================================
  * Bridge connection state
@@ -279,6 +290,7 @@ static void process_bridge_frame(const char *line, size_t len)
 		json_decref(frame);
 		return;
 	}
+	maybe_rewrite_turn(payload, json_is_string(to) ? json_string_value(to) : NULL);
 	char *payload_json = json_dumps(payload, JSON_COMPACT);
 	if (payload_json)
 	{
@@ -449,28 +461,247 @@ static void voice_rtc_new_message(Client *_client, MessageTag *recv_mtags,
 	}
 }
 
+static void free_turn_cfg(void)
+{
+	if (cfg_turn_urls)
+	{
+		for (int i = 0; i < cfg_turn_url_count; i++)
+			safe_free(cfg_turn_urls[i]);
+		safe_free(cfg_turn_urls);
+		cfg_turn_urls = NULL;
+		cfg_turn_url_count = 0;
+	}
+	safe_free_sensitive(cfg_turn_secret);
+	cfg_turn_ttl = 21600;
+}
+
+static json_t *mint_turn_creds(const char *account)
+{
+	if (!cfg_turn_secret || !account || !*account)
+		return NULL;
+
+	long expiry = (long)time(NULL) + cfg_turn_ttl;
+	char username[256];
+	snprintf(username, sizeof(username), "%ld:%s", expiry, account);
+
+	unsigned char mac[EVP_MAX_MD_SIZE];
+	unsigned int mac_len = 0;
+	if (!HMAC(EVP_sha1(), cfg_turn_secret, (int)strlen(cfg_turn_secret),
+	          (const unsigned char *)username, strlen(username),
+	          mac, &mac_len))
+		return NULL;
+
+	char b64[128];
+	if (b64_encode(mac, mac_len, b64, sizeof(b64)) <= 0)
+		return NULL;
+
+	json_t *t = json_object();
+	json_t *urls = json_array();
+	for (int i = 0; i < cfg_turn_url_count; i++)
+		json_array_append_new(urls, json_string(cfg_turn_urls[i]));
+	json_object_set_new(t, "urls", urls);
+	json_object_set_new(t, "username", json_string(username));
+	json_object_set_new(t, "password", json_string(b64));
+	json_object_set_new(t, "ttl", json_integer(cfg_turn_ttl));
+	return t;
+}
+
+static void maybe_rewrite_turn(json_t *payload, const char *to)
+{
+	if (!cfg_turn_secret)
+		return;
+	if (!payload || !json_is_object(payload))
+		return;
+	if (!json_object_get(payload, "TURN"))
+		return;
+
+	const char *account = NULL;
+	json_t *acct_j = json_object_get(payload, "account");
+	if (acct_j && json_is_string(acct_j))
+		account = json_string_value(acct_j);
+	if ((!account || !*account) && to)
+		account = to;
+
+	json_t *fresh = account && *account ? mint_turn_creds(account) : NULL;
+	if (fresh)
+	{
+		json_object_set_new(payload, "TURN", fresh);
+		return;
+	}
+
+	/* Fail closed: external TURN configured but couldn't mint creds.
+	 * Strip the field so embedded-TURN creds from the SFU don't leak. */
+	unreal_log(ULOG_WARNING, "voice", "TURN_REWRITE_FAILED", NULL,
+	           "voice-channels: external TURN configured but mint failed; "
+	           "stripping placeholder TURN from envelope");
+	json_object_del(payload, "TURN");
+}
+
 /* ===================================================================
  * Config
  * =================================================================== */
-static int voice_configtest(ConfigFile *_cf, ConfigEntry *ce, int type,
-                             int *_errs)
+static int voice_turn_configtest(ConfigEntry *turn_ce, int *errs)
 {
-	if (type != CONFIG_SET)
-		return 0;
-	if (!ce->name || strcmp(ce->name, "voice-bridge-socket"))
-		return 0;
-	return 1;
+	int errors = 0;
+	int urls_seen = 0, secret_seen = 0;
+	for (ConfigEntry *cep = turn_ce->items; cep; cep = cep->next)
+	{
+		if (!cep->name)
+		{
+			config_error("%s:%i: voice::turn: blank directive",
+			             cep->file->filename, cep->line_number);
+			errors++;
+			continue;
+		}
+		if (!strcmp(cep->name, "url"))
+		{
+			if (!cep->value || !*cep->value)
+			{
+				config_error("%s:%i: voice::turn::url requires a value",
+				             cep->file->filename, cep->line_number);
+				errors++;
+			}
+			else
+			{
+				urls_seen++;
+			}
+		}
+		else if (!strcmp(cep->name, "shared-secret"))
+		{
+			if (!cep->value || !*cep->value)
+			{
+				config_error("%s:%i: voice::turn::shared-secret requires a value",
+				             cep->file->filename, cep->line_number);
+				errors++;
+			}
+			else
+			{
+				secret_seen++;
+			}
+		}
+		else if (!strcmp(cep->name, "ttl"))
+		{
+			long v = cep->value ? atol(cep->value) : 0;
+			if (v < 60 || v > 86400)
+			{
+				config_error("%s:%i: voice::turn::ttl must be in range 60-86400",
+				             cep->file->filename, cep->line_number);
+				errors++;
+			}
+		}
+		else
+		{
+			config_error("%s:%i: unknown directive voice::turn::%s",
+			             cep->file->filename, cep->line_number, cep->name);
+			errors++;
+		}
+	}
+	if (!urls_seen)
+	{
+		config_error("%s:%i: voice::turn: at least one url is required",
+		             turn_ce->file->filename, turn_ce->line_number);
+		errors++;
+	}
+	if (!secret_seen)
+	{
+		config_error("%s:%i: voice::turn: shared-secret is required",
+		             turn_ce->file->filename, turn_ce->line_number);
+		errors++;
+	}
+	*errs += errors;
+	return errors ? -1 : 1;
+}
+
+static int voice_configtest(ConfigFile *_cf, ConfigEntry *ce, int type,
+                             int *errs)
+{
+	if (type == CONFIG_SET)
+	{
+		if (!ce->name || strcmp(ce->name, "voice-bridge-socket"))
+			return 0;
+		return 1;
+	}
+	if (type == CONFIG_MAIN)
+	{
+		if (!ce->name || strcmp(ce->name, "voice"))
+			return 0;
+		int errors = 0;
+		for (ConfigEntry *cep = ce->items; cep; cep = cep->next)
+		{
+			if (!cep->name)
+				continue;
+			if (!strcmp(cep->name, "turn"))
+			{
+				int rc = voice_turn_configtest(cep, &errors);
+				if (rc < 0)
+				{
+					if (errs)
+						*errs = errors;
+					return -1;
+				}
+			}
+			else
+			{
+				config_error("%s:%i: unknown directive voice::%s",
+				             cep->file->filename, cep->line_number, cep->name);
+				errors++;
+			}
+		}
+		if (errs)
+			*errs = errors;
+		return errors ? -1 : 1;
+	}
+	return 0;
 }
 
 static int voice_configrun(ConfigFile *_cf, ConfigEntry *ce, int type)
 {
-	if (type != CONFIG_SET)
-		return 0;
-	if (!ce->name || strcmp(ce->name, "voice-bridge-socket"))
-		return 0;
-	safe_free(cfg_bridge_socket);
-	safe_strdup(cfg_bridge_socket, ce->value);
-	return 1;
+	if (type == CONFIG_SET)
+	{
+		if (!ce->name || strcmp(ce->name, "voice-bridge-socket"))
+			return 0;
+		safe_free(cfg_bridge_socket);
+		safe_strdup(cfg_bridge_socket, ce->value);
+		return 1;
+	}
+	if (type == CONFIG_MAIN)
+	{
+		if (!ce->name || strcmp(ce->name, "voice"))
+			return 0;
+		for (ConfigEntry *cep = ce->items; cep; cep = cep->next)
+		{
+			if (!cep->name)
+				continue;
+			if (strcmp(cep->name, "turn"))
+				continue;
+
+			free_turn_cfg();
+			int n = 0;
+			for (ConfigEntry *t = cep->items; t; t = t->next)
+				if (t->name && !strcmp(t->name, "url"))
+					n++;
+			cfg_turn_urls = safe_alloc((n + 1) * sizeof(char *));
+			cfg_turn_url_count = n;
+			int i = 0;
+			for (ConfigEntry *t = cep->items; t; t = t->next)
+			{
+				if (!t->name)
+					continue;
+				if (!strcmp(t->name, "url"))
+				{
+					safe_strdup(cfg_turn_urls[i], t->value);
+					i++;
+				}
+				else if (!strcmp(t->name, "shared-secret"))
+					safe_strdup_sensitive(cfg_turn_secret, t->value);
+				else if (!strcmp(t->name, "ttl"))
+					cfg_turn_ttl = atol(t->value);
+			}
+			cfg_turn_urls[n] = NULL;
+		}
+		return 1;
+	}
+	return 0;
 }
 
 /* ===================================================================
@@ -538,5 +769,6 @@ MOD_UNLOAD()
 {
 	bridge_disconnect();
 	safe_free(cfg_bridge_socket);
+	free_turn_cfg();
 	return MOD_SUCCESS;
 }

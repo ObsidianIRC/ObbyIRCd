@@ -80,6 +80,40 @@ else
     export RPC_CONFIG=""
 fi
 
+# UnrealIRCd's parser has no escape mechanism inside single-quoted
+# values (single-quote = escaped=1, used to skip URL pre-pass).  For
+# values that may contain quote chars, use double-quoted directives
+# (escape \\ and " for the parser) like WS_CONFIG/RPC_CONFIG do.
+voice_dq_escape() {
+    printf "%s" "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# URLs contain '?'; set -f around the loop disables glob expansion.
+# URLs must not contain ' -- there's no way to escape one inside a
+# single-quoted conf value, and ' is not a valid URL character anyway.
+if [ -n "${VOICE_TURN_EXTERNAL_URLS:-}" ]; then
+    case "$VOICE_TURN_EXTERNAL_URLS" in
+        *"'"*)
+            echo "ERROR: VOICE_TURN_EXTERNAL_URLS contains a single quote, refuse to render conf" >&2
+            exit 1
+            ;;
+    esac
+    voice_turn_url_lines=""
+    set -f
+    for u in $VOICE_TURN_EXTERNAL_URLS; do
+        voice_turn_url_lines="$voice_turn_url_lines
+    url '$u';"
+    done
+    set +f
+    export VOICE_TURN_CONFIG="voice { turn {${voice_turn_url_lines}
+    shared-secret \"$(voice_dq_escape "${VOICE_TURN_SHARED_SECRET}")\";
+    ttl ${VOICE_TURN_TTL:-21600};
+}; };"
+    echo "External TURN: enabled (${VOICE_TURN_EXTERNAL_URLS})"
+else
+    export VOICE_TURN_CONFIG=""
+fi
+
 # Random cloak keys if the operator didn't supply any.  UnrealIRCd
 # requires >= 80 chars of mixed a-zA-Z0-9; hex alone is rejected as
 # "not mixed".  Operators running linked nodes should set

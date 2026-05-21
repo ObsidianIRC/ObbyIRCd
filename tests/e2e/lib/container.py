@@ -10,10 +10,20 @@ from pathlib import Path
 class IrcdContainer:
     """One isolated obbyircd container for IRCd-only smoke tests."""
 
-    def __init__(self, image: str | None = None, env: dict | None = None, bind_data: bool = False):
+    def __init__(
+        self,
+        image: str | None = None,
+        env: dict | None = None,
+        bind_data: bool = False,
+        with_voice_bridge: bool = False,
+    ):
         self.image = image or os.environ.get("OBBYIRCD_IMAGE", "obbyircd:e2e")
         self.name = f"obbyircd-e2e-{secrets.token_hex(4)}"
         self.bind_data = bind_data
+        self.with_voice_bridge = with_voice_bridge
+        self.voice_bridge_volume = (
+            f"voicebridge-{secrets.token_hex(4)}" if with_voice_bridge else None
+        )
         self.data_root = Path(tempfile.mkdtemp(prefix="obbyircd-e2e-")) if bind_data else None
         if self.data_root:
             for sub in ("conf", "data", "logs", "tls", "custom-modules"):
@@ -35,6 +45,11 @@ class IrcdContainer:
         return env
 
     def up(self):
+        if self.voice_bridge_volume:
+            subprocess.run(
+                ["docker", "volume", "create", self.voice_bridge_volume],
+                check=True, capture_output=True,
+            )
         cmd = [
             "docker", "run", "-d", "--name", self.name,
             "-p", "127.0.0.1::6697",
@@ -43,6 +58,8 @@ class IrcdContainer:
         if self.bind_data and self.data_root:
             for sub in ("conf", "data", "logs", "tls", "custom-modules"):
                 cmd += ["-v", f"{self.data_root}/{sub}:/home/obbyircd/obby/{sub}"]
+        if self.voice_bridge_volume:
+            cmd += ["-v", f"{self.voice_bridge_volume}:/run/obbyirc"]
         for k, v in self.env.items():
             cmd += ["-e", f"{k}={v}"]
         cmd.append(self.image)
@@ -51,6 +68,11 @@ class IrcdContainer:
 
     def down(self):
         subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
+        if self.voice_bridge_volume:
+            subprocess.run(
+                ["docker", "volume", "rm", "-f", self.voice_bridge_volume],
+                capture_output=True,
+            )
         if self.data_root:
             shutil.rmtree(self.data_root, ignore_errors=True)
 

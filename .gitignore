@@ -120,3 +120,9 @@ migration-research/
 
 # Claude Code local state -- never tracked
 .claude/
+
+# Python test artefacts (tests/e2e)
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/

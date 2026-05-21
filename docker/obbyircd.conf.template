@@ -72,6 +72,9 @@ ${FILEHOST_CONFIG}
 /* Optional JSON-RPC (set RPC_PASSWORD). */
 ${RPC_CONFIG}
 
+/* Optional external TURN service (set VOICE_TURN_EXTERNAL_URLS). */
+${VOICE_TURN_CONFIG}
+
 set {
     kline-address "${ADMIN_EMAIL}";
     modes-on-connect "+iwx";
