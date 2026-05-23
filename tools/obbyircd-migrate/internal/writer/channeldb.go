@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -13,13 +14,14 @@ import (
 	"github.com/obsidianirc/obbyircd-migrate/internal/ir"
 )
 
-// Mirrors src/modules/channeldb.c
+// UnrealDB record framing — see src/misc.c:write_str + per-module
+// MAGIC_ENTRY_START/END (channeldb, metadata-db, ...).
 const (
-	channelDBVersion    = 101
-	magicChannelStart   = 0x11111111
-	magicChannelEnd     = 0x22222222
-	maxStringLen        = 0xfffe
-	stringNullSentinel  = 0xffff
+	channelDBVersion   = 101
+	magicEntryStart    = 0x11111111
+	magicEntryEnd      = 0x22222222
+	maxStringLen       = 0xfffe
+	stringNullSentinel = 0xffff
 )
 
 // WriteChannelDB serialises every channel in the bundle into UnrealDB
@@ -75,7 +77,7 @@ func WriteChannelDB(path string, b *ir.Bundle, opts Options, rep *Report) error 
 }
 
 func writeChannelEntry(w *bytes.Buffer, ch *ir.Channel) error {
-	if err := writeUint32LE(w, magicChannelStart); err != nil {
+	if err := writeUint32LE(w, magicEntryStart); err != nil {
 		return err
 	}
 	if err := writeStr(w, ch.Name); err != nil {
@@ -131,7 +133,7 @@ func writeChannelEntry(w *bytes.Buffer, ch *ir.Channel) error {
 		return err
 	}
 
-	if err := writeUint32LE(w, magicChannelEnd); err != nil {
+	if err := writeUint32LE(w, magicEntryEnd); err != nil {
 		return err
 	}
 	return nil
@@ -283,30 +285,29 @@ func aclHasFounder(ch *ir.Channel) bool {
 	return false
 }
 
-func writeUint32LE(w *bytes.Buffer, v uint32) error {
+func writeUint32LE(w io.Writer, v uint32) error {
 	var b [4]byte
 	binary.LittleEndian.PutUint32(b[:], v)
 	_, err := w.Write(b[:])
 	return err
 }
 
-func writeUint64LE(w *bytes.Buffer, v uint64) error {
+func writeUint64LE(w io.Writer, v uint64) error {
 	var b [8]byte
 	binary.LittleEndian.PutUint64(b[:], v)
 	_, err := w.Write(b[:])
 	return err
 }
 
-func writeInt64LE(w *bytes.Buffer, v int64) error {
+func writeInt64LE(w io.Writer, v int64) error {
 	return writeUint64LE(w, uint64(v))
 }
 
-// writeStr writes UnrealDB string framing: uint16le length then bytes,
-// no NUL terminator. NULL string is signalled by length == 0xffff.
-func writeStr(w *bytes.Buffer, s string) error {
+// writeStr writes UnrealDB string framing (uint16le length + bytes).
+// Empty maps to length=0 (channeldb.c reads as ""); NULL marker
+// (length=0xffff = stringNullSentinel) is never emitted by us.
+func writeStr(w io.Writer, s string) error {
 	if s == "" {
-		// Empty string still writes length=0; we treat IR-side empty as
-		// empty rather than NULL (channeldb.c reads them back as "").
 		return writeUint16LE(w, 0)
 	}
 	if len(s) > maxStringLen {
@@ -315,11 +316,11 @@ func writeStr(w *bytes.Buffer, s string) error {
 	if err := writeUint16LE(w, uint16(len(s))); err != nil {
 		return err
 	}
-	_, err := w.WriteString(s)
+	_, err := io.WriteString(w, s)
 	return err
 }
 
-func writeUint16LE(w *bytes.Buffer, v uint16) error {
+func writeUint16LE(w io.Writer, v uint16) error {
 	var b [2]byte
 	binary.LittleEndian.PutUint16(b[:], v)
 	_, err := w.Write(b[:])
