@@ -10,7 +10,7 @@ set -e
 set -x
 
 # Kill old instances
-killall -9 unrealircd || true
+killall -9 obbyircd || true
 
 # Install 'unrealircd-tests'
 rm -rf unrealircd-tests/
