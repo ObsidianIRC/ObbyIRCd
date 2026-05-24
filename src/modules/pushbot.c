@@ -2366,7 +2366,7 @@ static PbInteraction *pb_interaction_new(PbBot *bot, Client *invoker,
 	snprintf(idbuf, sizeof(idbuf), "iact.%lx.%lx",
 	         (unsigned long)TStime(), (unsigned long)rand());
 	safe_strdup(it->id, idbuf);
-	if (invoker && invoker->name) safe_strdup(it->invoker_nick, invoker->name);
+	if (invoker && invoker->name[0]) safe_strdup(it->invoker_nick, invoker->name);
 	if (channel) safe_strdup(it->channel, channel);
 	if (msgid) safe_strdup(it->invoker_msgid, msgid);
 	it->bot = bot;
@@ -2633,7 +2633,7 @@ static void pb_dispatch_command(PbBot *bot, Client *invoker,
 	{
 		json_t *snap = json_object();
 		json_object_set_new(snap, "nick",
-		    json_string(invoker && invoker->name ? invoker->name : ""));
+		    json_string(invoker && invoker->name[0] ? invoker->name : ""));
 		json_object_set_new(snap, "name", json_string(cmd_name ? cmd_name : ""));
 		json_object_set_new(snap, "options",
 		    opts ? json_incref(opts) : json_object());
@@ -3117,7 +3117,7 @@ static json_t *pb_bot_to_burst_json(PbBot *b, int for_oper, const char *event)
 	json_t *chans = json_array();
 	if (b->ghost) {
 		for (Membership *m = b->ghost->user->channel; m; m = m->next) {
-			if (m->channel && m->channel->name)
+			if (m->channel && m->channel->name[0])
 				json_array_append_new(chans, json_string(m->channel->name));
 		}
 	}
@@ -3172,7 +3172,7 @@ static void pb_send_bot_info(Client *client, const char *batch_ref,
 static void pb_send_bot_burst(Client *client)
 {
 	if (!HasCapabilityFast(client, CAP_CHANBOTS)) return;
-	if (!MyUser(client) || !client->name || !*client->name) return;
+	if (!MyUser(client) || !client->name[0] || !*client->name) return;
 
 	char ref[BATCHLEN + 1];
 	gen_random_alnum(ref, BATCHLEN);
@@ -3226,7 +3226,7 @@ static void pb_broadcast_bot_event(PbBot *b, const char *event)
 	list_for_each_entry(c, &lclient_list, lclient_node) {
 		if (!HasCapabilityFast(c, CAP_CHANBOTS)) continue;
 		if (!MyUser(c) || !IsUser(c)) continue;
-		if (!c->name || !*c->name) continue;
+		if (!c->name[0] || !*c->name) continue;
 		if (strcmp(event, "remove") != 0 && !pb_bot_visible_to(b, c)) continue;
 		json_t *body = pb_bot_to_burst_json(b, IsOper(c), event);
 		pb_send_bot_info(c, NULL, body);
@@ -3444,16 +3444,16 @@ static json_t *pb_json_client(Client *c)
 {
 	json_t *j = json_object();
 	if (!c) return j;
-	json_object_set_new(j, "nick", json_string(c->name ? c->name : ""));
-	json_object_set_new(j, "id", json_string(c->id ? c->id : ""));
+	json_object_set_new(j, "nick", json_string(c->name[0] ? c->name : ""));
+	json_object_set_new(j, "id", json_string(c->id[0] ? c->id : ""));
 	if (c->user) {
 		json_object_set_new(j, "account",
-		    json_string(c->user->account && strcmp(c->user->account, "0")
+		    json_string(c->user->account[0] && strcmp(c->user->account, "0")
 		                ? c->user->account : ""));
 		json_object_set_new(j, "ident",
-		    json_string(c->user->username ? c->user->username : ""));
+		    json_string(c->user->username[0] ? c->user->username : ""));
 		const char *vhost = c->user->virthost ? c->user->virthost
-		                  : c->user->cloakedhost ? c->user->cloakedhost : "";
+		                  : c->user->cloakedhost[0] ? c->user->cloakedhost : "";
 		json_object_set_new(j, "host", json_string(vhost));
 		long bot_bit = find_user_mode('B');
 		json_object_set_new(j, "is_bot",
@@ -3473,7 +3473,7 @@ static json_t *pb_json_channel(Channel *ch)
 {
 	json_t *j = json_object();
 	if (!ch) return j;
-	json_object_set_new(j, "name", json_string(ch->name ? ch->name : ""));
+	json_object_set_new(j, "name", json_string(ch->name[0] ? ch->name : ""));
 	json_object_set_new(j, "topic", json_string(ch->topic ? ch->topic : ""));
 	int count = 0;
 	for (Member *m = ch->members; m; m = m->next) count++;

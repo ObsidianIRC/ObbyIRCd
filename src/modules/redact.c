@@ -230,7 +230,7 @@ CMD_FUNC(cmd_redact)
 						continue;
 					found = 1;
 					/* Line shape: ":nick!user@host PRIVMSG #chan :text" */
-					if (l->line && l->line[0] == ':') {
+					if (l->line[0] && l->line[0] == ':') {
 						const char *bang = strchr(l->line + 1, '!');
 						if (bang) {
 							size_t nlen = (size_t)(bang - (l->line + 1));

@@ -241,7 +241,7 @@ static char *make_guest_nick(Client *client)
             {
                 result[j++] = (char)('0' + (rand() % 10));
             }
-            else if (fmt[i] == 'n' && client && client->name)
+            else if (fmt[i] == 'n' && client && client->name[0])
             {
                 size_t nicklen = strlen(client->name);
                 if (j + nicklen < outlen - 1)

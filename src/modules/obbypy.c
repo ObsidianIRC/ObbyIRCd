@@ -371,11 +371,11 @@ static PyObject *PyClient_getattro(PyObject *self, PyObject *name_obj)
 		Py_RETURN_NONE;
 
 	if (!strcmp(name, "name"))
-		return PyUnicode_FromString(o->c->name ? o->c->name : "");
+		return PyUnicode_FromString(o->c->name[0] ? o->c->name : "");
 	if (!strcmp(name, "id"))
-		return PyUnicode_FromString(o->c->id ? o->c->id : "");
+		return PyUnicode_FromString(o->c->id[0] ? o->c->id : "");
 	if (!strcmp(name, "info"))
-		return PyUnicode_FromString(o->c->info ? o->c->info : "");
+		return PyUnicode_FromString(o->c->info[0] ? o->c->info : "");
 	if (!strcmp(name, "host")) {
 		const char *h = NULL;
 		if (o->c->user)
@@ -385,21 +385,21 @@ static PyObject *PyClient_getattro(PyObject *self, PyObject *name_obj)
 		return PyUnicode_FromString(h ? h : "");
 	}
 	if (!strcmp(name, "realhost"))
-		return PyUnicode_FromString(o->c->user && o->c->user->realhost ? o->c->user->realhost : "");
+		return PyUnicode_FromString(o->c->user && o->c->user->realhost[0] ? o->c->user->realhost : "");
 	if (!strcmp(name, "ip"))
 		return PyUnicode_FromString(o->c->ip ? o->c->ip : "");
 	if (!strcmp(name, "account")) {
-		if (o->c->user && o->c->user->account && strcmp(o->c->user->account, "0"))
+		if (o->c->user && o->c->user->account[0] && strcmp(o->c->user->account, "0"))
 			return PyUnicode_FromString(o->c->user->account);
 		Py_RETURN_NONE;
 	}
 	if (!strcmp(name, "realname")) {
 		if (o->c->user)
-			return PyUnicode_FromString(o->c->info ? o->c->info : "");
+			return PyUnicode_FromString(o->c->info[0] ? o->c->info : "");
 		Py_RETURN_NONE;
 	}
 	if (!strcmp(name, "ident") || !strcmp(name, "username")) {
-		return PyUnicode_FromString(o->c->user && o->c->user->username ? o->c->user->username : "");
+		return PyUnicode_FromString(o->c->user && o->c->user->username[0] ? o->c->user->username : "");
 	}
 	if (!strcmp(name, "umodes")) {
 		if (!o->c->user)
@@ -452,7 +452,7 @@ static PyObject *PyClient_repr(PyObject *self)
 	PyClientObject *o = (PyClientObject *)self;
 	if (!o->c)
 		return PyUnicode_FromString("<Client (gone)>");
-	return PyUnicode_FromFormat("<Client %s>", o->c->name ? o->c->name : "?");
+	return PyUnicode_FromFormat("<Client %s>", o->c->name[0] ? o->c->name : "?");
 }
 
 static PyTypeObject PyClient_Type = {
@@ -483,7 +483,7 @@ static PyObject *PyChannel_getattro(PyObject *self, PyObject *name_obj)
 		Py_RETURN_NONE;
 
 	if (!strcmp(name, "name"))
-		return PyUnicode_FromString(o->ch->name ? o->ch->name : "");
+		return PyUnicode_FromString(o->ch->name[0] ? o->ch->name : "");
 	if (!strcmp(name, "topic"))
 		return PyUnicode_FromString(o->ch->topic ? o->ch->topic : "");
 	if (!strcmp(name, "topic_nick"))
@@ -506,7 +506,7 @@ static PyObject *PyChannel_getattro(PyObject *self, PyObject *name_obj)
 		PyObject *list = PyList_New(0);
 		if (!list) return NULL;
 		for (Member *m = o->ch->members; m; m = m->next) {
-			PyObject *n = PyUnicode_FromString(m->client->name ? m->client->name : "");
+			PyObject *n = PyUnicode_FromString(m->client->name[0] ? m->client->name : "");
 			if (n) {
 				PyList_Append(list, n);
 				Py_DECREF(n);
@@ -524,7 +524,7 @@ static PyObject *PyChannel_getattro(PyObject *self, PyObject *name_obj)
 			PyDict_SetItemString(d, "client", py_client_new(m->client));
 			char modebuf[16];
 			int j = 0;
-			if (m->member_modes) {
+			if (m->member_modes[0]) {
 				strlcpy(modebuf, m->member_modes, sizeof(modebuf));
 				j = strlen(modebuf);
 			}
@@ -549,7 +549,7 @@ static PyObject *PyChannel_repr(PyObject *self)
 	PyChannelObject *o = (PyChannelObject *)self;
 	if (!o->ch)
 		return PyUnicode_FromString("<Channel (gone)>");
-	return PyUnicode_FromFormat("<Channel %s>", o->ch->name ? o->ch->name : "?");
+	return PyUnicode_FromFormat("<Channel %s>", o->ch->name[0] ? o->ch->name : "?");
 }
 
 static PyTypeObject PyChannel_Type = {
@@ -580,11 +580,11 @@ static PyObject *PyServer_getattro(PyObject *self, PyObject *name_obj)
 		Py_RETURN_NONE;
 
 	if (!strcmp(name, "name"))
-		return PyUnicode_FromString(o->c->name ? o->c->name : "");
+		return PyUnicode_FromString(o->c->name[0] ? o->c->name : "");
 	if (!strcmp(name, "info"))
-		return PyUnicode_FromString(o->c->info ? o->c->info : "");
+		return PyUnicode_FromString(o->c->info[0] ? o->c->info : "");
 	if (!strcmp(name, "id"))
-		return PyUnicode_FromString(o->c->id ? o->c->id : "");
+		return PyUnicode_FromString(o->c->id[0] ? o->c->id : "");
 	if (!strcmp(name, "is_local"))
 		return PyBool_FromLong(MyConnect(o->c) ? 1 : 0);
 	if (!strcmp(name, "is_uline"))
@@ -603,7 +603,7 @@ static PyObject *PyServer_repr(PyObject *self)
 	PyServerObject *o = (PyServerObject *)self;
 	if (!o->c)
 		return PyUnicode_FromString("<Server (gone)>");
-	return PyUnicode_FromFormat("<Server %s>", o->c->name ? o->c->name : "?");
+	return PyUnicode_FromFormat("<Server %s>", o->c->name[0] ? o->c->name : "?");
 }
 
 static PyTypeObject PyServer_Type = {
@@ -1451,7 +1451,7 @@ static PyObject *api_send_numeric(PyObject *self, PyObject *args)
 	if (PyErr_Occurred()) return NULL;
 	if (!c) Py_RETURN_NONE;
 	sendto_one(c, NULL, ":%s %03d %s :%s", me.name, numeric,
-	           c->name ? c->name : "*", msg);
+	           c->name[0] ? c->name : "*", msg);
 	Py_RETURN_NONE;
 }
 
