@@ -21,7 +21,10 @@ class clients {
     pingfreq 90;
     maxclients 1000;
     sendq 200k;
-    recvq 8000;
+    /* 8k upstream default is too tight for WebRTC SDP + metadata-2 batches;
+     * modern clients flood out during voice negotiation. 32k is the parser's
+     * hard cap. */
+    recvq 30k;
 };
 
 class servers {
@@ -71,6 +74,9 @@ ${FILEHOST_CONFIG}
 
 /* Optional JSON-RPC (set RPC_PASSWORD). */
 ${RPC_CONFIG}
+
+/* Optional external TURN service (set VOICE_TURN_EXTERNAL_URLS). */
+${VOICE_TURN_CONFIG}
 
 set {
     kline-address "${ADMIN_EMAIL}";
