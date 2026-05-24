@@ -473,8 +473,13 @@ int read_metadatadb(void){
 	/* new data will be stored in these vars */
 	Channel *channel;
 	struct metadata metadata;
-	char *name;
+	char *name = NULL;
 	time_t last_seen;
+
+	/* FreeMetadataEntry() (called from R_SAFE on an early read error) frees
+	 * name + metadata.name + metadata.value, so they must be NULL before the
+	 * first read can fail. */
+	memset(&metadata, 0, sizeof(metadata));
 
 	fd = fopen(cfg.database, "rb");
 	if (!fd){
