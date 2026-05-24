@@ -2287,6 +2287,20 @@ static json_t *pb_command_to_spec(json_t *cmd)
 	return out;
 }
 
+/* Map a bot's registered command array to the draft/bot-cmds wire schema
+ * (contexts rather than the stored visibility/scopes).  Returns a new array.
+ * Used everywhere commands go on the wire so clients always see `contexts`. */
+static json_t *pb_commands_to_spec_array(json_t *commands)
+{
+	json_t *out = json_array();
+	if (commands) {
+		size_t i; json_t *c;
+		json_array_foreach(commands, i, c)
+			json_array_append_new(out, pb_command_to_spec(c));
+	}
+	return out;
+}
+
 /* Reply to a +draft/bot-cmds-query TAGMSG with the bot's command
  * schema, base64-encoded, addressed back to the querying client. */
 static void pb_send_botcmds_to(Client *client, PbBot *b)
@@ -2295,13 +2309,7 @@ static void pb_send_botcmds_to(Client *client, PbBot *b)
 	json_t *body = json_object();
 	if (b->prefix)
 		json_object_set_new(body, "prefix", json_string(b->prefix));
-	json_t *cmds = json_array();
-	if (b->commands) {
-		size_t i; json_t *c;
-		json_array_foreach(b->commands, i, c)
-			json_array_append_new(cmds, pb_command_to_spec(c));
-	}
-	json_object_set_new(body, "commands", cmds);
+	json_object_set_new(body, "commands", pb_commands_to_spec_array(b->commands));
 	char *json_str = json_dumps(body, JSON_COMPACT);
 	json_decref(body);
 	if (!json_str) return;
@@ -3115,10 +3123,10 @@ static json_t *pb_bot_to_burst_json(PbBot *b, int for_oper, const char *event)
 	}
 	json_object_set_new(j, "channels", chans);
 
-	if (b->commands)
-		json_object_set_new(j, "commands", json_incref(b->commands));
-	else
-		json_object_set_new(j, "commands", json_array());
+	/* Emit the spec schema (contexts), not the raw stored visibility/scopes, so
+	 * a client that populates its command list from the directory routes a
+	 * private command privately instead of broadcasting it to the channel. */
+	json_object_set_new(j, "commands", pb_commands_to_spec_array(b->commands));
 
 	if (for_oper) {
 		json_object_set_new(j, "webhook_url",
