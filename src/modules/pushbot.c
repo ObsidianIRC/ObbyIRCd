@@ -163,6 +163,10 @@ struct PbInteraction {
 	                           * back as +obby.world/invoked-by on the bot's
 	                           * reply so the client can render a quote
 	                           * attribution without local state. */
+	int invoked_public;       /* 1 = invoked publicly in-channel; 0 = private/pm.
+	                           * A non-public invocation must never reply to the
+	                           * channel, regardless of the visibility the bot
+	                           * returns -- otherwise a private command leaks. */
 	PbBot *bot;
 	time_t expires_at;        /* hard timeout: 3s default, 15s after defer */
 	int deferred;
@@ -383,7 +387,8 @@ static int  pb_route_botcmd_channel(Client *invoker, Channel *channel,
 static int  pb_route_botcmd_user(Client *invoker, Client *to, MessageTag *mtags,
                                  const char *botcmd_b64, const char *channel_context);
 static PbInteraction *pb_interaction_new(PbBot *bot, Client *invoker,
-                                         const char *channel, const char *msgid);
+                                         const char *channel, const char *msgid,
+                                         int invoked_public);
 static PbInteraction *pb_interaction_find(const char *id);
 static void pb_interaction_free(PbInteraction *it);
 EVENT(pb_interaction_timeout_check);
@@ -2344,9 +2349,11 @@ static PbInteraction *pb_interaction_find(const char *id)
 }
 
 static PbInteraction *pb_interaction_new(PbBot *bot, Client *invoker,
-                                         const char *channel, const char *msgid)
+                                         const char *channel, const char *msgid,
+                                         int invoked_public)
 {
 	PbInteraction *it = safe_alloc(sizeof(*it));
+	it->invoked_public = invoked_public;
 	char idbuf[64];
 	snprintf(idbuf, sizeof(idbuf), "iact.%lx.%lx",
 	         (unsigned long)TStime(), (unsigned long)rand());
@@ -2559,7 +2566,7 @@ static const char *pb_validate_invocation(PbBot *bot, const char *cmd_name,
  * are known.  Generates an interaction id, fires COMMAND_INVOKE. */
 static void pb_dispatch_command(PbBot *bot, Client *invoker,
                                 const char *channel, const char *invoker_msgid,
-                                json_t *cmd_json)
+                                int invoked_public, json_t *cmd_json)
 {
 	if (!bot || !invoker || !cmd_json) {
 		if (cmd_json) json_decref(cmd_json);
@@ -2593,7 +2600,8 @@ static void pb_dispatch_command(PbBot *bot, Client *invoker,
 		json_decref(cmd_json);
 		return;
 	}
-	PbInteraction *it = pb_interaction_new(bot, invoker, channel, invoker_msgid);
+	PbInteraction *it = pb_interaction_new(bot, invoker, channel, invoker_msgid,
+	                                       invoked_public);
 
 	json_t *d = json_object();
 	json_object_set_new(d, "id", json_string(it->id));
@@ -2761,7 +2769,9 @@ static int pb_try_upgrade_legacy(PbBot *bot, Client *invoker,
 	json_t *cmd = json_object();
 	json_object_set_new(cmd, "name", json_string(name));
 	json_object_set_new(cmd, "options", options);
-	pb_dispatch_command(bot, invoker, channel, msgid, cmd);  /* takes ownership */
+	/* A legacy "<prefix><cmd>" typed in a channel is a public invocation; in a
+	 * DM it is pm. */
+	pb_dispatch_command(bot, invoker, channel, msgid, channel ? 1 : 0, cmd);
 	return 1;
 }
 
@@ -2791,8 +2801,18 @@ static int pb_bot_has_command(PbBot *b, const char *name)
 static PbBot *pb_resolve_channel_botcmd(Channel *ch, json_t *cmd,
                                         const char *target_nick)
 {
-	if (target_nick && *target_nick)
-		return pb_find_bot_by_nick(target_nick);
+	if (target_nick && *target_nick) {
+		/* A named (disambiguated) bot must still be reachable from THIS channel:
+		 * server-scope bots are reachable everywhere, channel-scope bots only in
+		 * channels they are actually in.  Without this check a channel-scope bot
+		 * could be invoked from any channel just by naming it. */
+		PbBot *b = pb_find_bot_by_nick(target_nick);
+		if (!b || b->status != PB_STATUS_ACTIVE)
+			return NULL;
+		if (b->scope == PB_SCOPE_SERVER || pb_bot_is_in_channel(b, ch))
+			return b;
+		return NULL;
+	}
 	const char *name = NULL;
 	json_t *nmj = json_object_get(cmd, "name");
 	if (json_is_string(nmj)) name = json_string_value(nmj);
@@ -2848,7 +2868,7 @@ static int pb_route_botcmd_channel(Client *invoker, Channel *channel,
 	}
 
 	pb_downgrade_invocation(invoker, channel, bot, cmd);
-	pb_dispatch_command(bot, invoker, channel->name, msgid, cmd);
+	pb_dispatch_command(bot, invoker, channel->name, msgid, 1, cmd);  /* public */
 	return 0;
 }
 
@@ -2904,7 +2924,7 @@ static int pb_route_botcmd_user(Client *invoker, Client *to, MessageTag *mtags,
 	for (MessageTag *m = mtags; m; m = m->next)
 		if (m->name && !strcmp(m->name, "msgid")) { msgid = m->value; break; }
 
-	pb_dispatch_command(bot, invoker, channel_context, msgid, cmd);
+	pb_dispatch_command(bot, invoker, channel_context, msgid, 0, cmd);  /* private/pm */
 	return 0;
 }
 
@@ -2948,7 +2968,12 @@ static void pb_send_interaction_reply(PbInteraction *it, const char *content,
 	if (!it->bot || !it->bot->ghost) return;
 
 	int as_notice = ephemeral ? 1 : 0;
-	int public_visible = (visibility && !strcasecmp(visibility, "public"));
+	/* Privacy: only a publicly-invoked command may reply into the channel. A
+	 * private/pm invocation is always whispered, whatever visibility the bot
+	 * asked for -- this stops a "private" command leaking to the channel when a
+	 * bot omits (or mis-sets) the response visibility. */
+	int public_visible = it->invoked_public &&
+	                     (visibility && !strcasecmp(visibility, "public"));
 
 	if (it->channel && public_visible) {
 		/* Public reply in-channel: PRIVMSG <ch> from bot ghost. */
