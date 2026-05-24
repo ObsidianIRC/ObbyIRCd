@@ -95,6 +95,7 @@ func runMigrate(args []string) {
 	obsidian := fs.String("obsidian", "", "obsidian.db output path (sqlite)")
 	channel := fs.String("channel", "", "channel.db output path (UnrealDB v101)")
 	tkl := fs.String("tkl", "", "tkldb.db output path (UnrealDB v4999)")
+	metadata := fs.String("metadata", "", "metadata.db output path (k4be metadata-db format)")
 	dryRun := fs.Bool("dry-run", false, "preview only, no writes")
 	conflict := fs.String("on-conflict", "skip", "skip|fail|merge")
 	if err := fs.Parse(args); err != nil {
@@ -123,6 +124,7 @@ func runMigrate(args []string) {
 		ObsidianPath: *obsidian,
 		ChannelPath:  *channel,
 		TKLPath:      *tkl,
+		MetadataPath: *metadata,
 		DryRun:       *dryRun,
 		OnConflict:   policy,
 	})
@@ -153,6 +155,9 @@ func runMigrate(args []string) {
 	}
 	fmt.Printf("accounts: %d inserted, %d skipped, %d failed\n", inserted, skipped, failed)
 	fmt.Printf("channels: %d written\n", chInserted)
+	if rep.Metadata > 0 {
+		fmt.Printf("metadata: %d entries written\n", rep.Metadata)
+	}
 	if len(rep.Warnings) > 0 {
 		fmt.Println("warnings:")
 		for _, w := range rep.Warnings {

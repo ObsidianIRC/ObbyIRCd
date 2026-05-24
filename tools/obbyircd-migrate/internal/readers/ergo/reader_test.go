@@ -110,21 +110,21 @@ func TestReadErgoFixture(t *testing.T) {
 		t.Errorf("expected 2 accounts, got %d", len(b.Accounts))
 	}
 	var alice, bob *struct {
-		Pwd     string
-		Vhost   string
-		Aliases []string
-		Email   string
+		Pwd      string
+		Vhost    string
+		Aliases  []string
+		Email    string
 		HasSCRAM bool
-		Certfps []string
+		Certfps  []string
 	}
 	for _, a := range b.Accounts {
 		v := &struct {
-			Pwd     string
-			Vhost   string
-			Aliases []string
-			Email   string
+			Pwd      string
+			Vhost    string
+			Aliases  []string
+			Email    string
 			HasSCRAM bool
-			Certfps []string
+			Certfps  []string
 		}{a.Password.Scheme, a.Vhost, a.Aliases, a.Email, a.SCRAM != nil, a.Certfps}
 		switch strings.ToLower(a.Name) {
 		case "alice":
@@ -179,5 +179,118 @@ func TestReadErgoFixture(t *testing.T) {
 	}
 	if len(ch.Akicks) != 1 {
 		t.Errorf("akicks = %+v", ch.Akicks)
+	}
+	if ch.Metadata["description"] != "staff channel" {
+		t.Errorf("channel metadata = %v", ch.Metadata)
+	}
+}
+
+// Fallback path: an Ergo db with NO account.metadata key but with
+// account.realname and account.settings.Email -- exercises the
+// scattered-key extraction added for pre-metadata-2 Ergo deploys.
+func TestReadErgoFallbackMetadata(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ircd.db")
+	db, err := buntdb.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	creds := map[string]any{
+		"Version":        1,
+		"PassphraseHash": []byte("$2a$10$xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+	}
+	credsJSON, _ := json.Marshal(creds)
+	if err := db.Update(func(tx *buntdb.Tx) error {
+		if _, _, err := tx.Set("account.exists charlie", "1", nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("account.name charlie", "Charlie", nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("account.credentials charlie", string(credsJSON), nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("account.realname charlie", "Charlie Brown", nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("account.settings charlie",
+			`{"Email":"charlie@example.com","AutoReplayMissed":false}`, nil); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("populate: %v", err)
+	}
+	_ = db.Close()
+
+	b, err := Read(path)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(b.Accounts) != 1 {
+		t.Fatalf("want 1 account, got %d", len(b.Accounts))
+	}
+	a := b.Accounts[0]
+	if a.Email != "charlie@example.com" {
+		t.Errorf("email = %q", a.Email)
+	}
+	if a.Metadata["realname"] != "Charlie Brown" {
+		t.Errorf("metadata.realname = %q", a.Metadata["realname"])
+	}
+	if a.Metadata["email"] != "charlie@example.com" {
+		t.Errorf("metadata.email = %q", a.Metadata["email"])
+	}
+}
+
+// account.metadata takes precedence over the fallback keys -- a user
+// who set draft.email via metadata-2 shouldn't have it clobbered by
+// the legacy account.settings.Email value on read.
+func TestReadErgoMetadataPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ircd.db")
+	db, err := buntdb.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	creds := map[string]any{
+		"Version":        1,
+		"PassphraseHash": []byte("$2a$10$xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+	}
+	credsJSON, _ := json.Marshal(creds)
+	if err := db.Update(func(tx *buntdb.Tx) error {
+		for _, kv := range [][2]string{
+			{"account.exists dave", "1"},
+			{"account.name dave", "Dave"},
+			{"account.credentials dave", string(credsJSON)},
+			{"account.realname dave", "legacy realname"},
+			{"account.settings dave", `{"Email":"legacy@example.com"}`},
+			{"account.metadata dave", `{"email":"new@example.com","realname":"new realname","avatar":"https://x/y.png"}`},
+		} {
+			if _, _, err := tx.Set(kv[0], kv[1], nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("populate: %v", err)
+	}
+	_ = db.Close()
+
+	b, err := Read(path)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	a := b.Accounts[0]
+	if a.Email != "new@example.com" {
+		t.Errorf("email = %q (account.metadata should win)", a.Email)
+	}
+	if a.Metadata["email"] != "new@example.com" {
+		t.Errorf("metadata.email = %q (account.metadata should win)", a.Metadata["email"])
+	}
+	if a.Metadata["realname"] != "new realname" {
+		t.Errorf("metadata.realname = %q (account.metadata should win)", a.Metadata["realname"])
+	}
+	if a.Metadata["avatar"] != "https://x/y.png" {
+		t.Errorf("metadata.avatar = %q (lost)", a.Metadata["avatar"])
 	}
 }
