@@ -146,7 +146,9 @@ struct PbBot {
 	time_t resume_expires_at; /* when the resume window closes (0 = active) */
 
 	/* Phase 5: slash commands the bot has registered. */
-	json_t *commands;         /* JSON array; each entry per spec §7.2 */
+	json_t *commands;         /* JSON array; each entry a draft/bot-cmds command */
+	char *prefix;             /* legacy text prefix (e.g. "!") for draft/bot-cmds
+	                           * compatibility translation; NULL = not bridged */
 };
 
 /* Outstanding interactions waiting for INTERACTION_RESPONSE. */
@@ -188,6 +190,7 @@ struct PbConfigBot {
 	char *token;
 	char *webhook_url;
 	char *webhook_secret;
+	char *prefix;          /* legacy text prefix for bot-cmds compat */
 	PbScope scope;
 	PbTransport transport;
 	NameList *auto_join;
@@ -212,6 +215,9 @@ static ModuleInfo *modinfo_ref = NULL;
  * happen. */
 #define PB_CAP_NAME "obby.world/channel-bots"
 static long CAP_CHANBOTS = 0L;
+/* draft/bot-cmds capability bit -- lets us tell capable clients from legacy
+ * ones for the compatibility translation. */
+static long CAP_BOT_CMDS = 0L;
 static long pb_cap_away_notify = 0L;
 
 /* Broadcast a bot ghost's away state change to channel members who have
@@ -449,6 +455,17 @@ MOD_INIT()
 			config_error("[pushbot] ClientCapabilityAdd(%s) failed", PB_CAP_NAME);
 			return MOD_FAILED;
 		}
+
+		/* draft/bot-cmds: the slash-command capability itself.  Valueless;
+		 * negotiating it marks a client as "capable" so the compatibility
+		 * layer knows who still needs the legacy text rendering. */
+		ClientCapabilityInfo cmdcap;
+		memset(&cmdcap, 0, sizeof(cmdcap));
+		cmdcap.name = "draft/bot-cmds";
+		if (!ClientCapabilityAdd(modinfo->handle, &cmdcap, &CAP_BOT_CMDS)) {
+			config_error("[pushbot] ClientCapabilityAdd(draft/bot-cmds) failed");
+			return MOD_FAILED;
+		}
 		MessageTagHandlerInfo m;
 		memset(&m, 0, sizeof(m));
 		m.name = PB_BOT_INFO_TAG;
@@ -487,6 +504,9 @@ MOD_INIT()
 		MessageTagHandlerAdd(modinfo->handle, &m);
 		m.is_ok = pb_mtag_botcmds_changed_is_ok;
 		m.name = "+draft/bot-cmds-changed";
+		MessageTagHandlerAdd(modinfo->handle, &m);
+		m.is_ok = pb_mtag_botcmd_is_ok;
+		m.name = "+draft/bot-cmd-error";
 		MessageTagHandlerAdd(modinfo->handle, &m);
 	}
 	/* Forward client-prefixed bot-cmd tags from recv_mtags into the
@@ -738,6 +758,7 @@ static void pb_parse_bot_block(ConfigEntry *bot_ce)
 		else if (!strcmp(cep->name, "transport")) b->transport = pb_parse_transport(cep->value);
 		else if (!strcmp(cep->name, "webhook-url")) safe_strdup(b->webhook_url, cep->value);
 		else if (!strcmp(cep->name, "webhook-secret")) safe_strdup(b->webhook_secret, cep->value);
+		else if (!strcmp(cep->name, "prefix")) safe_strdup(b->prefix, cep->value);
 		else if (!strcmp(cep->name, "auto-join")) {
 			for (ConfigEntry *ch = cep->items; ch; ch = ch->next) {
 				if (ch->name && ch->name[0] == '#')
@@ -789,6 +810,7 @@ static void pb_free_pending_bot(PbConfigBot *b)
 	safe_free(b->token);
 	safe_free(b->webhook_url);
 	safe_free(b->webhook_secret);
+	safe_free(b->prefix);
 	free_entire_name_list(b->auto_join);
 	safe_free(b);
 }
@@ -1013,6 +1035,7 @@ static int pb_apply_pending_bots(void)
 			b->status = PB_STATUS_ACTIVE;
 			if (pc->webhook_url) safe_strdup(b->webhook_url, pc->webhook_url);
 			if (pc->webhook_secret) safe_strdup(b->webhook_secret, pc->webhook_secret);
+			if (pc->prefix) safe_strdup(b->prefix, pc->prefix);
 			AddListItem(b, bots);
 		} else {
 			/* Update mutable fields from new config */
@@ -1023,6 +1046,8 @@ static int pb_apply_pending_bots(void)
 			if (pc->webhook_url) safe_strdup(b->webhook_url, pc->webhook_url);
 			safe_free(b->webhook_secret);
 			if (pc->webhook_secret) safe_strdup(b->webhook_secret, pc->webhook_secret);
+			safe_free(b->prefix);
+			if (pc->prefix) safe_strdup(b->prefix, pc->prefix);
 			b->webhook_suspended = 0;  /* /REHASH clears suspension */
 			b->webhook_failures = 0;
 		}
@@ -1200,6 +1225,7 @@ static void pb_free_bot(PbBot *b)
 	safe_free(b->webhook_url);
 	safe_free(b->webhook_secret);
 	safe_free(b->config_token);
+	safe_free(b->prefix);
 	if (b->commands) json_decref(b->commands);
 	free_entire_name_list(b->auto_join);
 	DelListItem(b, bots);
@@ -2206,15 +2232,71 @@ static int pb_mtag_botcmds_changed_is_ok(Client *c, const char *n, const char *v
 	return 1;
 }
 
+/* Normalise one registered command to the draft/bot-cmds wire schema.
+ * Bots may register either the new shape (a `contexts` array of
+ * public/private/pm) or the older obby shape (`visibility` public|private +
+ * `scopes` channel|dm); either way we emit `contexts`.  name/description/
+ * options/requires pass through unchanged. */
+static json_t *pb_command_to_spec(json_t *cmd)
+{
+	json_t *out = json_object();
+	const char *pass[] = { "name", "description", "options", "requires", NULL };
+	for (int i = 0; pass[i]; i++) {
+		json_t *v = json_object_get(cmd, pass[i]);
+		if (v) json_object_set(out, pass[i], v);
+	}
+
+	json_t *ctx = json_object_get(cmd, "contexts");
+	if (json_is_array(ctx)) {
+		json_object_set(out, "contexts", ctx);
+		return out;
+	}
+
+	/* Derive contexts from the legacy visibility + scopes pair. */
+	const char *vis = "public";
+	json_t *vj = json_object_get(cmd, "visibility");
+	if (json_is_string(vj)) vis = json_string_value(vj);
+	int priv = !strcasecmp(vis, "private");
+
+	int has_channel = 0, has_dm = 0;
+	json_t *scopes = json_object_get(cmd, "scopes");
+	if (json_is_array(scopes)) {
+		size_t i; json_t *s;
+		json_array_foreach(scopes, i, s) {
+			if (!json_is_string(s)) continue;
+			if (!strcasecmp(json_string_value(s), "channel")) has_channel = 1;
+			else if (!strcasecmp(json_string_value(s), "dm")) has_dm = 1;
+		}
+	} else {
+		has_channel = 1;  /* no scopes => channel by default */
+	}
+
+	json_t *contexts = json_array();
+	if (has_channel)
+		json_array_append_new(contexts, json_string(priv ? "private" : "public"));
+	if (has_dm)
+		json_array_append_new(contexts, json_string("pm"));
+	if (json_array_size(contexts) == 0)
+		json_array_append_new(contexts, json_string(priv ? "private" : "public"));
+	json_object_set_new(out, "contexts", contexts);
+	return out;
+}
+
 /* Reply to a +draft/bot-cmds-query TAGMSG with the bot's command
  * schema, base64-encoded, addressed back to the querying client. */
 static void pb_send_botcmds_to(Client *client, PbBot *b)
 {
 	if (!client || !b || !b->ghost) return;
 	json_t *body = json_object();
-	json_object_set_new(body, "version", json_integer(1));
-	json_object_set_new(body, "commands",
-	    b->commands ? json_incref(b->commands) : json_array());
+	if (b->prefix)
+		json_object_set_new(body, "prefix", json_string(b->prefix));
+	json_t *cmds = json_array();
+	if (b->commands) {
+		size_t i; json_t *c;
+		json_array_foreach(b->commands, i, c)
+			json_array_append_new(cmds, pb_command_to_spec(c));
+	}
+	json_object_set_new(body, "commands", cmds);
 	char *json_str = json_dumps(body, JSON_COMPACT);
 	json_decref(body);
 	if (!json_str) return;
@@ -2343,6 +2425,136 @@ static char *pb_b64_decode_alloc(const char *b64, int *outlen)
 	return buf;
 }
 
+/* draft/bot-cmds §Reporting an error: a NOTICE to the invoker carrying
+ * +draft/bot-cmd-error=<CODE>, correlated with +reply, whispered against the
+ * channel for a private invocation.  `from` is the bot ghost name, or the
+ * server name when no bot/command resolved. */
+static void pb_send_botcmd_error(Client *invoker, const char *from,
+                                 const char *channel, const char *msgid,
+                                 const char *code, const char *human)
+{
+	if (!invoker || !from || !code) return;
+	MessageTag *tags = NULL, *m;
+	if (msgid && *msgid) {
+		m = safe_alloc(sizeof(*m));
+		safe_strdup(m->name, "+reply");
+		safe_strdup(m->value, msgid);
+		AddListItem(m, tags);
+	}
+	if (channel && *channel) {
+		m = safe_alloc(sizeof(*m));
+		safe_strdup(m->name, "+draft/channel-context");
+		safe_strdup(m->value, channel);
+		AddListItem(m, tags);
+	}
+	m = safe_alloc(sizeof(*m));
+	safe_strdup(m->name, "+draft/bot-cmd-error");
+	safe_strdup(m->value, code);
+	AddListItem(m, tags);
+	sendto_one(invoker, tags, ":%s NOTICE %s :%s",
+	           from, invoker->name, human ? human : code);
+	free_message_tags(tags);
+}
+
+/* Find a registered command definition by name (case-insensitive). */
+static json_t *pb_find_command_def(PbBot *b, const char *name)
+{
+	if (!b || !b->commands || !name) return NULL;
+	size_t i; json_t *c;
+	json_array_foreach(b->commands, i, c) {
+		json_t *n = json_object_get(c, "name");
+		if (json_is_string(n) && !strcasecmp(json_string_value(n), name))
+			return c;
+	}
+	return NULL;
+}
+
+/* draft/bot-cmds min-channel-rank ladder: voice=1 .. owner=5. */
+static int pb_rank_level(const char *name)
+{
+	if (!name) return 0;
+	if (!strcasecmp(name, "voice"))  return 1;
+	if (!strcasecmp(name, "halfop")) return 2;
+	if (!strcasecmp(name, "op"))     return 3;
+	if (!strcasecmp(name, "admin"))  return 4;
+	if (!strcasecmp(name, "owner"))  return 5;
+	return 0;
+}
+static int pb_member_rank(Client *cli, Channel *ch)
+{
+	if (!cli || !cli->user || !ch) return 0;
+	Membership *mb = find_membership_link(cli->user->channel, ch);
+	if (!mb) return 0;
+	int r = 0;
+	if (strchr(mb->member_modes, 'v')) r = 1;
+	if (strchr(mb->member_modes, 'h')) r = 2;
+	if (strchr(mb->member_modes, 'o')) r = 3;
+	if (strchr(mb->member_modes, 'a')) r = 4;
+	if (strchr(mb->member_modes, 'q')) r = 5;
+	return r;
+}
+
+/* Validate an invocation against the advertised schema + gating.  Returns a
+ * draft/bot-cmds error code (and sets *human) on failure, or NULL if OK. */
+static const char *pb_validate_invocation(PbBot *bot, const char *cmd_name,
+                                          json_t *options, Client *invoker,
+                                          Channel *ch, const char **human)
+{
+	static char buf[160];
+	json_t *def = pb_find_command_def(bot, cmd_name);
+	if (!def) { *human = "No such command."; return "INVALID_COMMAND"; }
+
+	json_t *opts = json_object_get(def, "options");
+	if (json_is_array(opts)) {
+		size_t i; json_t *o;
+		json_array_foreach(opts, i, o) {
+			json_t *nmj = json_object_get(o, "name");
+			if (!json_is_string(nmj)) continue;
+			const char *oname = json_string_value(nmj);
+			json_t *val = options ? json_object_get(options, oname) : NULL;
+			if (json_is_true(json_object_get(o, "required")) && !val) {
+				snprintf(buf, sizeof buf, "Missing required option: %s", oname);
+				*human = buf; return "INVALID_OPTIONS";
+			}
+			json_t *choices = json_object_get(o, "choices");
+			if (val && json_is_array(choices) && json_array_size(choices) > 0) {
+				const char *vs = json_is_string(val) ? json_string_value(val) : NULL;
+				int ok = 0; size_t k; json_t *cj;
+				json_array_foreach(choices, k, cj)
+					if (json_is_string(cj) && vs &&
+					    !strcmp(json_string_value(cj), vs)) { ok = 1; break; }
+				if (!ok) {
+					snprintf(buf, sizeof buf, "Invalid value for option: %s", oname);
+					*human = buf; return "INVALID_OPTIONS";
+				}
+			}
+		}
+	}
+
+	json_t *req = json_object_get(def, "requires");
+	if (json_is_object(req)) {
+		if (json_is_true(json_object_get(req, "tls")) && !IsSecure(invoker)) {
+			*human = "This command requires a secure (TLS) connection.";
+			return "NOT_PERMITTED";
+		}
+		if (json_is_true(json_object_get(req, "account")) && !IsLoggedIn(invoker)) {
+			*human = "This command requires you to be logged in to an account.";
+			return "NOT_PERMITTED";
+		}
+		json_t *mr = json_object_get(req, "min-channel-rank");
+		if (json_is_string(mr) && ch) {
+			int need = pb_rank_level(json_string_value(mr));
+			if (need && pb_member_rank(invoker, ch) < need) {
+				snprintf(buf, sizeof buf,
+				         "This command requires channel rank: %s",
+				         json_string_value(mr));
+				*human = buf; return "NOT_PERMITTED";
+			}
+		}
+	}
+	return NULL;
+}
+
 /* Common dispatch path once the bot, invoker, and command JSON
  * are known.  Generates an interaction id, fires COMMAND_INVOKE. */
 static void pb_dispatch_command(PbBot *bot, Client *invoker,
@@ -2353,6 +2565,27 @@ static void pb_dispatch_command(PbBot *bot, Client *invoker,
 		if (cmd_json) json_decref(cmd_json);
 		return;
 	}
+
+	/* Validate against the advertised schema + gating before dispatching;
+	 * report failures via +draft/bot-cmd-error rather than acting. */
+	{
+		const char *vname = NULL;
+		json_t *vnm = json_object_get(cmd_json, "name");
+		if (json_is_string(vnm)) vname = json_string_value(vnm);
+		json_t *vopts = json_object_get(cmd_json, "options");
+		Channel *vch = channel ? find_channel(channel) : NULL;
+		const char *human = NULL;
+		const char *code = pb_validate_invocation(bot, vname ? vname : "",
+		                                          vopts, invoker, vch, &human);
+		if (code) {
+			pb_send_botcmd_error(invoker,
+			                     bot->ghost ? bot->ghost->name : me.name,
+			                     channel, invoker_msgid, code, human);
+			json_decref(cmd_json);
+			return;
+		}
+	}
+
 	if (!bot->session || !bot->session->identified ||
 	    !bot->session->client || IsDead(bot->session->client)) {
 		sendto_one(invoker, NULL, ":%s FAIL BOTCMD BOT_OFFLINE %s :Bot is offline",
@@ -2402,6 +2635,134 @@ static void pb_dispatch_command(PbBot *bot, Client *invoker,
 
 	pb_dispatch_event(bot, "COMMAND_INVOKE", d);
 	json_decref(cmd_json);
+}
+
+/* ── draft/bot-cmds legacy compatibility ──────────────────────────────────── */
+
+/* Append one option value to a legacy text rendering buffer. */
+static int pb_append_value(char *buf, int n, size_t cap, json_t *v)
+{
+	char vbuf[160];
+	if (json_is_string(v))
+		strlcpy(vbuf, json_string_value(v), sizeof vbuf);
+	else if (json_is_integer(v))
+		snprintf(vbuf, sizeof vbuf, "%lld", (long long)json_integer_value(v));
+	else if (json_is_real(v))
+		snprintf(vbuf, sizeof vbuf, "%g", json_real_value(v));
+	else if (json_is_true(v)) strlcpy(vbuf, "true", sizeof vbuf);
+	else if (json_is_false(v)) strlcpy(vbuf, "false", sizeof vbuf);
+	else return n;
+	if (n < (int)cap)
+		n += snprintf(buf + n, cap - n, " %s", vbuf);
+	return n;
+}
+
+/* §Downgrading a structured invocation: render the invocation in the bot's
+ * legacy "<prefix><name> v1 v2 ..." form (values in schema order) and send it,
+ * as a PRIVMSG from the invoker, only to channel members that have NOT
+ * negotiated draft/bot-cmds and are not bots -- so legacy users see what ran.
+ * No-op unless the bot has a configured prefix. */
+static void pb_downgrade_invocation(Client *invoker, Channel *channel,
+                                    PbBot *bot, json_t *cmd)
+{
+	if (!bot->prefix || !invoker || !invoker->user || !channel) return;
+	const char *name = NULL;
+	json_t *nmj = json_object_get(cmd, "name");
+	if (json_is_string(nmj)) name = json_string_value(nmj);
+	if (!name) return;
+	json_t *options = json_object_get(cmd, "options");
+
+	char text[512];
+	int n = snprintf(text, sizeof text, "%s%s", bot->prefix, name);
+	json_t *def = pb_find_command_def(bot, name);
+	json_t *opts = def ? json_object_get(def, "options") : NULL;
+	if (json_is_array(opts) && json_is_object(options)) {
+		size_t i; json_t *o;
+		json_array_foreach(opts, i, o) {
+			json_t *onm = json_object_get(o, "name");
+			if (!json_is_string(onm)) continue;
+			json_t *v = json_object_get(options, json_string_value(onm));
+			if (v) n = pb_append_value(text, n, sizeof text, v);
+		}
+	}
+
+	const char *umask_user = invoker->user->username;
+	const char *umask_host = GetHost(invoker);
+	for (Member *mem = channel->members; mem; mem = mem->next) {
+		Client *t = mem->client;
+		if (!MyUser(t)) continue;
+		if (t == invoker) continue;
+		if (CAP_BOT_CMDS && HasCapabilityFast(t, CAP_BOT_CMDS)) continue;
+		if (has_user_mode(t, 'B')) continue;
+		sendto_one(t, NULL, ":%s!%s@%s PRIVMSG %s :%s",
+		           invoker->name, umask_user, umask_host, channel->name, text);
+	}
+}
+
+/* §Upgrading a legacy invocation: if `text` is a "<prefix><name> args" line for
+ * a command this bot publishes, build a structured invocation (mapping
+ * whitespace-separated args onto options in schema order) and dispatch it.
+ * Returns 1 if handled (caller should not also fire MESSAGE_CREATE for this
+ * bot), 0 otherwise.  No-op unless the bot has a configured prefix. */
+static int pb_try_upgrade_legacy(PbBot *bot, Client *invoker,
+                                 const char *channel, const char *msgid,
+                                 const char *text)
+{
+	if (!bot->prefix || !text) return 0;
+	size_t plen = strlen(bot->prefix);
+	if (strncmp(text, bot->prefix, plen) != 0) return 0;
+	const char *rest = text + plen;
+	while (*rest == ' ') rest++;
+	if (!*rest) return 0;
+
+	char name[64];
+	size_t i = 0;
+	while (rest[i] && rest[i] != ' ' && i < sizeof(name) - 1) { name[i] = rest[i]; i++; }
+	name[i] = '\0';
+	json_t *def = pb_find_command_def(bot, name);
+	if (!def) return 0;
+
+	const char *args = rest + i;
+	while (*args == ' ') args++;
+
+	json_t *options = json_object();
+	json_t *opts = json_object_get(def, "options");
+	if (json_is_array(opts) && *args) {
+		size_t nopts = json_array_size(opts);
+		const char *p = args;
+		for (size_t k = 0; k < nopts && *p; k++) {
+			json_t *o = json_array_get(opts, k);
+			json_t *onm = json_object_get(o, "name");
+			if (!json_is_string(onm)) continue;
+			const char *oname = json_string_value(onm);
+			char val[256];
+			if (k == nopts - 1) {           /* last option soaks up the rest */
+				strlcpy(val, p, sizeof val);
+				p += strlen(p);
+			} else {
+				size_t j = 0;
+				while (*p && *p != ' ' && j < sizeof(val) - 1) val[j++] = *p++;
+				val[j] = '\0';
+				while (*p == ' ') p++;
+			}
+			json_t *otype = json_object_get(o, "type");
+			const char *ty = json_is_string(otype) ? json_string_value(otype) : "string";
+			if (!strcmp(ty, "int"))
+				json_object_set_new(options, oname, json_integer(atoll(val)));
+			else if (!strcmp(ty, "bool"))
+				json_object_set_new(options, oname,
+				    (!strcmp(val, "true") || !strcmp(val, "1") ||
+				     !strcmp(val, "yes")) ? json_true() : json_false());
+			else
+				json_object_set_new(options, oname, json_string(val));
+		}
+	}
+
+	json_t *cmd = json_object();
+	json_object_set_new(cmd, "name", json_string(name));
+	json_object_set_new(cmd, "options", options);
+	pb_dispatch_command(bot, invoker, channel, msgid, cmd);  /* takes ownership */
+	return 1;
 }
 
 /* Resolve the target bot from a TAGMSG sent to a channel.  Strategy:
@@ -2470,20 +2831,23 @@ static int pb_route_botcmd_channel(Client *invoker, Channel *channel,
 		return 0;
 	}
 	const char *target_nick = NULL;
-	json_t *tj = json_object_get(cmd, "target");
+	json_t *tj = json_object_get(cmd, "bot");       /* draft/bot-cmds disambiguation */
+	if (!json_is_string(tj)) tj = json_object_get(cmd, "target"); /* legacy fallback */
 	if (json_is_string(tj)) target_nick = json_string_value(tj);
-
-	PbBot *bot = pb_resolve_channel_botcmd(channel, cmd, target_nick);
-	if (!bot) {
-		sendto_one(invoker, NULL, ":%s FAIL BOTCMD NO_SUCH_BOT :bot-cmd: no such bot/command", me.name);
-		json_decref(cmd);
-		return 0;
-	}
 
 	const char *msgid = NULL;
 	for (MessageTag *m = mtags; m; m = m->next)
 		if (m->name && !strcmp(m->name, "msgid")) { msgid = m->value; break; }
 
+	PbBot *bot = pb_resolve_channel_botcmd(channel, cmd, target_nick);
+	if (!bot) {
+		pb_send_botcmd_error(invoker, me.name, channel ? channel->name : NULL,
+		                     msgid, "INVALID_COMMAND", "No such command.");
+		json_decref(cmd);
+		return 0;
+	}
+
+	pb_downgrade_invocation(invoker, channel, bot, cmd);
 	pb_dispatch_command(bot, invoker, channel->name, msgid, cmd);
 	return 0;
 }
@@ -2510,6 +2874,13 @@ static int pb_route_botcmd_user(Client *invoker, Client *to, MessageTag *mtags,
 		sendto_one(invoker, NULL, ":%s FAIL BOTCMD INVALID :bot-cmd: invalid JSON", me.name);
 		return 0;
 	}
+
+	/* New spec: a private-context invocation carries the channel it relates to
+	 * in the payload (+draft/channel-context is not valid on TAGMSG).  Prefer
+	 * that over the legacy channel-context tag. */
+	json_t *chj = json_object_get(cmd, "channel");
+	if (json_is_string(chj) && *json_string_value(chj))
+		channel_context = json_string_value(chj);
 
 	/* Validate channel_context: the invoker must be in the channel.
 	 * For channel-scope bots the bot ghost must also be a member;
@@ -3137,6 +3508,16 @@ static int pb_hook_chanmsg(Client *client, Channel *channel, int sendflags,
 		if (!pb_bot_is_in_channel(b, channel)) continue;
 		if (pb_skip_sender(client, b)) continue;
 
+		/* Legacy compat: upgrade a plain "<prefix><cmd> args" PRIVMSG into a
+		 * structured invocation for this bot, in place of MESSAGE_CREATE. */
+		if (sendtype == SEND_TYPE_PRIVMSG) {
+			const char *umsgid = NULL;
+			for (MessageTag *m = mtags; m; m = m->next)
+				if (m->name && !strcmp(m->name, "msgid")) { umsgid = m->value; break; }
+			if (pb_try_upgrade_legacy(b, client, channel->name, umsgid, text))
+				continue;
+		}
+
 		json_t *d = json_object();
 		const char *msgid = NULL;
 		for (MessageTag *m = mtags; m; m = m->next)
@@ -3194,6 +3575,16 @@ static int pb_hook_usermsg(Client *client, Client *to, MessageTag *mtags,
 		if (!pb_bot_deliverable(b)) continue;
 		if (to != b->ghost) continue;     /* DM addressed at this bot only */
 		if (pb_skip_sender(client, b)) continue;
+
+		/* Legacy compat: upgrade a plain "<prefix><cmd> args" DM into a
+		 * structured (pm-context) invocation, in place of MESSAGE_CREATE. */
+		if (sendtype == SEND_TYPE_PRIVMSG) {
+			const char *umsgid = NULL;
+			for (MessageTag *m = mtags; m; m = m->next)
+				if (m->name && !strcmp(m->name, "msgid")) { umsgid = m->value; break; }
+			if (pb_try_upgrade_legacy(b, client, NULL, umsgid, text))
+				continue;
+		}
 
 		json_t *d = json_object();
 		const char *msgid = NULL;
