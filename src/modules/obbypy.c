@@ -423,7 +423,7 @@ static PyObject *PyClient_getattro(PyObject *self, PyObject *name_obj)
 	if (!strcmp(name, "is_local"))
 		return PyBool_FromLong(MyConnect(o->c) ? 1 : 0);
 	if (!strcmp(name, "server")) {
-		Client *s = o->c->user ? o->c->user->server : o->c->uplink;
+		Client *s = o->c->user ? find_server_quick(o->c->user->server) : o->c->uplink;
 		if (s)
 			return py_server_new(s);
 		Py_RETURN_NONE;

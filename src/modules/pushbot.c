@@ -3914,8 +3914,7 @@ static json_t *pb_bot_to_json(PbBot *b)
 	    json_string(b->webhook_url ? b->webhook_url : ""));
 	json_object_set_new(o, "online",
 	    json_boolean(b->session && b->session->identified));
-	json_object_set_new(o, "channels_count", json_integer(
-	    b->ghost && b->ghost->user ? 0 : 0));  /* TODO membership count */
+	json_object_set_new(o, "channels_count", json_integer(0));  /* TODO membership count */
 	return o;
 }
 
@@ -4255,16 +4254,12 @@ static void pb_rest_react(Client *client, WebRequest *web, PbBot *b,
 		the_emoji = pb_post_string_field(client, web, "emoji", &owner);
 		if (!the_emoji) return;
 	}
-	/* React via TAGMSG with the IRCv3 react tag. */
-	if (remove) {
-		sendto_channel(ch, b->ghost, NULL, 0, 0, SEND_ALL, NULL,
-		               "@+draft/react=%s;+draft/reply=%s TAGMSG %s",
-		               the_emoji, msgid, ch->name);
-	} else {
-		sendto_channel(ch, b->ghost, NULL, 0, 0, SEND_ALL, NULL,
-		               "@+draft/react=%s;+draft/reply=%s TAGMSG %s",
-		               the_emoji, msgid, ch->name);
-	}
+	/* React via TAGMSG with the IRCv3 react tag.  Reaction removal is not yet
+	 * differentiated on the wire, so add and remove emit the same react. */
+	(void)remove;
+	sendto_channel(ch, b->ghost, NULL, 0, 0, SEND_ALL, NULL,
+	               "@+draft/react=%s;+draft/reply=%s TAGMSG %s",
+	               the_emoji, msgid, ch->name);
 	if (owner) json_decref(owner);
 	json_t *body = json_object();
 	json_object_set_new(body, "ok", json_true());
