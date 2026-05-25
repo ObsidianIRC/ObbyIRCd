@@ -36,6 +36,16 @@
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif
 
+/* Maximum length of a single chunked-transfer chunk header
+ * (the line announcing a chunk, eg. "7f\r\n", optionally with
+ * chunk extensions like "7f;name=value\r\n"). This is NOT the
+ * size of the chunk data itself.
+ * Caps how much we will buffer while waiting for the terminating
+ * LF so a server that streams a chunk header with no LF cannot
+ * grow handle->lefttoparse without bound.
+ */
+#define HTTPS_MAX_CHUNK_HEADER_LEN	256
+
 /* Structs */
 
 /* Stores information about the async transfer.
@@ -53,6 +63,7 @@ struct Download
 	char *memory_data; /**< Memory for writing response (otherwise NULL) */
 	long long memory_data_len; /**< Size of memory_data */
 	long long memory_data_allocated; /**< Total allocated memory for 'memory_data' */
+	long long bytes_written_to_file; /**< Bytes written to file_fd so far (for max_size cap) */
 	char errorbuf[512];
 	char *hostname;		/**< Parsed hostname (from 'url') */
 	int port;		/**< Parsed port (from 'url') */
@@ -180,7 +191,7 @@ void url_start_async(OutgoingWebRequest *request)
 	if (request->transfer_timeout == 0)
 		request->transfer_timeout = DOWNLOAD_TRANSFER_TIMEOUT;
 	if (request->max_size <= 0)
-		request->max_size = DOWNLOAD_MAX_SIZE;
+		request->max_size = request->store_in_file ? DOWNLOAD_MAX_SIZE_FILE_BACKED : DOWNLOAD_MAX_SIZE_MEMORY_BACKED;
 
 	handle = safe_alloc(sizeof(Download));
 	handle->download_started = TStime();
@@ -486,6 +497,7 @@ int https_fatal_tls_error(int ssl_error, int my_errno, Download *handle)
 int url_parse(const char *url, char **hostname, int *port, char **username, char **password, char **document)
 {
 	char *p, *p2;
+	const char *q;
 	static char hostbuf[256];
 	static char documentbuf[512];
 
@@ -494,6 +506,12 @@ int url_parse(const char *url, char **hostname, int *port, char **username, char
 
 	if (strncmp(url, "https://", 8))
 		return 0;
+
+	/* Refuse control chars and space (would allow request-line injection). */
+	for (q = url; *q; q++)
+		if (*q <= ' ')
+			return 0;
+
 	url += 8; /* skip over https:// part */
 
 	p = strchr(url, '/');
@@ -869,7 +887,15 @@ int https_handle_response_body(Download *handle, char *readbuf, int pktsize)
 			https_handle_response_body_memory(handle, readbuf, pktsize);
 		}
 		else if (handle->file_fd)
+		{
+			if (handle->bytes_written_to_file + pktsize > handle->request->max_size)
+			{
+				https_cancel(handle, "Response too large (maximum: %lld bytes)", handle->request->max_size);
+				return 0; /* handle freed */
+			}
 			fwrite(readbuf, 1, pktsize, handle->file_fd);
+			handle->bytes_written_to_file += pktsize;
+		}
 		return 1;
 	}
 
@@ -907,14 +933,23 @@ int https_handle_response_body(Download *handle, char *readbuf, int pktsize)
 				https_handle_response_body_memory(handle, buf, eat);
 			}
 			else if (handle->file_fd)
+			{
+				if (handle->bytes_written_to_file + eat > handle->request->max_size)
+				{
+					https_cancel(handle, "Response too large (maximum: %lld bytes)", handle->request->max_size);
+					safe_free(free_this_buffer);
+					return 0; /* handle freed */
+				}
 				fwrite(buf, 1, eat, handle->file_fd);
+				handle->bytes_written_to_file += eat;
+			}
 			n -= eat;
 			buf += eat;
 			handle->chunk_remaining -= eat;
 		} else
 		{
 			int gotlf = 0;
-			int i;
+			long long i;
 
 			/* First check if it is a (trailing) empty line,
 			 * eg from a previous chunk. Skip over.
@@ -948,6 +983,16 @@ int https_handle_response_body(Download *handle, char *readbuf, int pktsize)
 				 * as it does not contain an \n. Wait for more data
 				 * from the network socket.
 				 */
+				if (n > HTTPS_MAX_CHUNK_HEADER_LEN)
+				{
+					/* A chunk-size line should never be this long;
+					 * refuse to keep buffering otherwise a malicious
+					 * server can grow lefttoparse without bound.
+					 */
+					https_cancel(handle, "Chunk size line too long (%lld bytes, no LF)", n);
+					safe_free(free_this_buffer);
+					return 0;
+				}
 				if (n > 0)
 				{
 					/* Store what we have first.. */
@@ -960,7 +1005,14 @@ int https_handle_response_body(Download *handle, char *readbuf, int pktsize)
 			}
 			buf[i] = '\0'; /* cut at LF */
 			i++; /* point to next data */
+			errno = 0;
 			handle->chunk_remaining = strtoll(buf, NULL, 16);
+			if (errno == ERANGE)
+			{
+				https_cancel(handle, "Chunk size out of range: '%s'", buf);
+				safe_free(free_this_buffer);
+				return 0;
+			}
 			if (handle->chunk_remaining < 0)
 			{
 				https_cancel(handle, "Negative chunk encountered (%lld)", handle->chunk_remaining);
