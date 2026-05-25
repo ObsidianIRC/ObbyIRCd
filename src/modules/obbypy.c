@@ -2766,10 +2766,23 @@ MOD_INIT()
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, obbypy_configrun);
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 1, obbypy_dispatch_configrun);
 
+	RegisterApiCallbackWebResponse(modinfo->handle, HTTP_API_CALLBACK_NAME,
+	                               obbypy_http_callback);
+	return MOD_SUCCESS;
+}
+
+MOD_LOAD()
+{
 	/* AppendInittab + Py_Initialize is a one-time-per-process setup;
 	 * Python aborts the process if AppendInittab is called after
-	 * Py_Initialize.  On /REHASH MOD_INIT runs again on the freshly
-	 * dlopened obbypy.so, so guard everything behind IsInitialized. */
+	 * Py_Initialize.  We do this in MOD_LOAD rather than MOD_INIT so the
+	 * interpreter is created only in the actually-running server.  The
+	 * config-test parent (and the -DTESTSUITE Init_all_testing_modules
+	 * dry-run) call MOD_INIT but never MOD_LOAD, then exit -- initialising
+	 * Python there left the interpreter unreferenced at exit, which
+	 * LeakSanitizer reports as a ~600KB leak.  On /REHASH MOD_LOAD runs
+	 * again on the freshly dlopened obbypy.so, so guard behind
+	 * IsInitialized (we never Py_Finalize, see MOD_UNLOAD). */
 	if (!Py_IsInitialized()) {
 		if (PyImport_AppendInittab("obby", PyInit_obby) == -1) {
 			config_error("[obbypy] PyImport_AppendInittab failed");
@@ -2782,13 +2795,6 @@ MOD_INIT()
 		}
 	}
 
-	RegisterApiCallbackWebResponse(modinfo->handle, HTTP_API_CALLBACK_NAME,
-	                               obbypy_http_callback);
-	return MOD_SUCCESS;
-}
-
-MOD_LOAD()
-{
 	load_scripts();
 	return MOD_SUCCESS;
 }
