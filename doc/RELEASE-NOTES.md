@@ -1,4 +1,4 @@
-UnrealIRCd 6.2.6-git
+UnrealIRCd 6.2.6
 =================
 
 This is the git version (development version) for future UnrealIRCd 6.2.6.
