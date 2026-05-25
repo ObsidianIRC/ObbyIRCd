@@ -17,6 +17,12 @@ rm -rf unrealircd-tests/
 git clone -q --branch unreal60 https://github.com/unrealircd/unrealircd-tests.git unrealircd-tests
 cd unrealircd-tests
 
+# The upstream test harness boots the server via 'bin/unrealircd' and reads
+# 'data/unrealircd.pid'. ObbyIRCd renamed the binary/pidfile to obbyircd, so
+# adapt the freshly-cloned run script to our names (leaves serverconfig paths
+# untouched).
+sed -i 's@bin/unrealircd @bin/obbyircd @g; s@unrealircd\.pid@obbyircd.pid@g' run
+
 # FreeBSD has various issues with the tests from us and others,
 # better set a flag to keep it simple:
 if uname -a|grep -q FreeBSD; then
