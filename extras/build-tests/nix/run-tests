@@ -23,6 +23,12 @@ cd unrealircd-tests
 # untouched).
 sed -i 's@bin/unrealircd @bin/obbyircd @g; s@unrealircd\.pid@obbyircd.pid@g' run
 
+# ObbyIRCd loads account-registration with RTLD_GLOBAL (so account-recovery can
+# share its DB layer). Under ASAN that exposes per-module 'Mod_Header' globals
+# in the global namespace, which the cross-DSO ODR checker false-positives on.
+# Disable that one check (the modules are genuinely distinct objects).
+sed -i 's@^export ASAN_OPTIONS=.*@&:detect_odr_violation=0@' run
+
 # FreeBSD has various issues with the tests from us and others,
 # better set a flag to keep it simple:
 if uname -a|grep -q FreeBSD; then

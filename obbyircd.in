@@ -14,7 +14,10 @@ DOCDIR="@DOCDIR@"
 
 # When built with --with-asan, ASan does not dump core by default because
 # older gcc/clang might dump a 16TB core file. We explicitly enable it here.
-export ASAN_OPTIONS="abort_on_error=1:disable_coredump=0:unmap_shadow_on_exit=1:log_path=$TMPDIR/unrealircd_asan:detect_leaks=0"
+# detect_odr_violation=0: we load account-registration with RTLD_GLOBAL so
+# account-recovery can share its DB layer; that exposes each module's
+# 'Mod_Header' global and trips ASan's cross-DSO ODR checker on a false match.
+export ASAN_OPTIONS="abort_on_error=1:disable_coredump=0:unmap_shadow_on_exit=1:log_path=$TMPDIR/unrealircd_asan:detect_leaks=0:detect_odr_violation=0"
 
 if [ ! -f $IRCD ]; then
 	echo "ERROR: Could not find the IRCd binary ($IRCD)"
