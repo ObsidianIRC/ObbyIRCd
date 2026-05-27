@@ -18,7 +18,7 @@ VPS as a successor to the existing UnrealIRCd installation there.
 | Core IRCd | UnrealIRCd 6.2.5 (`unreal60_dev`) | Periodically merged from `upstream/unreal60_dev` |
 | ObsidianIRC modules | `src/modules/*.c`, `include/obsidian.h` | First-class in the tree, not third-party |
 | Vendored from `valware/unrealircd-contrib` | `react.c`, `redact.c`, `channel-rename.c` | Imported in-tree, kept in sync manually |
-| Hosted services | [`ObsidianIRC/hosted-backend`](https://github.com/ObsidianIRC/hosted-backend) (Go, separate repo) | Separate binary, talks to the IRCd over JSON-RPC + an AF_UNIX socket. Published as `mattfly/obby-api:latest` and pulled by this repo's compose. |
+| Hosted services | [`ObsidianIRC/hosted-backend`](https://github.com/ObsidianIRC/hosted-backend) (Go, separate repo) | Separate binary, talks to the IRCd over JSON-RPC + an AF_UNIX socket. Published as `obbyirc/obby-api:latest` and pulled by this repo's compose. |
 | Migration tooling | `tools/obbyircd-migrate/` (Go) | Stand-alone CLI; reads Ergo/Anope/Atheme → writes ObbyIRCd stores |
 
 GPLv2, inherited from upstream. UnrealIRCd authorship and credit are
@@ -31,7 +31,7 @@ preserved everywhere.
 ├── Config, configure, configure.ac, autogen.sh
 ├── Makefile.in, BSDmakefile, Makefile.windows
 ├── obbyircd.in              (init wrapper template, substituted at build)
-├── compose.yaml             (full stack: obbyircd built locally + obby-api pulled from mattfly/obby-api + obby web pulled from mattfly/obby, frontend opt-in)
+├── compose.yaml             (full stack: obbyircd built locally + obby-api pulled from obbyirc/obby-api + obby web pulled from obbyirc/obby, frontend opt-in)
 ├── docker/
 │   ├── Dockerfile           (single Alpine stage, builds from this checkout)
 │   ├── docker-entrypoint.sh (first-run template render + custom-module build)
@@ -172,7 +172,7 @@ via `rpc.modules.default.conf`.
 
 ## 5. Hosted-backend
 
-Separate Go binary, source at [ObsidianIRC/hosted-backend](https://github.com/ObsidianIRC/hosted-backend), published as `mattfly/obby-api:latest`. The image is pulled (not built) by this repo's `compose.yaml`. Two integration channels:
+Separate Go binary, source at [ObsidianIRC/hosted-backend](https://github.com/ObsidianIRC/hosted-backend), published as `obbyirc/obby-api:latest`. The image is pulled (not built) by this repo's `compose.yaml`. Two integration channels:
 
 1. **JSON-RPC over TCP** (typically `127.0.0.1:8600`, opt-in via
    `RPC_PASSWORD`). The backend authenticates as an RPC user and calls
@@ -370,13 +370,13 @@ the IRCd).
 h4ks is **arm64 (aarch64)**, Ubuntu 24.04, Coolify v4.0.0, Traefik
 v3.6. The paired build server is `t3ks-dockerbuilder` (arm64, same
 arch). Coolify builds there and pushes to Dockerhub
-(`mattfly/obbyircd`), h4ks pulls. Both ends match arch.
+(`obbyirc/obbyircd`), h4ks pulls. Both ends match arch.
 
 Two Coolify applications:
 
 | App | Source | Public hostnames |
 |-----|--------|------------------|
-| obbyircd (full backend stack) | this repo's `compose.yaml` runs `obbyircd` (built here), `obby-api` (pulled from `mattfly/obby-api`, source at [ObsidianIRC/hosted-backend](https://github.com/ObsidianIRC/hosted-backend)) and `obby` web (pulled from `mattfly/obby`, source at [ObsidianIRC/ObsidianIRC](https://github.com/ObsidianIRC/ObsidianIRC), opt-in via `--profile frontend`) | `${IRC_FQDN}` (WS) + `${API_FQDN}` (REST) + `${WEB_FQDN}` (SPA) routed by compose labels |
+| obbyircd (full backend stack) | this repo's `compose.yaml` runs `obbyircd` (built here), `obby-api` (pulled from `obbyirc/obby-api`, source at [ObsidianIRC/hosted-backend](https://github.com/ObsidianIRC/hosted-backend)) and `obby` web (pulled from `obbyirc/obby`, source at [ObsidianIRC/ObsidianIRC](https://github.com/ObsidianIRC/ObsidianIRC), opt-in via `--profile frontend`) | `${IRC_FQDN}` (WS) + `${API_FQDN}` (REST) + `${WEB_FQDN}` (SPA) routed by compose labels |
 
 Both apps share `WEB_FQDN`, `API_FQDN`, `IRC_FQDN`, `NETWORK_NAME`,
 `SERVER_NAME`, `ADMIN_EMAIL`, `OPER_PASSWORD`, `VOICE_TURN_SECRET`,

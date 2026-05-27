@@ -40,7 +40,7 @@ services:
   # https://github.com/ObsidianIRC/hosted-backend
   # We just pull the published image here.
   obby-api:
-    image: ${OBBY_API_IMAGE:-mattfly/obby-api:latest}
+    image: ${OBBY_API_IMAGE:-obbyirc/obby-api:latest}
     container_name: obby-api
     restart: unless-stopped
     depends_on:
@@ -74,7 +74,7 @@ services:
   # Opt-in via `--profile frontend` (or set COMPOSE_PROFILES=frontend in .env)
   # so backend-only devs can `docker compose up` without pulling the SPA.
   obby:
-    image: ${OBBY_WEB_IMAGE:-mattfly/obby:latest}
+    image: ${OBBY_WEB_IMAGE:-obbyirc/obby:latest}
     container_name: obby-web
     restart: unless-stopped
     profiles: ["frontend"]

@@ -34,7 +34,7 @@ doc/conf/               default config files + example.conf
 doc/conf/scripts/       obbyscript example .js shipped to operators
 tools/obbyircd-migrate/ Go CLI: Ergo/Anope/Atheme → obbyircd
 docker/                 single-stage Alpine Dockerfile + entrypoint + conf template
-compose.yaml            Coolify deploy: obbyircd (built here) + obby-api (mattfly/obby-api) + obby web (mattfly/obby, opt-in)
+compose.yaml            Coolify deploy: obbyircd (built here) + obby-api (obbyirc/obby-api) + obby web (obbyirc/obby, opt-in)
 ```
 
 The "where is X" answer is almost always *the upstream UnrealIRCd

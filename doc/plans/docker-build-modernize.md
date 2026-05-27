@@ -110,7 +110,7 @@ day `feat/h4ks-fixes` lands.
 
 ## Out of scope
 
-- Replacing `mattfly/*` Docker Hub repos with GHCR — separate decision
+- Replacing `obbyirc/*` Docker Hub repos with GHCR — separate decision
   about hosting/billing.
 - Per-PR ephemeral environments.
 - Speeding up the C build itself (e.g. ccache layer). Easy follow-up

@@ -204,7 +204,7 @@ See [docker/README.md](docker/README.md) for the full Docker reference.
 
 ## Hosted backend
 
-The hosted-backend (Go REST/JWT API + WebRTC SFU + TURN that works alongside the IRCd for account management, channel metadata, and image hosting) lives in its own repository: <https://github.com/ObsidianIRC/hosted-backend>. The published image `mattfly/obby-api:latest` is pulled by this repo's `compose.yaml`, so `docker compose up -d` brings up the full stack with no extra steps.
+The hosted-backend (Go REST/JWT API + WebRTC SFU + TURN that works alongside the IRCd for account management, channel metadata, and image hosting) lives in its own repository: <https://github.com/ObsidianIRC/hosted-backend>. The published image `obbyirc/obby-api:latest` is pulled by this repo's `compose.yaml`, so `docker compose up -d` brings up the full stack with no extra steps.
 
 To build the backend from source, clone its repo separately and follow the build instructions there.
 
