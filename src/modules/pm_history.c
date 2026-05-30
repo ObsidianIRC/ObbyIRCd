@@ -34,7 +34,7 @@
 
 ModuleHeader MOD_HEADER
 = {
-	"dm_history",
+	"pm_history",
 	"0.1",
 	"Ergo-style persistent CHATHISTORY for account-holder DMs",
 	"obbyircd",
@@ -44,32 +44,32 @@ ModuleHeader MOD_HEADER
 #define DMH_MAX_LIMIT  100   /* hard cap on any one CHATHISTORY response */
 #define DMH_TARGETS_MAX 100  /* hard cap on TARGETS results */
 
-static sqlite3 *dmh_db = NULL;
-static CommandOverride *dmh_ovr = NULL;
-static CommandOverride *dmh_redact_ovr = NULL;
+static sqlite3 *pmh_db = NULL;
+static CommandOverride *pmh_ovr = NULL;
+static CommandOverride *pmh_redact_ovr = NULL;
 
 /* Forward decls */
-static int dmh_open_db(void);
-static void dmh_close_db(void);
-static int dmh_ensure_schema(void);
-static int dmh_usermsg(Client *client, Client *to, MessageTag *mtags,
+static int pmh_open_db(void);
+static void pmh_close_db(void);
+static int pmh_ensure_schema(void);
+static int pmh_usermsg(Client *client, Client *to, MessageTag *mtags,
                        const char *text, SendType sendtype);
-CMD_OVERRIDE_FUNC(dmh_chathistory_override);
-CMD_OVERRIDE_FUNC(dmh_redact_override);
+CMD_OVERRIDE_FUNC(pmh_chathistory_override);
+CMD_OVERRIDE_FUNC(pmh_redact_override);
 
 MOD_INIT()
 {
 	MARK_AS_OFFICIAL_MODULE(modinfo);
 
-	if (dmh_open_db() != 0)
+	if (pmh_open_db() != 0)
 		return MOD_FAILED;
-	if (dmh_ensure_schema() != 0)
+	if (pmh_ensure_schema() != 0)
 	{
-		dmh_close_db();
+		pmh_close_db();
 		return MOD_FAILED;
 	}
 
-	HookAdd(modinfo->handle, HOOKTYPE_USERMSG, 0, dmh_usermsg);
+	HookAdd(modinfo->handle, HOOKTYPE_USERMSG, 0, pmh_usermsg);
 
 	return MOD_SUCCESS;
 }
@@ -79,9 +79,9 @@ MOD_LOAD()
 	/* CommandOverrideAdd must run in MOD_LOAD so the CHATHISTORY
 	 * command itself (registered by chathistory.so's MOD_INIT) is
 	 * already in the command table. */
-	dmh_ovr = CommandOverrideAdd(modinfo->handle, "CHATHISTORY", 0,
-	                             dmh_chathistory_override);
-	if (!dmh_ovr)
+	pmh_ovr = CommandOverrideAdd(modinfo->handle, "CHATHISTORY", 0,
+	                             pmh_chathistory_override);
+	if (!pmh_ovr)
 	{
 		config_error("dm_history: CommandOverrideAdd(CHATHISTORY) failed -- "
 		             "is chathistory.so loaded ahead of dm_history.so?");
@@ -89,9 +89,9 @@ MOD_LOAD()
 	}
 	/* REDACT override -- gives draft/message-redaction a DM code path
 	 * alongside the channel path the upstream redact.so handles. */
-	dmh_redact_ovr = CommandOverrideAdd(modinfo->handle, "REDACT", 0,
-	                                    dmh_redact_override);
-	if (!dmh_redact_ovr)
+	pmh_redact_ovr = CommandOverrideAdd(modinfo->handle, "REDACT", 0,
+	                                    pmh_redact_override);
+	if (!pmh_redact_ovr)
 	{
 		config_error("dm_history: CommandOverrideAdd(REDACT) failed -- "
 		             "is redact.so loaded ahead of dm_history.so?");
@@ -102,13 +102,9 @@ MOD_LOAD()
 
 MOD_UNLOAD()
 {
-	if (dmh_ovr)
-		CommandOverrideDel(dmh_ovr);
-	dmh_ovr = NULL;
-	if (dmh_redact_ovr)
-		CommandOverrideDel(dmh_redact_ovr);
-	dmh_redact_ovr = NULL;
-	dmh_close_db();
+	pmh_ovr = NULL;
+	pmh_redact_ovr = NULL;
+	pmh_close_db();
 	return MOD_SUCCESS;
 }
 
@@ -116,32 +112,32 @@ MOD_UNLOAD()
  * sqlite plumbing
  * ------------------------------------------------------------------ */
 
-static int dmh_open_db(void)
+static int pmh_open_db(void)
 {
-	if (sqlite3_open(OBSIDIAN_DB, &dmh_db) != SQLITE_OK)
+	if (sqlite3_open(OBSIDIAN_DB, &pmh_db) != SQLITE_OK)
 	{
 		config_error("dm_history: could not open %s: %s",
 		             OBSIDIAN_DB,
-		             dmh_db ? sqlite3_errmsg(dmh_db) : "(open failed)");
-		if (dmh_db) sqlite3_close(dmh_db);
-		dmh_db = NULL;
+		             pmh_db ? sqlite3_errmsg(pmh_db) : "(open failed)");
+		if (pmh_db) sqlite3_close(pmh_db);
+		pmh_db = NULL;
 		return -1;
 	}
 	/* WAL is what the other obsidian.db consumers use; matching their
 	 * journal mode avoids "database is locked" cross-handle. */
-	sqlite3_exec(dmh_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
-	sqlite3_exec(dmh_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
+	sqlite3_exec(pmh_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+	sqlite3_exec(pmh_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
 	return 0;
 }
 
-static void dmh_close_db(void)
+static void pmh_close_db(void)
 {
-	if (dmh_db)
-		sqlite3_close(dmh_db);
-	dmh_db = NULL;
+	if (pmh_db)
+		sqlite3_close(pmh_db);
+	pmh_db = NULL;
 }
 
-static int dmh_ensure_schema(void)
+static int pmh_ensure_schema(void)
 {
 	const char *sql =
 		"CREATE TABLE IF NOT EXISTS dm_history ("
@@ -158,7 +154,7 @@ static int dmh_ensure_schema(void)
 		"CREATE UNIQUE INDEX IF NOT EXISTS dm_history_msgid "
 		"  ON dm_history(msgid) WHERE msgid IS NOT NULL;";
 	char *err = NULL;
-	if (sqlite3_exec(dmh_db, sql, NULL, NULL, &err) != SQLITE_OK)
+	if (sqlite3_exec(pmh_db, sql, NULL, NULL, &err) != SQLITE_OK)
 	{
 		config_error("dm_history: schema init failed: %s",
 		             err ? err : "(unknown)");
@@ -174,7 +170,7 @@ static int dmh_ensure_schema(void)
 
 /* Sort the two account names lexically so both directions of a DM
  * land in the same (a,b) bucket. */
-static void dmh_pair(const char *acc1, const char *acc2,
+static void pmh_pair(const char *acc1, const char *acc2,
                      const char **out_a, const char **out_b)
 {
 	if (strcmp(acc1, acc2) <= 0)
@@ -195,7 +191,7 @@ static void dmh_pair(const char *acc1, const char *acc2,
  * pluck their account.  Returns a heap-dup'd account name on success
  * (caller frees) or NULL when the target isn't online / isn't
  * logged in. */
-static char *dmh_account_for_target(const char *target)
+static char *pmh_account_for_target(const char *target)
 {
 	Client *c = find_user(target, NULL);
 	if (!c || !IsLoggedIn(c))
@@ -208,7 +204,7 @@ static char *dmh_account_for_target(const char *target)
  * ------------------------------------------------------------------ */
 
 /* Pull msgid out of mtags if present, else NULL. */
-static const char *dmh_find_msgid(MessageTag *mtags)
+static const char *pmh_find_msgid(MessageTag *mtags)
 {
 	MessageTag *m;
 	for (m = mtags; m; m = m->next)
@@ -222,7 +218,7 @@ static const char *dmh_find_msgid(MessageTag *mtags)
 /* Format the IRC line the recipient would have seen, sans the message
  * tags (those are stored implicitly via msgid / ts and re-emitted on
  * replay by attaching a fresh batch tag). */
-static void dmh_format_line(char *buf, size_t n,
+static void pmh_format_line(char *buf, size_t n,
                             Client *sender, Client *recipient,
                             const char *cmd, const char *text)
 {
@@ -236,7 +232,7 @@ static void dmh_format_line(char *buf, size_t n,
 }
 
 /* Same shape as cmd_privmsg.c uses internally. */
-static const char *dmh_cmd_for_sendtype(SendType st)
+static const char *pmh_cmd_for_sendtype(SendType st)
 {
 	switch (st)
 	{
@@ -247,7 +243,7 @@ static const char *dmh_cmd_for_sendtype(SendType st)
 	return "PRIVMSG";
 }
 
-static int dmh_usermsg(Client *client, Client *to, MessageTag *mtags,
+static int pmh_usermsg(Client *client, Client *to, MessageTag *mtags,
                        const char *text, SendType sendtype)
 {
 	const char *acc_a, *acc_b;
@@ -265,26 +261,26 @@ static int dmh_usermsg(Client *client, Client *to, MessageTag *mtags,
 		return 0;
 	if (!strcasecmp(client->user->account, to->user->account))
 		return 0;
-	if (!dmh_db)
+	if (!pmh_db)
 		return 0;
 
-	dmh_pair(client->user->account, to->user->account, &acc_a, &acc_b);
-	msgid = dmh_find_msgid(mtags);
+	pmh_pair(client->user->account, to->user->account, &acc_a, &acc_b);
+	msgid = pmh_find_msgid(mtags);
 	ts_ms = (long long)(time(NULL)) * 1000;
 
 	/* TAGMSG carries no body; store an empty string so replay still
 	 * produces a valid IRC line.  text is normally non-NULL for
 	 * PRIVMSG / NOTICE. */
-	dmh_format_line(line, sizeof(line),
+	pmh_format_line(line, sizeof(line),
 	                client, to,
-	                dmh_cmd_for_sendtype(sendtype),
+	                pmh_cmd_for_sendtype(sendtype),
 	                sendtype == SEND_TYPE_TAGMSG ? "" : text);
 
 	const char *sql =
 		"INSERT OR IGNORE INTO dm_history "
 		"  (account_a, account_b, ts_ms, msgid, sender_account, line) "
 		"VALUES (?, ?, ?, ?, ?, ?)";
-	if (sqlite3_prepare_v2(dmh_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+	if (sqlite3_prepare_v2(pmh_db, sql, -1, &stmt, NULL) != SQLITE_OK)
 		return 0;
 	sqlite3_bind_text(stmt, 1, acc_a, -1, SQLITE_TRANSIENT);
 	sqlite3_bind_text(stmt, 2, acc_b, -1, SQLITE_TRANSIENT);
@@ -308,7 +304,7 @@ static int dmh_usermsg(Client *client, Client *to, MessageTag *mtags,
 /* Parse "timestamp=YYYY-...." into unix ms.  Returns 1 on success.
  * The IRCv3 timestamp format is ISO-8601 with milliseconds: e.g.
  * "2026-05-19T03:45:12.123Z". */
-static int dmh_parse_iso_ms(const char *s, long long *out_ms)
+static int pmh_parse_iso_ms(const char *s, long long *out_ms)
 {
 	struct tm t;
 	int ms = 0;
@@ -331,19 +327,19 @@ static int dmh_parse_iso_ms(const char *s, long long *out_ms)
  * row up in dm_history and read its ts_ms; that way our ordering is
  * always a pure ts_ms range query regardless of which form the
  * client used. */
-static int dmh_resolve_bound(const char *timestamp, const char *msgid,
+static int pmh_resolve_bound(const char *timestamp, const char *msgid,
                              const char *acc_a, const char *acc_b,
                              long long *out_ms)
 {
 	if (timestamp && *timestamp)
-		return dmh_parse_iso_ms(timestamp, out_ms);
+		return pmh_parse_iso_ms(timestamp, out_ms);
 	if (msgid && *msgid)
 	{
 		sqlite3_stmt *stmt = NULL;
 		const char *sql =
 			"SELECT ts_ms FROM dm_history "
 			"WHERE account_a=? AND account_b=? AND msgid=?";
-		if (sqlite3_prepare_v2(dmh_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+		if (sqlite3_prepare_v2(pmh_db, sql, -1, &stmt, NULL) != SQLITE_OK)
 			return 0;
 		sqlite3_bind_text(stmt, 1, acc_a, -1, SQLITE_TRANSIENT);
 		sqlite3_bind_text(stmt, 2, acc_b, -1, SQLITE_TRANSIENT);
@@ -369,7 +365,7 @@ static int dmh_resolve_bound(const char *timestamp, const char *msgid,
  *     sees the same line twice
  *   - batch=<id>: links the line to the CHATHISTORY batch we're sending
  * Returns a fresh MessageTag* the caller must free_message_tags(). */
-static MessageTag *dmh_build_mtags(const char *msgid, long long ts_ms,
+static MessageTag *pmh_build_mtags(const char *msgid, long long ts_ms,
                                     const char *batchid)
 {
 	MessageTag *head = NULL;
@@ -411,11 +407,11 @@ static MessageTag *dmh_build_mtags(const char *msgid, long long ts_ms,
 }
 
 /* Send one stored line with reconstructed time/msgid/batch mtags. */
-static void dmh_send_line_with_tags(Client *client, const char *line,
+static void pmh_send_line_with_tags(Client *client, const char *line,
                                      const char *msgid, long long ts_ms,
                                      const char *batchid)
 {
-	MessageTag *mtags = dmh_build_mtags(msgid, ts_ms, batchid);
+	MessageTag *mtags = pmh_build_mtags(msgid, ts_ms, batchid);
 	sendto_one(client, mtags, "%s", line);
 	free_message_tags(mtags);
 }
@@ -423,7 +419,7 @@ static void dmh_send_line_with_tags(Client *client, const char *line,
 /* Open a chathistory BATCH for the given target and return its id in
  * `out_batch` (must be at least BATCHLEN+1).  Sends nothing on a
  * client without `batch` capability and zeroes out_batch. */
-static void dmh_open_batch(Client *client, const char *target, char *out_batch)
+static void pmh_open_batch(Client *client, const char *target, char *out_batch)
 {
 	out_batch[0] = '\0';
 	if (!HasCapability(client, "batch"))
@@ -433,7 +429,7 @@ static void dmh_open_batch(Client *client, const char *target, char *out_batch)
 	           me.name, out_batch, target);
 }
 
-static void dmh_close_batch(Client *client, const char *batchid)
+static void pmh_close_batch(Client *client, const char *batchid)
 {
 	if (BadPtr(batchid))
 		return;
@@ -445,7 +441,7 @@ static void dmh_close_batch(Client *client, const char *batchid)
  * client asked for; we use it verbatim in the BATCH target field
  * so the receiving client knows which conversation these messages
  * belong to. */
-static void dmh_send_history(Client *client, const char *target_nick,
+static void pmh_send_history(Client *client, const char *target_nick,
                              const char *acc_a, const char *acc_b,
                              HistoryFilter *filter)
 {
@@ -456,9 +452,9 @@ static void dmh_send_history(Client *client, const char *target_nick,
 	if (limit <= 0 || limit > DMH_MAX_LIMIT)
 		limit = DMH_MAX_LIMIT;
 
-	have_a = dmh_resolve_bound(filter->timestamp_a, filter->msgid_a,
+	have_a = pmh_resolve_bound(filter->timestamp_a, filter->msgid_a,
 	                           acc_a, acc_b, &a_ms);
-	have_b = dmh_resolve_bound(filter->timestamp_b, filter->msgid_b,
+	have_b = pmh_resolve_bound(filter->timestamp_b, filter->msgid_b,
 	                           acc_a, acc_b, &b_ms);
 
 	/* Build the SQL based on the filter command.  We always select
@@ -506,7 +502,7 @@ static void dmh_send_history(Client *client, const char *target_nick,
 		int half = limit / 2;
 		if (half < 1) half = 1;
 
-		dmh_open_batch(client, target_nick, batch);
+		pmh_open_batch(client, target_nick, batch);
 
 		/* Older half (ts < anchor), DESC then we'll flip into ASC. */
 		{
@@ -515,7 +511,7 @@ static void dmh_send_history(Client *client, const char *target_nick,
 				"SELECT line, msgid, ts_ms FROM dm_history "
 				"WHERE account_a=? AND account_b=? AND ts_ms<? "
 				"ORDER BY ts_ms DESC LIMIT ?";
-			if (sqlite3_prepare_v2(dmh_db, q, -1, &st, NULL) == SQLITE_OK)
+			if (sqlite3_prepare_v2(pmh_db, q, -1, &st, NULL) == SQLITE_OK)
 			{
 				sqlite3_bind_text(st, 1, acc_a, -1, SQLITE_TRANSIENT);
 				sqlite3_bind_text(st, 2, acc_b, -1, SQLITE_TRANSIENT);
@@ -537,7 +533,7 @@ static void dmh_send_history(Client *client, const char *target_nick,
 				sqlite3_finalize(st);
 				for (int i = n - 1; i >= 0; i--)
 				{
-					dmh_send_line_with_tags(client, lines[i],
+					pmh_send_line_with_tags(client, lines[i],
 					                        msgids[i], tss[i], batch);
 					free(lines[i]);
 					if (msgids[i]) free(msgids[i]);
@@ -551,7 +547,7 @@ static void dmh_send_history(Client *client, const char *target_nick,
 				"SELECT line, msgid, ts_ms FROM dm_history "
 				"WHERE account_a=? AND account_b=? AND ts_ms>=? "
 				"ORDER BY ts_ms ASC LIMIT ?";
-			if (sqlite3_prepare_v2(dmh_db, q, -1, &st, NULL) == SQLITE_OK)
+			if (sqlite3_prepare_v2(pmh_db, q, -1, &st, NULL) == SQLITE_OK)
 			{
 				sqlite3_bind_text(st, 1, acc_a, -1, SQLITE_TRANSIENT);
 				sqlite3_bind_text(st, 2, acc_b, -1, SQLITE_TRANSIENT);
@@ -562,14 +558,14 @@ static void dmh_send_history(Client *client, const char *target_nick,
 					const unsigned char *l = sqlite3_column_text(st, 0);
 					const unsigned char *mid = sqlite3_column_text(st, 1);
 					long long ts = sqlite3_column_int64(st, 2);
-					dmh_send_line_with_tags(client, (const char *)l,
+					pmh_send_line_with_tags(client, (const char *)l,
 					                        mid ? (const char *)mid : NULL,
 					                        ts, batch);
 				}
 				sqlite3_finalize(st);
 			}
 		}
-		dmh_close_batch(client, batch);
+		pmh_close_batch(client, batch);
 		return;
 	}
 
@@ -612,12 +608,12 @@ static void dmh_send_history(Client *client, const char *target_nick,
 	}
 
 	sqlite3_stmt *st = NULL;
-	if (sqlite3_prepare_v2(dmh_db, query, -1, &st, NULL) != SQLITE_OK)
+	if (sqlite3_prepare_v2(pmh_db, query, -1, &st, NULL) != SQLITE_OK)
 		goto empty;
 	sqlite3_bind_text(st, 1, acc_a, -1, SQLITE_TRANSIENT);
 	sqlite3_bind_text(st, 2, acc_b, -1, SQLITE_TRANSIENT);
 
-	dmh_open_batch(client, target_nick, batch);
+	pmh_open_batch(client, target_nick, batch);
 
 	if (!strcmp(sql_order_inner, "DESC") && filter->cmd != HFC_BETWEEN)
 	{
@@ -638,7 +634,7 @@ static void dmh_send_history(Client *client, const char *target_nick,
 		}
 		for (int i = n - 1; i >= 0; i--)
 		{
-			dmh_send_line_with_tags(client, lines[i],
+			pmh_send_line_with_tags(client, lines[i],
 			                        msgids[i], tss[i], batch);
 			free(lines[i]);
 			if (msgids[i]) free(msgids[i]);
@@ -651,25 +647,25 @@ static void dmh_send_history(Client *client, const char *target_nick,
 			const unsigned char *l = sqlite3_column_text(st, 0);
 			const unsigned char *mid = sqlite3_column_text(st, 1);
 			long long ts = sqlite3_column_int64(st, 2);
-			dmh_send_line_with_tags(client, (const char *)l,
+			pmh_send_line_with_tags(client, (const char *)l,
 			                        mid ? (const char *)mid : NULL,
 			                        ts, batch);
 		}
 	}
 	sqlite3_finalize(st);
-	dmh_close_batch(client, batch);
+	pmh_close_batch(client, batch);
 	return;
 
 empty:
-	dmh_open_batch(client, target_nick, batch);
-	dmh_close_batch(client, batch);
+	pmh_open_batch(client, target_nick, batch);
+	pmh_close_batch(client, batch);
 }
 
 /* TARGETS handler.  Spec is "list of {target, last_ts} that the
  * client has chathistory for, within a timestamp window".  We list
  * channels the client is in (the canonical behaviour) PLUS DM
  * partners from the dm_history table, all in one BATCH. */
-static void dmh_send_targets(Client *client, HistoryFilter *filter, int limit)
+static void pmh_send_targets(Client *client, HistoryFilter *filter, int limit)
 {
 	char batch[BATCHLEN+1];
 	long long a_ms = 0, b_ms = 0;
@@ -680,9 +676,9 @@ static void dmh_send_targets(Client *client, HistoryFilter *filter, int limit)
 		limit = DMH_TARGETS_MAX;
 
 	have_a = filter->timestamp_a &&
-	         dmh_parse_iso_ms(filter->timestamp_a, &a_ms);
+	         pmh_parse_iso_ms(filter->timestamp_a, &a_ms);
 	have_b = filter->timestamp_b &&
-	         dmh_parse_iso_ms(filter->timestamp_b, &b_ms);
+	         pmh_parse_iso_ms(filter->timestamp_b, &b_ms);
 	if (!have_a || !have_b)
 	{
 		/* No window -> use widest possible range. */
@@ -745,7 +741,7 @@ static void dmh_send_targets(Client *client, HistoryFilter *filter, int limit)
 	 * The "target" reported back is the *other* account name --
 	 * that's what the client passed to /msg, and what they'll pass
 	 * to a follow-up CHATHISTORY LATEST. */
-	if (sent < limit && IsLoggedIn(client) && dmh_db)
+	if (sent < limit && IsLoggedIn(client) && pmh_db)
 	{
 		const char *q =
 			"SELECT CASE WHEN account_a=?1 THEN account_b ELSE account_a END "
@@ -758,7 +754,7 @@ static void dmh_send_targets(Client *client, HistoryFilter *filter, int limit)
 			"ORDER BY last_ts DESC "
 			"LIMIT ?4";
 		sqlite3_stmt *st = NULL;
-		if (sqlite3_prepare_v2(dmh_db, q, -1, &st, NULL) == SQLITE_OK)
+		if (sqlite3_prepare_v2(pmh_db, q, -1, &st, NULL) == SQLITE_OK)
 		{
 			sqlite3_bind_text(st, 1, client->user->account, -1, SQLITE_TRANSIENT);
 			sqlite3_bind_int64(st, 2, lo);
@@ -807,7 +803,7 @@ static void dmh_send_targets(Client *client, HistoryFilter *filter, int limit)
 /* Minimal token parser matching the upstream chathistory.c style:
  * recognise "name=value" and return a heap-dup of value (NULL on
  * miss).  Used to pluck timestamp= / msgid= out of the argv. */
-static char *dmh_token(const char *str, const char *name)
+static char *pmh_token(const char *str, const char *name)
 {
 	size_t nlen = strlen(name);
 	if (strncmp(str, name, nlen) != 0 || str[nlen] != '=')
@@ -815,7 +811,7 @@ static char *dmh_token(const char *str, const char *name)
 	return strdup(str + nlen + 1);
 }
 
-static void dmh_filter_free(HistoryFilter *f)
+static void pmh_filter_free(HistoryFilter *f)
 {
 	if (!f) return;
 	safe_free(f->timestamp_a);
@@ -825,7 +821,7 @@ static void dmh_filter_free(HistoryFilter *f)
 	safe_free(f);
 }
 
-CMD_OVERRIDE_FUNC(dmh_chathistory_override)
+CMD_OVERRIDE_FUNC(pmh_chathistory_override)
 {
 	/* parv[1] = subcommand, parv[2] = target (or filter for TARGETS),
 	 * parv[3] = filter, parv[4] = filter/limit, parv[5] = limit (for
@@ -842,19 +838,19 @@ CMD_OVERRIDE_FUNC(dmh_chathistory_override)
 	if (!strcasecmp(parv[1], "TARGETS"))
 	{
 		HistoryFilter *f = safe_alloc(sizeof(HistoryFilter));
-		f->timestamp_a = dmh_token(parv[2], "timestamp");
-		f->timestamp_b = dmh_token(parv[3], "timestamp");
+		f->timestamp_a = pmh_token(parv[2], "timestamp");
+		f->timestamp_b = pmh_token(parv[3], "timestamp");
 		if (!f->timestamp_a || !f->timestamp_b)
 		{
 			/* Malformed -- defer to the upstream handler which
 			 * already emits a proper FAIL. */
-			dmh_filter_free(f);
+			pmh_filter_free(f);
 			CALL_NEXT_COMMAND_OVERRIDE();
 			return;
 		}
 		int limit = atoi(parv[4]);
-		dmh_send_targets(client, f, limit);
-		dmh_filter_free(f);
+		pmh_send_targets(client, f, limit);
+		pmh_filter_free(f);
 		return;
 	}
 
@@ -877,20 +873,20 @@ CMD_OVERRIDE_FUNC(dmh_chathistory_override)
 		return;
 	}
 
-	char *other_acc = dmh_account_for_target(target);
+	char *other_acc = pmh_account_for_target(target);
 	if (!other_acc)
 	{
 		/* Empty batch -- the same shape the upstream module returns
 		 * when there's no history.  Better than FAIL for clients
 		 * that mass-query an inbox. */
 		char batch[BATCHLEN+1];
-		dmh_open_batch(client, target, batch);
-		dmh_close_batch(client, batch);
+		pmh_open_batch(client, target, batch);
+		pmh_close_batch(client, batch);
 		return;
 	}
 
 	const char *acc_a, *acc_b;
-	dmh_pair(client->user->account, other_acc, &acc_a, &acc_b);
+	pmh_pair(client->user->account, other_acc, &acc_a, &acc_b);
 
 	HistoryFilter *filter = safe_alloc(sizeof(HistoryFilter));
 
@@ -899,39 +895,39 @@ CMD_OVERRIDE_FUNC(dmh_chathistory_override)
 		filter->cmd = HFC_LATEST;
 		if (strcmp(parv[3], "*") != 0)
 		{
-			filter->timestamp_a = dmh_token(parv[3], "timestamp");
-			filter->msgid_a = dmh_token(parv[3], "msgid");
+			filter->timestamp_a = pmh_token(parv[3], "timestamp");
+			filter->msgid_a = pmh_token(parv[3], "msgid");
 		}
 		filter->limit = atoi(parv[4]);
 	}
 	else if (!strcasecmp(parv[1], "BEFORE"))
 	{
 		filter->cmd = HFC_BEFORE;
-		filter->timestamp_a = dmh_token(parv[3], "timestamp");
-		filter->msgid_a = dmh_token(parv[3], "msgid");
+		filter->timestamp_a = pmh_token(parv[3], "timestamp");
+		filter->msgid_a = pmh_token(parv[3], "msgid");
 		filter->limit = atoi(parv[4]);
 	}
 	else if (!strcasecmp(parv[1], "AFTER"))
 	{
 		filter->cmd = HFC_AFTER;
-		filter->timestamp_a = dmh_token(parv[3], "timestamp");
-		filter->msgid_a = dmh_token(parv[3], "msgid");
+		filter->timestamp_a = pmh_token(parv[3], "timestamp");
+		filter->msgid_a = pmh_token(parv[3], "msgid");
 		filter->limit = atoi(parv[4]);
 	}
 	else if (!strcasecmp(parv[1], "AROUND"))
 	{
 		filter->cmd = HFC_AROUND;
-		filter->timestamp_a = dmh_token(parv[3], "timestamp");
-		filter->msgid_a = dmh_token(parv[3], "msgid");
+		filter->timestamp_a = pmh_token(parv[3], "timestamp");
+		filter->msgid_a = pmh_token(parv[3], "msgid");
 		filter->limit = atoi(parv[4]);
 	}
 	else if (!strcasecmp(parv[1], "BETWEEN") && parc >= 6)
 	{
 		filter->cmd = HFC_BETWEEN;
-		filter->timestamp_a = dmh_token(parv[3], "timestamp");
-		filter->msgid_a = dmh_token(parv[3], "msgid");
-		filter->timestamp_b = dmh_token(parv[4], "timestamp");
-		filter->msgid_b = dmh_token(parv[4], "msgid");
+		filter->timestamp_a = pmh_token(parv[3], "timestamp");
+		filter->msgid_a = pmh_token(parv[3], "msgid");
+		filter->timestamp_b = pmh_token(parv[4], "timestamp");
+		filter->msgid_b = pmh_token(parv[4], "msgid");
 		filter->limit = atoi(parv[5]);
 	}
 	else
@@ -941,14 +937,14 @@ CMD_OVERRIDE_FUNC(dmh_chathistory_override)
 		           ":Invalid subcommand",
 		           me.name, parv[1]);
 		free(other_acc);
-		dmh_filter_free(filter);
+		pmh_filter_free(filter);
 		return;
 	}
 
-	dmh_send_history(client, target, acc_a, acc_b, filter);
+	pmh_send_history(client, target, acc_a, acc_b, filter);
 
 	free(other_acc);
-	dmh_filter_free(filter);
+	pmh_filter_free(filter);
 }
 
 /* ------------------------------------------------------------------
@@ -958,7 +954,7 @@ CMD_OVERRIDE_FUNC(dmh_chathistory_override)
 /* Send a REDACT line to a single recipient if they have negotiated
  * draft/message-redaction.  If `with_reason` is set, includes the
  * trailing reason. */
-static void dmh_send_redact_one(Client *recipient, Client *sender,
+static void pmh_send_redact_one(Client *recipient, Client *sender,
                                  const char *target_nick,
                                  const char *msgid, const char *reason)
 {
@@ -986,7 +982,7 @@ static void dmh_send_redact_one(Client *recipient, Client *sender,
  * `sender_client` is the actual originating Client; we still
  * deliver to that one (the user expects to see the redact landed
  * in the conversation they triggered it from). */
-static void dmh_fan_redact_to_account(Client *sender_client,
+static void pmh_fan_redact_to_account(Client *sender_client,
                                        const char *account,
                                        const char *target_nick,
                                        const char *msgid,
@@ -999,11 +995,11 @@ static void dmh_fan_redact_to_account(Client *sender_client,
 			continue;
 		if (strcasecmp(acptr->user->account, account))
 			continue;
-		dmh_send_redact_one(acptr, sender_client, target_nick, msgid, reason);
+		pmh_send_redact_one(acptr, sender_client, target_nick, msgid, reason);
 	}
 }
 
-CMD_OVERRIDE_FUNC(dmh_redact_override)
+CMD_OVERRIDE_FUNC(pmh_redact_override)
 {
 	if (!MyUser(client) || parc < 3 || BadPtr(parv[1]) || BadPtr(parv[2]))
 	{
@@ -1031,7 +1027,7 @@ CMD_OVERRIDE_FUNC(dmh_redact_override)
 		return;
 	}
 
-	char *other_acc = dmh_account_for_target(target);
+	char *other_acc = pmh_account_for_target(target);
 	if (!other_acc)
 	{
 		/* Could be offline / unregistered.  Fall back to upstream so
@@ -1041,7 +1037,7 @@ CMD_OVERRIDE_FUNC(dmh_redact_override)
 	}
 
 	const char *acc_a, *acc_b;
-	dmh_pair(client->user->account, other_acc, &acc_a, &acc_b);
+	pmh_pair(client->user->account, other_acc, &acc_a, &acc_b);
 
 	/* Look up the row.  We need sender_account + line so we can both
 	 * authorise (sender or oper) and broadcast back the right
@@ -1050,7 +1046,7 @@ CMD_OVERRIDE_FUNC(dmh_redact_override)
 	const char *q =
 		"SELECT sender_account, line FROM dm_history "
 		"WHERE account_a=? AND account_b=? AND msgid=?";
-	if (sqlite3_prepare_v2(dmh_db, q, -1, &st, NULL) != SQLITE_OK)
+	if (sqlite3_prepare_v2(pmh_db, q, -1, &st, NULL) != SQLITE_OK)
 	{
 		free(other_acc);
 		sendto_one(client, NULL,
@@ -1106,7 +1102,7 @@ CMD_OVERRIDE_FUNC(dmh_redact_override)
 		const char *dq =
 			"DELETE FROM dm_history "
 			"WHERE account_a=? AND account_b=? AND msgid=?";
-		if (sqlite3_prepare_v2(dmh_db, dq, -1, &del, NULL) == SQLITE_OK)
+		if (sqlite3_prepare_v2(pmh_db, dq, -1, &del, NULL) == SQLITE_OK)
 		{
 			sqlite3_bind_text(del, 1, acc_a, -1, SQLITE_TRANSIENT);
 			sqlite3_bind_text(del, 2, acc_b, -1, SQLITE_TRANSIENT);
@@ -1129,9 +1125,9 @@ CMD_OVERRIDE_FUNC(dmh_redact_override)
 	 * nick).  Either party can identify which DM conversation to
 	 * apply this to from {source, target} -- one of those two
 	 * nicks is themselves; the other is the partner. */
-	dmh_fan_redact_to_account(client, client->user->account,
+	pmh_fan_redact_to_account(client, client->user->account,
 	                          parv[1], parv[2], reason);
-	dmh_fan_redact_to_account(client, other_acc,
+	pmh_fan_redact_to_account(client, other_acc,
 	                          parv[1], parv[2], reason);
 
 	if (sender_account_dup) free(sender_account_dup);
