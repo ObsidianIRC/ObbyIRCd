@@ -37,6 +37,8 @@ for t in \
 	chanmodes/permanent \
 	chanmodes/topiclimit \
 	chanmodes/vhoaq \
+	db/reading/permanent \
+	db/writing/permanent \
 	extbans/text \
 	extensions/chathistory \
 	extensions/multi-prefix \
