@@ -647,7 +647,9 @@ static int pb_test_bot_block(ConfigFile *cf, ConfigEntry *bot_ce, int *errs)
 		} else if (!strcmp(cep->name, "auto-join")) {
 			/* Block of channel names; values inside are channels. */
 			for (ConfigEntry *ch = cep->items; ch; ch = ch->next) {
-				if (!ch->name || ch->name[0] != '#') {
+				if (!ch->name ||
+				    (ch->name[0] != '#' && ch->name[0] != '&' &&
+				     ch->name[0] != '^' && ch->name[0] != '$')) {
 					config_error("%s:%d: pushbot::bot::auto-join entries must be channel names",
 					             ch->file->filename, ch->line_number);
 					errors++;
@@ -740,7 +742,9 @@ static void pb_parse_bot_block(ConfigEntry *bot_ce)
 		else if (!strcmp(cep->name, "webhook-secret")) safe_strdup(b->webhook_secret, cep->value);
 		else if (!strcmp(cep->name, "auto-join")) {
 			for (ConfigEntry *ch = cep->items; ch; ch = ch->next) {
-				if (ch->name && ch->name[0] == '#')
+				if (ch->name &&
+				    (ch->name[0] == '#' || ch->name[0] == '&' ||
+				     ch->name[0] == '^' || ch->name[0] == '$'))
 					add_name_list(b->auto_join, ch->name);
 			}
 		}
