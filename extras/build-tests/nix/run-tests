@@ -30,20 +30,23 @@ sed -i 's@bin/unrealircd @bin/obbyircd @g; s@unrealircd\.pid@obbyircd.pid@g' run
 sed -i 's@^export ASAN_OPTIONS=.*@&:detect_odr_violation=0@' run
 
 for t in \
-	chanmodes/topiclimit \
 	chanmodes/delayjoin \
-	chanmodes/vhoaq \
 	chanmodes/exempt \
 	chanmodes/history \
 	chanmodes/noinvite \
 	chanmodes/permanent \
+	chanmodes/topiclimit \
+	chanmodes/vhoaq \
 	extbans/text \
+	extensions/chathistory \
 	extensions/multi-prefix \
+	extensions/multiline \
 	serial/netsplit_merge \
 	usercommands/credits \
 	usercommands/history \
 	usercommands/invite \
 	usercommands/kick \
+	usercommands/list \
 	usercommands/module \
 	usercommands/names \
 	usercommands/version
