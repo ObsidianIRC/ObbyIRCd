@@ -61,6 +61,17 @@
 #define PB_OP_COMMAND_REGISTER     20  /* bot -> server */
 #define PB_OP_INTERACTION_RESPONSE 21  /* bot -> server */
 #define PB_OP_INTERACTION_DEFER    22  /* bot -> server (extend window) */
+#define PB_OP_WORKFLOW_EVENT       30  /* bot -> server (emit workflow/step) */
+
+/* Fallback time-to-live for a tracked workflow when the bot forgets to
+ * send a terminal state. After this the GC drops it. */
+#define PB_WORKFLOW_TTL_SEC          3600
+/* GC cadence (ms). */
+#define PB_WORKFLOW_GC_INTERVAL_MS   60000
+/* Compact-JSON budget under one +draft/bot-tools tag. base64 expands by
+ * ~4/3, the IRCv3 client-tag limit is 4094, leaving us a safe ceiling
+ * of roughly 3000 bytes of JSON before we MUST truncate or stream. */
+#define PB_WORKFLOW_JSON_BUDGET      3000
 
 #define PB_INTERACTION_TIMEOUT_SEC 3
 #define PB_INTERACTION_DEFER_SEC   15
@@ -172,6 +183,21 @@ struct PbInteraction {
 	int deferred;
 };
 static PbInteraction *interactions = NULL;
+
+/* Tracks one live draft/bot-tools workflow so inbound action TAGMSGs
+ * (whose target is a wid or sid, not a bot nick) can be routed back to
+ * the owning bot. */
+typedef struct PbWorkflow PbWorkflow;
+struct PbWorkflow {
+	PbWorkflow *prev, *next;
+	char *wid;
+	PbBot *bot;
+	char *target;          /* channel name or user nick (last seen) */
+	NameList *sids;        /* step sids seen on this workflow */
+	time_t expires_at;
+	int terminal;          /* 1 = state was complete/failed/cancelled */
+};
+static PbWorkflow *workflows = NULL;
 
 /* One gateway connection.  Created on WS upgrade, hung off the
  * connecting client via moddata.  Becomes "bound" to a PbBot once
@@ -382,6 +408,18 @@ static void pb_mtag_forward(Client *sender, MessageTag *recv_mtags,
 static void pb_handle_command_register(Client *client, json_t *frame);
 static void pb_handle_interaction_response(Client *client, json_t *frame);
 static void pb_handle_interaction_defer(Client *client, json_t *frame);
+static void pb_handle_workflow_event(Client *client, json_t *frame);
+static PbWorkflow *pb_workflow_find(const char *wid);
+static PbWorkflow *pb_workflow_find_by_sid(const char *sid);
+static PbWorkflow *pb_workflow_touch(PbBot *bot, const char *wid, const char *target);
+static void pb_workflow_remember_sid(PbWorkflow *w, const char *sid);
+static void pb_workflow_terminate(PbWorkflow *w);
+static void pb_workflow_free(PbWorkflow *w);
+static void pb_workflow_drop_for_bot(PbBot *bot);
+static int pb_mtag_bottools_is_ok(Client *c, const char *n, const char *v);
+static int pb_route_bottools_action(Client *invoker, Client *target_user,
+                                    Channel *target_chan, const char *bot_tools_b64);
+EVENT(pb_workflow_gc);
 static int  pb_route_botcmd_channel(Client *invoker, Channel *channel,
                                     MessageTag *mtags, const char *botcmd_b64);
 static int  pb_route_botcmd_user(Client *invoker, Client *to, MessageTag *mtags,
@@ -513,6 +551,9 @@ MOD_INIT()
 		m.is_ok = pb_mtag_botcmd_is_ok;
 		m.name = "+draft/bot-cmd-error";
 		MessageTagHandlerAdd(modinfo->handle, &m);
+		m.is_ok = pb_mtag_bottools_is_ok;
+		m.name = "+draft/bot-tools";
+		MessageTagHandlerAdd(modinfo->handle, &m);
 	}
 	/* Forward client-prefixed bot-cmd tags from recv_mtags into the
 	 * outbound mtag set so HOOKTYPE_CHANMSG / USERMSG can see them. */
@@ -554,6 +595,8 @@ MOD_INIT()
 	/* Phase 5: expire stale interactions every second. */
 	EventAdd(modinfo->handle, "pb_interaction_timeout_check",
 	         pb_interaction_timeout_check, NULL, 1000, 0);
+	EventAdd(modinfo->handle, "pb_workflow_gc",
+	         pb_workflow_gc, NULL, PB_WORKFLOW_GC_INTERVAL_MS, 0);
 	return MOD_SUCCESS;
 }
 
@@ -629,6 +672,9 @@ MOD_UNLOAD()
 		pb_free_bot(b);
 	}
 	bots = NULL;
+
+	while (workflows)
+		pb_workflow_free(workflows);
 
 	if (db) {
 		sqlite3_close(db);
@@ -1216,6 +1262,7 @@ static PbBot *pb_find_bot_by_nick(const char *nick)
 static void pb_free_bot(PbBot *b)
 {
 	if (!b) return;
+	pb_workflow_drop_for_bot(b);
 	while (b->queue_head) {
 		PbQueuedEvent *e = b->queue_head;
 		safe_free(e->json);
@@ -1911,6 +1958,7 @@ static void pb_handle_ws_message(Client *client, char *msg, int len)
 	case PB_OP_COMMAND_REGISTER:     pb_handle_command_register(client, frame); break;
 	case PB_OP_INTERACTION_RESPONSE: pb_handle_interaction_response(client, frame); break;
 	case PB_OP_INTERACTION_DEFER:    pb_handle_interaction_defer(client, frame); break;
+	case PB_OP_WORKFLOW_EVENT:       pb_handle_workflow_event(client, frame); break;
 	default:
 		unreal_log(ULOG_DEBUG, "pushbot", "WS_UNKNOWN_OP", client,
 		           "Received unknown opcode $op",
@@ -2328,6 +2376,310 @@ static void pb_send_botcmds_to(Client *client, PbBot *b)
 	safe_free(b64);
 }
 
+/* ===================================================================
+ * draft/bot-tools workflow streaming
+ * =================================================================== */
+
+static int pb_mtag_bottools_is_ok(Client *c, const char *n, const char *v)
+{
+	/* Same shape as pb_mtag_botcmd_is_ok: just sanity-check the base64
+	 * envelope. Actual JSON validation happens when we decode. */
+	if (!v || !*v) return 0;
+	int len = strlen(v);
+	if (len > 4094) return 0;
+	for (const char *p = v; *p; p++) {
+		if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+		      (*p >= '0' && *p <= '9') ||
+		      *p == '+' || *p == '/' || *p == '='))
+			return 0;
+	}
+	return 1;
+}
+
+static PbWorkflow *pb_workflow_find(const char *wid)
+{
+	if (!wid || !*wid) return NULL;
+	for (PbWorkflow *w = workflows; w; w = w->next)
+		if (w->wid && !strcmp(w->wid, wid))
+			return w;
+	return NULL;
+}
+
+static PbWorkflow *pb_workflow_find_by_sid(const char *sid)
+{
+	if (!sid || !*sid) return NULL;
+	for (PbWorkflow *w = workflows; w; w = w->next) {
+		for (NameList *n = w->sids; n; n = n->next)
+			if (!strcmp(n->name, sid)) return w;
+	}
+	return NULL;
+}
+
+static PbWorkflow *pb_workflow_touch(PbBot *bot, const char *wid, const char *target)
+{
+	if (!bot || !wid || !*wid) return NULL;
+	PbWorkflow *w = pb_workflow_find(wid);
+	if (w) {
+		if (w->bot != bot) return NULL;   /* foreign wid -- refuse */
+		w->expires_at = TStime() + PB_WORKFLOW_TTL_SEC;
+		if (target && (!w->target || strcmp(w->target, target)))
+			safe_strdup(w->target, target);
+		w->terminal = 0;
+		return w;
+	}
+	w = safe_alloc(sizeof(*w));
+	safe_strdup(w->wid, wid);
+	w->bot = bot;
+	if (target && *target) safe_strdup(w->target, target);
+	w->expires_at = TStime() + PB_WORKFLOW_TTL_SEC;
+	AddListItem(w, workflows);
+	return w;
+}
+
+static void pb_workflow_remember_sid(PbWorkflow *w, const char *sid)
+{
+	if (!w || !sid || !*sid) return;
+	if (find_name_list(w->sids, sid)) return;
+	add_name_list(w->sids, sid);
+}
+
+static void pb_workflow_terminate(PbWorkflow *w)
+{
+	if (!w) return;
+	/* Keep the entry alive for a short grace window so any in-flight
+	 * action TAGMSG still resolves; the GC takes it from there. */
+	w->terminal = 1;
+	w->expires_at = TStime() + 60;
+}
+
+static void pb_workflow_free(PbWorkflow *w)
+{
+	if (!w) return;
+	DelListItem(w, workflows);
+	safe_free(w->wid);
+	safe_free(w->target);
+	free_entire_name_list(w->sids);
+	safe_free(w);
+}
+
+static void pb_workflow_drop_for_bot(PbBot *bot)
+{
+	PbWorkflow *w = workflows;
+	while (w) {
+		PbWorkflow *next = w->next;
+		if (w->bot == bot) pb_workflow_free(w);
+		w = next;
+	}
+}
+
+EVENT(pb_workflow_gc)
+{
+	time_t now = TStime();
+	PbWorkflow *w = workflows;
+	while (w) {
+		PbWorkflow *next = w->next;
+		if (w->expires_at && now > w->expires_at)
+			pb_workflow_free(w);
+		w = next;
+	}
+}
+
+/* Construct and send a +draft/bot-tools TAGMSG from a bot's ghost to a
+ * channel or user. payload_obj is owned by caller (we json_dumps it,
+ * possibly mutate `content` for truncation, and don't free). */
+static int pb_workflow_send_tag(PbBot *bot, const char *target,
+                                json_t *payload_obj)
+{
+	if (!bot || !bot->ghost || !target || !*target || !payload_obj)
+		return 0;
+
+	/* If the payload won't fit under the tag limit, try truncating
+	 * `content` (per draft/bot-tools §value-encoding). */
+	char *json_str = json_dumps(payload_obj, JSON_COMPACT);
+	if (!json_str) return 0;
+	if ((int)strlen(json_str) > PB_WORKFLOW_JSON_BUDGET) {
+		json_t *content = json_object_get(payload_obj, "content");
+		if (content && json_is_string(content)) {
+			const char *s = json_string_value(content);
+			int overshoot = strlen(json_str) - PB_WORKFLOW_JSON_BUDGET;
+			int slen = strlen(s);
+			int keep = slen - overshoot - 32;
+			if (keep < 0) keep = 0;
+			char *truncated = safe_alloc(keep + 2);
+			memcpy(truncated, s, keep);
+			truncated[keep] = '\0';
+			json_object_set_new(payload_obj, "content", json_string(truncated));
+			json_object_set_new(payload_obj, "truncated", json_true());
+			safe_free(truncated);
+			free(json_str);
+			json_str = json_dumps(payload_obj, JSON_COMPACT);
+			if (!json_str) return 0;
+		}
+		/* If it's still too big (or content wasn't a string), give up
+		 * gracefully: log and emit nothing rather than a broken tag. */
+		if ((int)strlen(json_str) > PB_WORKFLOW_JSON_BUDGET) {
+			unreal_log(ULOG_WARNING, "pushbot", "WF_OVERSIZE", NULL,
+			           "Bot $nick workflow payload too big to send "
+			           "(size=$size, budget=$budget); drop",
+			           log_data_string("nick", bot->nick ? bot->nick : "?"),
+			           log_data_integer("size", (int)strlen(json_str)),
+			           log_data_integer("budget", PB_WORKFLOW_JSON_BUDGET));
+			free(json_str);
+			return 0;
+		}
+	}
+
+	int jlen = strlen(json_str);
+	int b64_max = ((jlen + 2) / 3) * 4 + 1;
+	char *b64 = safe_alloc(b64_max);
+	b64_encode((unsigned char *)json_str, jlen, b64, b64_max);
+	free(json_str);
+
+	MessageTag *tag = safe_alloc(sizeof(*tag));
+	safe_strdup(tag->name, "+draft/bot-tools");
+	safe_strdup(tag->value, b64);
+
+	Channel *ch = (*target == '#' || *target == '&' || *target == '^') ?
+	              find_channel(target) : NULL;
+	if (ch) {
+		sendto_channel(ch, bot->ghost, NULL, NULL, 0, SEND_ALL, tag,
+		               ":%s TAGMSG %s", bot->ghost->name, ch->name);
+	} else {
+		Client *to = find_user(target, NULL);
+		if (to)
+			sendto_one(to, tag, ":%s TAGMSG %s",
+			           bot->ghost->name, to->name);
+	}
+
+	free_message_tags(tag);
+	safe_free(b64);
+	return 1;
+}
+
+/* PB_OP_WORKFLOW_EVENT handler:
+ *   {op:30, d:{target:"#chan"|"nick", payload:{...draft/bot-tools obj...}}}
+ *
+ * Updates the workflow ownership table from the payload (wid/sid/state),
+ * then constructs and sends a +draft/bot-tools TAGMSG to `target`.
+ */
+static void pb_handle_workflow_event(Client *client, json_t *frame)
+{
+	PbSession *s = PB_SESS(client);
+	if (!s || !s->bot || !s->identified) {
+		pb_close_ws(client, PB_CLOSE_AUTH_FAILED, "Not authenticated");
+		return;
+	}
+	json_t *d = json_object_get(frame, "d");
+	if (!json_is_object(d)) return;
+
+	json_t *targetj = json_object_get(d, "target");
+	json_t *payload = json_object_get(d, "payload");
+	if (!json_is_string(targetj) || !json_is_object(payload)) return;
+
+	const char *target = json_string_value(targetj);
+	json_t *msgj = json_object_get(payload, "msg");
+	if (!json_is_string(msgj)) return;
+	const char *msg = json_string_value(msgj);
+
+	if (!strcmp(msg, "workflow")) {
+		json_t *idj = json_object_get(payload, "id");
+		json_t *statej = json_object_get(payload, "state");
+		if (!json_is_string(idj) || !json_is_string(statej)) return;
+		const char *wid = json_string_value(idj);
+		const char *state = json_string_value(statej);
+		PbWorkflow *w = pb_workflow_touch(s->bot, wid, target);
+		if (!w) return;
+		if (!strcmp(state, "complete") || !strcmp(state, "failed") ||
+		    !strcmp(state, "cancelled"))
+			pb_workflow_terminate(w);
+	} else if (!strcmp(msg, "step")) {
+		json_t *widj = json_object_get(payload, "wid");
+		json_t *sidj = json_object_get(payload, "sid");
+		if (!json_is_string(widj) || !json_is_string(sidj)) return;
+		PbWorkflow *w = pb_workflow_touch(s->bot, json_string_value(widj),
+		                                 target);
+		if (w) pb_workflow_remember_sid(w, json_string_value(sidj));
+	} else {
+		/* Unknown msg type. The bot may be reporting something the
+		 * spec adds later; relay anyway after sanity-encoding. */
+	}
+
+	pb_workflow_send_tag(s->bot, target, payload);
+}
+
+/* Inbound action routing.
+ *
+ * A user sends a TAGMSG carrying +draft/bot-tools whose decoded value
+ * has msg="action". Per spec the target is a workflow id (cancel,
+ * input) or a step sid (approve, reject). We look it up, find the
+ * owning bot, and dispatch a WORKFLOW_ACTION event to that bot. */
+static int pb_route_bottools_action(Client *invoker, Client *target_user,
+                                    Channel *target_chan, const char *bot_tools_b64)
+{
+	if (!invoker || !bot_tools_b64 || !*bot_tools_b64) return 0;
+
+	int blen = strlen(bot_tools_b64);
+	int max_decoded = (blen / 4) * 3 + 4;
+	unsigned char *decoded = safe_alloc(max_decoded);
+	int dlen = b64_decode(bot_tools_b64, decoded, max_decoded);
+	if (dlen <= 0) { safe_free(decoded); return 0; }
+
+	json_error_t je;
+	json_t *obj = json_loadb((const char *)decoded, dlen, 0, &je);
+	safe_free(decoded);
+	if (!obj || !json_is_object(obj)) {
+		if (obj) json_decref(obj);
+		return 0;
+	}
+
+	json_t *msgj = json_object_get(obj, "msg");
+	if (!json_is_string(msgj) || strcmp(json_string_value(msgj), "action")) {
+		json_decref(obj);
+		return 0;
+	}
+
+	json_t *actionj = json_object_get(obj, "action");
+	json_t *targetj = json_object_get(obj, "target");
+	if (!json_is_string(actionj) || !json_is_string(targetj)) {
+		json_decref(obj);
+		return 0;
+	}
+	const char *action = json_string_value(actionj);
+	const char *target = json_string_value(targetj);
+
+	/* Resolve target -> workflow. cancel/input identify the workflow
+	 * directly by wid; approve/reject use a step sid. */
+	PbWorkflow *w = NULL;
+	if (!strcmp(action, "approve") || !strcmp(action, "reject"))
+		w = pb_workflow_find_by_sid(target);
+	if (!w) w = pb_workflow_find(target);
+	if (!w || !w->bot) {
+		json_decref(obj);
+		return 0;
+	}
+
+	/* If the TAGMSG was sent to a channel (rare for actions; the spec
+	 * says actions go to the bot's nick), make sure the bot is at
+	 * least in that channel before forwarding the signal. */
+	if (target_chan && !pb_bot_is_in_channel(w->bot, target_chan)) {
+		json_decref(obj);
+		return 0;
+	}
+	(void)target_user;
+
+	json_t *d = json_object();
+	json_object_set_new(d, "wid", json_string(w->wid ? w->wid : ""));
+	json_object_set_new(d, "action", json_string(action));
+	json_object_set_new(d, "target", json_string(target));
+	json_t *contentj = json_object_get(obj, "content");
+	if (contentj) json_object_set(d, "content", contentj);
+	json_object_set_new(d, "from", pb_json_client(invoker));
+
+	pb_dispatch_event(w->bot, "WORKFLOW_ACTION", d);
+	json_decref(obj);
+	return 1;
+}
+
 /* Copy our client-prefixed tags from the incoming message into the
  * outgoing tag list, so HOOKTYPE_CHANMSG/USERMSG can see them. */
 static void pb_mtag_forward(Client *sender, MessageTag *recv_mtags,
@@ -2337,6 +2689,7 @@ static void pb_mtag_forward(Client *sender, MessageTag *recv_mtags,
 	static const char *names[] = {
 		"+draft/bot-cmd", "+draft/bot-cmds-query",
 		"+draft/bot-cmds", "+draft/bot-cmds-changed",
+		"+draft/bot-tools",
 		NULL
 	};
 	for (int i = 0; names[i]; i++) {
@@ -3579,10 +3932,12 @@ static int pb_hook_usermsg(Client *client, Client *to, MessageTag *mtags,
 
 	/* Phase 5: a TAGMSG to a bot's ghost with +draft/bot-cmd is a
 	 * slash invocation in DM (or private-visibility channel context).
-	 * +draft/bot-cmds-query is the discovery counterpart. */
+	 * +draft/bot-cmds-query is the discovery counterpart.
+	 * +draft/bot-tools (msg=action) is a workflow control signal. */
 	if (sendtype == SEND_TYPE_TAGMSG) {
 		const char *botcmd_b64 = NULL;
 		const char *channel_ctx = NULL;
+		const char *bottools_b64 = NULL;
 		int is_query = 0;
 		for (MessageTag *m = mtags; m; m = m->next) {
 			if (m->name && !strcmp(m->name, "+draft/bot-cmd"))
@@ -3591,9 +3946,16 @@ static int pb_hook_usermsg(Client *client, Client *to, MessageTag *mtags,
 				channel_ctx = m->value;
 			else if (m->name && !strcmp(m->name, "+draft/bot-cmds-query"))
 				is_query = 1;
+			else if (m->name && !strcmp(m->name, "+draft/bot-tools"))
+				bottools_b64 = m->value;
 		}
 		if (botcmd_b64)
 			return pb_route_botcmd_user(client, to, mtags, botcmd_b64, channel_ctx);
+		if (bottools_b64) {
+			pb_route_bottools_action(client, to, NULL, bottools_b64);
+			/* fall through: bot still sees the TAGMSG as a generic
+			 * message-create if anything below catches it. */
+		}
 		if (is_query) {
 			PbBot *b = NULL;
 			for (PbBot *bb = bots; bb; bb = bb->next)
