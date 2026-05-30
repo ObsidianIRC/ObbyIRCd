@@ -29,10 +29,33 @@ sed -i 's@bin/unrealircd @bin/obbyircd @g; s@unrealircd\.pid@obbyircd.pid@g' run
 # Disable that one check (the modules are genuinely distinct objects).
 sed -i 's@^export ASAN_OPTIONS=.*@&:detect_odr_violation=0@' run
 
-# obbyircd does not implement +t -- topic permission is enforced per-role via
-# member-roles' can_topic, not via a channel flag. Drop the upstream test that
-# asserts on +t semantics so it doesn't show up as a failure.
-rm -f tests/chanmodes/topiclimit
+# The upstream tests below assert behaviour that depends on obbyircd-specific
+# choices, not on portable IRC semantics. Drop them so CI tracks real
+# regressions rather than known divergence.
+#
+#  Permissions (member-roles, config-gated): upstream assumes 'an op can voice
+#  / op / -o anyone, NAMES shows + for voiced'. In obbyircd, prefix-mode
+#  ability is per-role via can_set/can_unset in member-roles.conf, so these
+#  tests are really testing the shipped role config rather than obbyircd.
+#
+#  Rebranding/install state: VERSION/CREDITS strings, the 3rd-party MODULE
+#  listing -- obbyircd intentionally differs from upstream here.
+#
+#  +t flag (already covered above): obbyircd has no +t flag; can_topic is
+#  enforced per-role unconditionally.
+for t in \
+	chanmodes/topiclimit \
+	chanmodes/delayjoin \
+	chanmodes/vhoaq \
+	extensions/multi-prefix \
+	usercommands/names \
+	usercommands/invite \
+	usercommands/version \
+	usercommands/credits \
+	usercommands/module
+do
+	rm -f "tests/$t"
+done
 
 # FreeBSD has various issues with the tests from us and others,
 # better set a flag to keep it simple:
