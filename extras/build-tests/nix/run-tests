@@ -29,20 +29,6 @@ sed -i 's@bin/unrealircd @bin/obbyircd @g; s@unrealircd\.pid@obbyircd.pid@g' run
 # Disable that one check (the modules are genuinely distinct objects).
 sed -i 's@^export ASAN_OPTIONS=.*@&:detect_odr_violation=0@' run
 
-# The upstream tests below assert behaviour that depends on obbyircd-specific
-# choices, not on portable IRC semantics. Drop them so CI tracks real
-# regressions rather than known divergence.
-#
-#  Permissions (member-roles, config-gated): upstream assumes 'an op can voice
-#  / op / -o anyone, NAMES shows + for voiced'. In obbyircd, prefix-mode
-#  ability is per-role via can_set/can_unset in member-roles.conf, so these
-#  tests are really testing the shipped role config rather than obbyircd.
-#
-#  Rebranding/install state: VERSION/CREDITS strings, the 3rd-party MODULE
-#  listing -- obbyircd intentionally differs from upstream here.
-#
-#  +t flag (already covered above): obbyircd has no +t flag; can_topic is
-#  enforced per-role unconditionally.
 for t in \
 	chanmodes/topiclimit \
 	chanmodes/delayjoin \
