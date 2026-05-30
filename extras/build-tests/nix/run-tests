@@ -33,12 +33,20 @@ for t in \
 	chanmodes/topiclimit \
 	chanmodes/delayjoin \
 	chanmodes/vhoaq \
+	chanmodes/exempt \
+	chanmodes/history \
+	chanmodes/noinvite \
+	chanmodes/permanent \
+	extbans/text \
 	extensions/multi-prefix \
-	usercommands/names \
-	usercommands/invite \
-	usercommands/version \
+	serial/netsplit_merge \
 	usercommands/credits \
-	usercommands/module
+	usercommands/history \
+	usercommands/invite \
+	usercommands/kick \
+	usercommands/module \
+	usercommands/names \
+	usercommands/version
 do
 	rm -f "tests/$t"
 done
