@@ -233,7 +233,6 @@ DLL_FILES=\
  src/modules/chanmodes/secret.dll \
  src/modules/chanmodes/secureonly.dll \
  src/modules/chanmodes/stripcolor.dll \
- src/modules/chanmodes/topiclimit.dll \
  src/modules/channeldb.dll \
  src/modules/charsys.dll \
  src/modules/chathistory.dll \
@@ -841,9 +840,6 @@ src/modules/chanmodes/secureonly.dll: src/modules/chanmodes/secureonly.c $(INCLU
 
 src/modules/chanmodes/stripcolor.dll: src/modules/chanmodes/stripcolor.c $(INCLUDES)
 	$(CC) $(MODCFLAGS) src/modules/chanmodes/stripcolor.c /Fesrc/modules/chanmodes/ /Fosrc/modules/chanmodes/ /Fdsrc/modules/chanmodes/stripcolor.pdb $(MODLFLAGS)
-
-src/modules/chanmodes/topiclimit.dll: src/modules/chanmodes/topiclimit.c $(INCLUDES)
-	$(CC) $(MODCFLAGS) src/modules/chanmodes/topiclimit.c /Fesrc/modules/chanmodes/ /Fosrc/modules/chanmodes/ /Fdsrc/modules/chanmodes/topiclimit.pdb $(MODLFLAGS)
 
 src/modules/channeldb.dll: src/modules/channeldb.c $(INCLUDES)
 	$(CC) $(MODCFLAGS) src/modules/channeldb.c /Fesrc/modules/ /Fosrc/modules/ /Fdsrc/modules/channeldb.pdb $(MODLFLAGS)

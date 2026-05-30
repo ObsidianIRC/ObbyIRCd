@@ -29,6 +29,11 @@ sed -i 's@bin/unrealircd @bin/obbyircd @g; s@unrealircd\.pid@obbyircd.pid@g' run
 # Disable that one check (the modules are genuinely distinct objects).
 sed -i 's@^export ASAN_OPTIONS=.*@&:detect_odr_violation=0@' run
 
+# obbyircd does not implement +t -- topic permission is enforced per-role via
+# member-roles' can_topic, not via a channel flag. Drop the upstream test that
+# asserts on +t semantics so it doesn't show up as a failure.
+rm -f tests/chanmodes/topiclimit
+
 # FreeBSD has various issues with the tests from us and others,
 # better set a flag to keep it simple:
 if uname -a|grep -q FreeBSD; then
