@@ -61,6 +61,7 @@
 #define PB_OP_COMMAND_REGISTER     20  /* bot -> server */
 #define PB_OP_INTERACTION_RESPONSE 21  /* bot -> server */
 #define PB_OP_INTERACTION_DEFER    22  /* bot -> server (extend window) */
+#define PB_OP_SEND_MESSAGE         31  /* bot -> server: spontaneous PRIVMSG/NOTICE */
 
 #define PB_INTERACTION_TIMEOUT_SEC 3
 #define PB_INTERACTION_DEFER_SEC   15
@@ -372,6 +373,7 @@ static void pb_mtag_forward(Client *sender, MessageTag *recv_mtags,
 static void pb_handle_command_register(Client *client, json_t *frame);
 static void pb_handle_interaction_response(Client *client, json_t *frame);
 static void pb_handle_interaction_defer(Client *client, json_t *frame);
+static void pb_handle_send_message(Client *client, json_t *frame);
 static int  pb_route_botcmd_channel(Client *invoker, Channel *channel,
                                     MessageTag *mtags, const char *botcmd_b64);
 static int  pb_route_botcmd_user(Client *invoker, Client *to, MessageTag *mtags,
@@ -1884,6 +1886,7 @@ static void pb_handle_ws_message(Client *client, char *msg, int len)
 	case PB_OP_COMMAND_REGISTER:     pb_handle_command_register(client, frame); break;
 	case PB_OP_INTERACTION_RESPONSE: pb_handle_interaction_response(client, frame); break;
 	case PB_OP_INTERACTION_DEFER:    pb_handle_interaction_defer(client, frame); break;
+	case PB_OP_SEND_MESSAGE:         pb_handle_send_message(client, frame); break;
 	default:
 		unreal_log(ULOG_DEBUG, "pushbot", "WS_UNKNOWN_OP", client,
 		           "Received unknown opcode $op",
@@ -2651,6 +2654,55 @@ static void pb_handle_interaction_defer(Client *client, json_t *frame)
 	if (!it || it->bot != s->bot) return;
 	it->expires_at = TStime() + PB_INTERACTION_DEFER_SEC;
 	it->deferred = 1;
+}
+
+/* PB_OP_SEND_MESSAGE: bot sends a spontaneous PRIVMSG/NOTICE from its
+ * ghost. d = { target, content, [is_notice] }. Target may be a
+ * channel (#/^/&/$) or a nick. Not tied to any interaction -- used by
+ * e.g. Orca voice subsystem to mirror transcripts into the text side
+ * of a voice channel without piggybacking on a user invocation. */
+static void pb_handle_send_message(Client *client, json_t *frame)
+{
+	PbSession *s = PB_SESS(client);
+	if (!s || !s->bot || !s->identified) {
+		pb_close_ws(client, PB_CLOSE_AUTH_FAILED, "Not authenticated");
+		return;
+	}
+	if (!s->bot->ghost) return;
+
+	json_t *d = json_object_get(frame, "d");
+	if (!json_is_object(d)) return;
+
+	json_t *tj = json_object_get(d, "target");
+	json_t *cj = json_object_get(d, "content");
+	if (!json_is_string(tj) || !json_is_string(cj)) return;
+	const char *target = json_string_value(tj);
+	const char *content = json_string_value(cj);
+	if (!target || !*target || !content) return;
+
+	int as_notice = 0;
+	json_t *nj = json_object_get(d, "is_notice");
+	if (json_is_true(nj)) as_notice = 1;
+
+	const char *verb = as_notice ? "NOTICE" : "PRIVMSG";
+
+	/* Channel-targeted: any of the channel prefixes (#, &, ^, $). */
+	if (target[0] == '#' || target[0] == '&' ||
+	    target[0] == '^' || target[0] == '$')
+	{
+		Channel *ch = find_channel(target);
+		if (!ch) return;
+		sendto_channel(ch, s->bot->ghost, NULL, NULL, 0, SEND_ALL, NULL,
+		               ":%s %s %s :%s",
+		               s->bot->ghost->name, verb, ch->name, content);
+		return;
+	}
+
+	/* Nick-targeted. */
+	Client *to = find_user(target, NULL);
+	if (!to) return;
+	sendto_one(to, NULL, ":%s %s %s :%s",
+	           s->bot->ghost->name, verb, to->name, content);
 }
 
 EVENT(pb_interaction_timeout_check)
