@@ -2302,7 +2302,7 @@ static int ircv3bearer_dispatch(Client *client, const char *param)
  * =================================================================== */
 
 /* ===================================================================
- * Password-scheme verifier dispatcher (PLAN.md §6.1).
+ * Password-scheme verifier dispatcher.
  *
  * Migrated accounts may carry hashes from any of:
  *
@@ -2372,8 +2372,8 @@ static int b64_decode_any(const char *in, unsigned char *out, int outcap)
  *                    (we verify by recomputing StoredKey only;
  *                    ServerKey is unused for the password check.)
  *
- * Numeric algo IDs come from migration-research/atheme/include/atheme/
- * pbkdf2.h (PBKDF2_PRF_HMAC_*, PBKDF2_PRF_SCRAM_*). Salt-as-b64-string
+ * Numeric algo IDs come from Atheme's `pbkdf2.h`
+ * (PBKDF2_PRF_HMAC_*, PBKDF2_PRF_SCRAM_*). Salt-as-b64-string
  * variants (23-26, 63-66) feed the literal base64 ASCII as the salt to
  * PBKDF2 instead of decoding first; that matches Atheme's
  * atheme_pbkdf2v2_salt_is_b64() == true branch.

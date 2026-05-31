@@ -275,7 +275,7 @@ Password compatibility: hashes are copied verbatim into
 `accounts.password` with the scheme family in
 `accounts.password_scheme`. `argon2id` is the only scheme currently
 verifiable for live login; `bcrypt` / `pbkdf2v2` / `crypt-sha*`
-verifier paths are TODO in `account-registration.c` (PLAN.md §6.3).
+verifier paths are not yet implemented in `account-registration.c`.
 Until then those accounts can be migrated but a password reset is
 required to log in.
 
@@ -410,61 +410,7 @@ VOICE_BRIDGE_BIND=/srv/obbyircd/voice-bridge
 When unset, the named-volume defaults kick in (handled by the
 `${VAR:-named_volume}` idiom in `compose.yaml`).
 
-## 11. Migration plan — Ergo coexistence and unrealircd cutover on h4ks
-
-Current h4ks state (per memory): UnrealIRCd is the live IRCd, Ergo
-runs alongside. End state: replace UnrealIRCd with ObbyIRCd; keep
-Ergo and ObbyIRCd as two independent IRC services on the host.
-
-Phased rollout:
-
-### Phase 0 — Stabilise the stack locally
-
-1. Build the Docker image from the current tree
-2. Bring up the three-app stack on a developer host
-3. Smoke-test: connect via WSS, register an account, send a message,
-   create a voice channel, take down + restart, confirm state survives
-
-### Phase 1 — Migration dry-run
-
-1. Snapshot the live Ergo `ircd.db` from h4ks
-2. Run `obbyircd-migrate run --from ergo --in <snapshot> --dry-run`
-   against an empty ObbyIRCd data dir
-3. Inspect the IR JSON and the projected `obsidian.db` / `channel.db`
-   for surprises (X-line drops, password scheme mismatches, ACL
-   encoding)
-4. Iterate on the migration tool until the dry-run is clean
-
-### Phase 2 — Side-by-side on h4ks
-
-1. Deploy the three Coolify apps on h4ks under temporary hostnames
-   (e.g. `irc-next.h4ks.com`) without touching the existing
-   UnrealIRCd or Ergo
-2. Real migration: stop Ergo briefly, copy its `ircd.db`, run
-   `obbyircd-migrate run --from ergo --on-conflict skip` against
-   ObbyIRCd's data dir, restart Ergo
-3. Validate end-to-end: log in as a migrated account, join a
-   migrated channel, confirm bans / opers / metadata
-
-### Phase 3 — Cutover
-
-1. Drain UnrealIRCd users (broadcast notice, give a deadline)
-2. Repoint `${IRC_FQDN}` and `${WEB_FQDN}` DNS at the Coolify
-   ObbyIRCd app
-3. Decommission the UnrealIRCd container; preserve its data dir for
-   rollback for at least 30 days
-4. Ergo stays running on its own hostname for its own users
-
-### Phase 4 — Iterate
-
-- Replace the in-process TURN with a dedicated coturn instance
-  (separate Coolify app, share the `VOICE_TURN_SECRET` HMAC scheme)
-- Add backups for `obsidian.db`, `channel.db`, `tkldb.db`,
-  `persistence/`
-- Add observability (Prometheus exporters from RPC stats; existing
-  `rpc.stats` returns historical snapshots)
-
-## 12. Out-of-scope, but useful to know
+## 11. Out-of-scope, but useful to know
 
 - **WebSocket transport is plain TCP inside the container** — TLS is
   terminated at Traefik. Don't expose `:8080` publicly without

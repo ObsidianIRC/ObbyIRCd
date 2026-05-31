@@ -41,9 +41,7 @@ obbyircd-migrate run \
 
 ## How channel ACL is encoded
 
-Source-side ACL grants and akicks become channel-level extbans
-(matching the design in [migration-research/PLAN.md](../../migration-research/PLAN.md)
-§1.3):
+Source-side ACL grants and akicks become channel-level extbans:
 
 | Source | Encoded as |
 |--------|-----------|
@@ -112,7 +110,7 @@ binary output against the same logic `src/modules/channeldb.c` uses).
 ## Known limitations
 
 - The bcrypt / pbkdf2v2 / crypt-sha256 / crypt-sha512 verifier paths
-  in `account-registration.c` are still TODO (PLAN.md §6.3 follow-up).
+  in `account-registration.c` are not yet implemented.
   Migrated accounts using those schemes will be readable by the
   writer (column populated, hash preserved), but obbyircd can't yet
   *verify* against them — only argon2id works for live login.
@@ -120,4 +118,4 @@ binary output against the same logic `src/modules/channeldb.c` uses).
   The TKL writer drops X-lines with a warning; create a manual
   spamfilter rule if needed.
 - Memos are not currently written anywhere — the IR carries them but
-  no obsidian.db `memos` table exists yet (deferred per PLAN.md §6.2).
+  no obsidian.db `memos` table exists yet.
