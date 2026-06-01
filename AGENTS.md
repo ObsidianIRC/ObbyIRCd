@@ -11,13 +11,13 @@ extends them with the fork-specific bits.
 ## 1. Orientation
 
 - **Lineage**: fork of UnrealIRCd 6 (`unreal60_dev`). Periodically merged
-  from `upstream/unreal60_dev`. ObsidianIRC modules and the hosted backend
-  live in-tree, not as third-party drops.
+  from `upstream/unreal60_dev`. ObsidianIRC modules live in-tree, not as
+  third-party drops; the hosted backend is a separate repo (see §5).
 - **License**: GPLv2, inherited from UnrealIRCd. Preserve upstream
   credit; rule #15 of `doc/coding-guidelines` is non-negotiable.
 - **Languages**:
   - C (ircd core + modules) — UnrealIRCd house style, see §3
-  - Go (`tools/obbyircd-migrate/`; the hosted-backend Go source lives in its own repo, [ObsidianIRC/hosted-backend](https://github.com/ObsidianIRC/hosted-backend))
+  - Go (`tools/obbyircd-migrate/`; the hosted-backend Go source lives in its own repo, [obbyworld/hosted-backend](https://github.com/obbyworld/hosted-backend))
   - Embedded JavaScript via Duktape (`obbyscript`, `conf/scripts/*.js`)
   - Embedded Python 3 via CPython (`obbypy`, `conf/scripts/python/*.py`)
   - Shell (`docker/docker-entrypoint.sh`, `Config`, `extras/startup/`)
@@ -343,7 +343,7 @@ Per repo-wide preference:
 ## 5. Go — for `tools/obbyircd-migrate/`
 
 (The hosted-backend Go code lives in its own repo,
-[ObsidianIRC/hosted-backend](https://github.com/ObsidianIRC/hosted-backend);
+[obbyworld/hosted-backend](https://github.com/obbyworld/hosted-backend);
 the rules below apply there too but enforce them on its PRs, not here.)
 
 - `gofmt`/`goimports` clean — CI gate when added.

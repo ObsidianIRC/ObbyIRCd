@@ -1,7 +1,7 @@
 # ObbyIRCd Architecture
 
 ObbyIRCd is an [UnrealIRCd 6](https://www.unrealircd.org/) fork maintained
-by [ObsidianIRC](https://github.com/ObsidianIRC). It tracks
+by [obbyworld](https://github.com/obbyworld). It tracks
 `unreal60_dev` upstream and adds a coherent stack of modules, an embedded
 scripting layer (JavaScript + Python), a sibling Go hosted-backend that
 handles WebRTC SFU + TURN + REST/JWT, and a migration toolchain for
@@ -18,7 +18,7 @@ VPS as a successor to the existing UnrealIRCd installation there.
 | Core IRCd | UnrealIRCd 6.2.5 (`unreal60_dev`) | Periodically merged from `upstream/unreal60_dev` |
 | ObsidianIRC modules | `src/modules/*.c`, `include/obsidian.h` | First-class in the tree, not third-party |
 | Vendored from `valware/unrealircd-contrib` | `react.c`, `redact.c`, `channel-rename.c` | Imported in-tree, kept in sync manually |
-| Hosted services | [`ObsidianIRC/hosted-backend`](https://github.com/ObsidianIRC/hosted-backend) (Go, separate repo) | Separate binary, talks to the IRCd over JSON-RPC + an AF_UNIX socket. Published as `obbyirc/obby-api:latest` and pulled by this repo's compose. |
+| Hosted services | [`obbyworld/hosted-backend`](https://github.com/obbyworld/hosted-backend) (Go, separate repo) | Separate binary, talks to the IRCd over JSON-RPC + an AF_UNIX socket. Published as `obbyirc/obby-api:latest` and pulled by this repo's compose. |
 | Migration tooling | `tools/obbyircd-migrate/` (Go) | Stand-alone CLI; reads Ergo/Anope/Atheme → writes ObbyIRCd stores |
 
 GPLv2, inherited from upstream. UnrealIRCd authorship and credit are
@@ -172,7 +172,7 @@ via `rpc.modules.default.conf`.
 
 ## 5. Hosted-backend
 
-Separate Go binary, source at [ObsidianIRC/hosted-backend](https://github.com/ObsidianIRC/hosted-backend), published as `obbyirc/obby-api:latest`. The image is pulled (not built) by this repo's `compose.yaml`. Two integration channels:
+Separate Go binary, source at [obbyworld/hosted-backend](https://github.com/obbyworld/hosted-backend), published as `obbyirc/obby-api:latest`. The image is pulled (not built) by this repo's `compose.yaml`. Two integration channels:
 
 1. **JSON-RPC over TCP** (typically `127.0.0.1:8600`, opt-in via
    `RPC_PASSWORD`). The backend authenticates as an RPC user and calls
@@ -365,52 +365,7 @@ Exposes `8080` (HTTP) and `3478/udp` (TURN). Mounts:
 `obby_api_data`, `obby_api_images`, and `voice-bridge` (shared with
 the IRCd).
 
-## 10. Coolify deployment topology — h4ks
-
-h4ks is **arm64 (aarch64)**, Ubuntu 24.04, Coolify v4.0.0, Traefik
-v3.6. The paired build server is `t3ks-dockerbuilder` (arm64, same
-arch). Coolify builds there and pushes to Dockerhub
-(`obbyirc/obbyircd`), h4ks pulls. Both ends match arch.
-
-Two Coolify applications:
-
-| App | Source | Public hostnames |
-|-----|--------|------------------|
-| obbyircd (full backend stack) | this repo's `compose.yaml` runs `obbyircd` (built here), `obby-api` (pulled from `obbyirc/obby-api`, source at [ObsidianIRC/hosted-backend](https://github.com/ObsidianIRC/hosted-backend)) and `obby` web (pulled from `obbyirc/obby`, source at [ObsidianIRC/ObsidianIRC](https://github.com/ObsidianIRC/ObsidianIRC), opt-in via `--profile frontend`) | `${IRC_FQDN}` (WS) + `${API_FQDN}` (REST) + `${WEB_FQDN}` (SPA) routed by compose labels |
-
-Both apps share `WEB_FQDN`, `API_FQDN`, `IRC_FQDN`, `NETWORK_NAME`,
-`SERVER_NAME`, `ADMIN_EMAIL`, `OPER_PASSWORD`, `VOICE_TURN_SECRET`,
-`VOICE_PUBLIC_IP`, `TURN_PORT` in Coolify env. The obbyircd app
-additionally needs the cloak keys + bind paths.
-
-### 10.1 Network ports
-
-| Port | Direction | Notes |
-|------|-----------|-------|
-| 443 / TCP | Traefik public | Proxies WSS to `${IRC_FQDN}` → obbyircd:8080, REST to `${API_FQDN}` → backend:8080, the web SPA to `${WEB_FQDN}` |
-| 6697 / TCP | Public | Native ircs://. Either expose via Traefik TCP-passthrough or publish a host port directly. Skip if no native-client users. |
-| 3478 / UDP | Public | TURN. Cloudflare cannot proxy UDP — set turn DNS to "DNS only". |
-| 8600 / TCP | Internal | JSON-RPC (RPC_PASSWORD-gated). Do not publish. |
-
-### 10.2 Volume strategy
-
-For Coolify the operator typically wants bind mounts under `/srv/` so
-the volume target is the same path used by host-level backups. Set
-the `*_BIND` env vars in the Coolify environment UI:
-
-```
-CONF_BIND=/srv/obbyircd/conf
-DATA_BIND=/srv/obbyircd/data
-LOGS_BIND=/srv/obbyircd/logs
-TLS_BIND=/srv/obbyircd/tls
-CUSTOM_MODULES_BIND=/srv/obbyircd/custom-modules
-VOICE_BRIDGE_BIND=/srv/obbyircd/voice-bridge
-```
-
-When unset, the named-volume defaults kick in (handled by the
-`${VAR:-named_volume}` idiom in `compose.yaml`).
-
-## 11. Out-of-scope, but useful to know
+## 10. Out-of-scope, but useful to know
 
 - **WebSocket transport is plain TCP inside the container** — TLS is
   terminated at Traefik. Don't expose `:8080` publicly without

@@ -6,29 +6,9 @@ on:
       - unreal60_dev
     tags:
       - 'v*'
-    paths:
-      - 'src/**'
-      - 'include/**'
-      - 'doc/conf/**'
-      - 'extras/**'
-      - 'autoconf/**'
-      - 'configure*'
-      - 'Config'
-      - 'Makefile.in'
-      - 'BSDmakefile'
-      - 'obbyircd.in'
-      - 'docker/**'
-      - '.dockerignore'
-      - '.github/workflows/docker-obbyircd.yml'
-      - '.github/workflows/docker-build-push.yml'
   pull_request:
     branches:
       - unreal60_dev
-    paths:
-      - 'src/**'
-      - 'docker/**'
-      - '.github/workflows/docker-obbyircd.yml'
-      - '.github/workflows/docker-build-push.yml'
   workflow_dispatch:
 
 jobs:

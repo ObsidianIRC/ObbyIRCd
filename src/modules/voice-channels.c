@@ -704,6 +704,15 @@ static int voice_configrun(ConfigFile *_cf, ConfigEntry *ce, int type)
 	return 0;
 }
 
+/* Reset TURN config to defaults before each rehash so that removing the
+ * voice::turn block (or the whole voice block) actually disables external
+ * TURN rewriting; configrun repopulates it when the block is still present. */
+static int voice_rehash(void)
+{
+	free_turn_cfg();
+	return 0;
+}
+
 /* ===================================================================
  * Module wiring
  * =================================================================== */
@@ -746,6 +755,7 @@ MOD_INIT()
 	HookAdd(modinfo->handle, HOOKTYPE_CAN_JOIN, 0, voice_can_join);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_PART, 0, voice_local_part);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_QUIT, 0, voice_local_quit);
+	HookAdd(modinfo->handle, HOOKTYPE_REHASH, 0, voice_rehash);
 
 	/* Pump the bridge socket on a 100ms cadence -- low enough that
 	 * signaling RTT feels instant, high enough that idle CPU is

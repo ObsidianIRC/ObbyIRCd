@@ -22,5 +22,5 @@ its own `/tmp/obbyircd-e2e-*` data root. No shared state.
 - IRCv3 CAP coverage of obby features
 
 Stack-level tests (file uploads, voice bridge, web client) live in
-[obby-stack](https://github.com/ObsidianIRC/obby-stack) under
+[obby-stack](https://github.com/obbyworld/obby-stack) under
 `tests/e2e/`.

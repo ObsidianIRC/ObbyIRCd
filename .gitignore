@@ -103,20 +103,8 @@ src/macosx/pods/
 # Doxygen generated files
 doc/doxygen/
 
-# Working copies of the ObsidianIRC client used for cross-repo development.
-ObsidianIRC/
-
-# Standalone research workspace (own .git) for examining ergochat/anope/atheme
-# sources used to plan obbyircd migration tooling. Not part of obbyircd itself.
-migration-research/
-
 # Per-source backup files from in-place edits.
 *.bak
-
-# Bundled installer artifacts produced by Tauri builds (ObsidianIRC client).
-*.deb
-*.rpm
-*.AppImage
 
 # Claude Code local state -- never tracked
 .claude/

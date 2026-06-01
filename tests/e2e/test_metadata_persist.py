@@ -100,10 +100,11 @@ def _wait_for_marker(name: str, marker: str, min_count: int, timeout: int):
 
 
 def _restart_and_wait(c: IrcdContainer, timeout: int = 120):
-    pre = _docker_logs(c.name).count("Configuration test passed OK")
+    marker = "ObbyIRCd started."
+    pre = _docker_logs(c.name).count(marker)
     subprocess.check_call(["docker", "stop", "-t", "15", c.name])
     subprocess.check_call(["docker", "start", c.name])
-    _wait_for_marker(c.name, "Configuration test passed OK", pre + 1, timeout)
+    _wait_for_marker(c.name, marker, pre + 1, timeout)
 
 
 async def test_channel_metadata_survives_restart(persistent_ircd):

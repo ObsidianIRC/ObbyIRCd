@@ -46,7 +46,7 @@
 /*** <<<MODULE MANAGER START>>>
 module
 {
-	documentation "https://github.com/ObsidianIRC/ObbyScript/README.md";
+	documentation "https://github.com/obbyworld/ObbyScript/README.md";
 	troubleshooting "In case of problems, documentation or e-mail me at v.a.pond@outlook.com";
 	min-unrealircd-version "6.1.0";
 	max-unrealircd-version "6.*";
