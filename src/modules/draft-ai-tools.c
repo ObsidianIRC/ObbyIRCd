@@ -1,24 +1,25 @@
 /*
- * draft-ai-tools.c — obbyircd module for draft/ai-tools v0.4
+ * draft-ai-tools.c — obbyircd module for draft/bot-tools
  *
- * Advertises the draft/ai-tools IRCv3 capability and registers the single
- * +obsidianirc/ai-tools message tag, whose value is an IRC-tag-value-escaped
- * JSON object carrying all workflow/step/action payloads.
+ * Advertises the draft/bot-tools IRCv3 capability (the "Bot Tools" workflow-
+ * transparency spec) and registers the single +draft/bot-tools client-only
+ * message tag, whose value is the base64 of a compact JSON object carrying all
+ * workflow/step/action payloads.
  *
- * Using one tag avoids clienttagdeny slot exhaustion that afflicted the old
- * 15-tag v0.3 design.  Tags are relayed only to clients that have negotiated
- * draft/ai-tools (enforced via clicap_handler); only clients with the
- * capability (or servers) may send them.
+ * Using one tag avoids clienttagdeny slot exhaustion.  The tag is relayed only
+ * to clients that have negotiated draft/bot-tools (enforced via clicap_handler),
+ * so the workflow stream never reaches clients that would not display it; any
+ * client (or server) may send it.
  *
- * Spec: draft-ai-tools.md in irc-ai-tag-framework
+ * Spec: extensions/bot-tools.md
  */
 
 #include "unrealircd.h"
 
 ModuleHeader MOD_HEADER = {
 	"draft-ai-tools",
-	"0.4",
-	"draft/ai-tools — AI workflow transparency tags (single-tag JSON)",
+	"0.5",
+	"draft/bot-tools — bot workflow transparency tags (single-tag JSON)",
 	"irc-ai-tag-framework",
 	"unrealircd-6",
 };
@@ -28,34 +29,19 @@ static long CAP_AI_TOOLS = 0L;
 
 /* ── forward declarations ─────────────────────────────────────────────────── */
 
-static const char *ai_tools_cap_parameter(Client *client);
 static int         ai_tools_mtag_is_ok(Client *client, const char *name, const char *value);
 static void        ai_tools_mtag_relay(Client *client, MessageTag *recv_mtags,
                                        MessageTag **mtag_list, const char *signature);
 static void        register_ait_tag(Module *module, ClientCapability *cap, const char *name);
 
-/* ── capability parameter ─────────────────────────────────────────────────── */
-
-/*
- * Advertise the feature set supported by this server-side module.
- * Bots and clients read this to know which control signals to offer.
- */
-static const char *ai_tools_cap_parameter(Client *client)
-{
-	return "interactive,thinking,approval";
-}
-
 /* ── tag sender validation ────────────────────────────────────────────────── */
 
 /*
- * is_ok — called for every incoming +obby.world/ai-tools tag from a client
- * or server.  Per IRCv3 client-only-tag semantics (the leading "+"), the
- * server MUST relay these verbatim regardless of whether the sender has
- * negotiated the capability — recipients verify trust themselves.  We
- * therefore accept from anyone and just reject empty values.
- *
- * (Previously this required HasCapabilityFast(CAP_AI_TOOLS) on the sender,
- * which silently dropped every TAGMSG from bots that hadn't run CAP REQ.)
+ * is_ok — called for every incoming +draft/bot-tools tag from a client or
+ * server.  Per IRCv3 client-only-tag semantics (the leading "+"), the server
+ * MUST relay these verbatim regardless of whether the sender has negotiated the
+ * capability — recipients verify trust themselves.  We therefore accept from
+ * anyone and just reject empty values.
  */
 static int ai_tools_mtag_is_ok(Client *client, const char *name, const char *value)
 {
@@ -67,7 +53,7 @@ static int ai_tools_mtag_is_ok(Client *client, const char *name, const char *val
 /* ── HOOKTYPE_NEW_MESSAGE relay ────────────────────────────────────────────── */
 
 /*
- * Without a NEW_MESSAGE hook, the +obby.world/ai-tools tag survives the
+ * Without a NEW_MESSAGE hook, the +draft/bot-tools tag survives the
  * incoming `is_ok` filter but never gets COPIED onto the outgoing message-
  * tag list `cmd_message` builds.  cmd_message then calls
  * has_client_mtags() on the outgoing list, finds no `+`-prefixed tags, and
@@ -83,7 +69,7 @@ static void ai_tools_mtag_relay(Client *client, MessageTag *recv_mtags,
 	if (!IsUser(client))
 		return;
 
-	m = find_mtag(recv_mtags, "+obby.world/ai-tools");
+	m = find_mtag(recv_mtags, "+draft/bot-tools");
 	if (m)
 	{
 		m = duplicate_mtag(m);
@@ -100,7 +86,7 @@ static void register_ait_tag(Module *module, ClientCapability *cap, const char *
 	memset(&mtag, 0, sizeof(mtag));
 	mtag.name           = (char *)name;  /* const-cast safe; API doesn't modify */
 	mtag.is_ok          = ai_tools_mtag_is_ok;
-	mtag.clicap_handler = cap;           /* relay only to draft/ai-tools clients */
+	mtag.clicap_handler = cap;           /* relay only to draft/bot-tools clients */
 	/* should_send_to_client left NULL: clicap_handler already handles filtering */
 	MessageTagHandlerAdd(module, &mtag);
 }
@@ -117,10 +103,12 @@ MOD_INIT()
 	ClientCapabilityInfo cap;
 	ClientCapability *c;
 
-	/* Register the draft/ai-tools capability. */
+	/* Register the draft/bot-tools capability.  It carries no value: a bot
+	 * advertises the behaviours it supports (interactive/reasoning/approval)
+	 * per-workflow in its `features` array, since a server cannot speak for an
+	 * individual bot. */
 	memset(&cap, 0, sizeof(cap));
-	cap.name      = "draft/ai-tools";
-	cap.parameter = ai_tools_cap_parameter;
+	cap.name      = "draft/bot-tools";
 	/* flags = CLICAP_FLAGS_NONE: individual tags carry their own clicap_handler */
 	c = ClientCapabilityAdd(modinfo->handle, &cap, &CAP_AI_TOOLS);
 	if (!c)
@@ -129,9 +117,8 @@ MOD_INIT()
 		return MOD_FAILED;
 	}
 
-	/* Single JSON-envelope tag replaces all 15 v0.3 per-field tags.
-	 * Value is an IRC-tag-value-escaped JSON object; see spec for schema. */
-	register_ait_tag(modinfo->handle, c, "+obby.world/ai-tools");
+	/* Single JSON-envelope tag (base64 of compact JSON; see spec for schema). */
+	register_ait_tag(modinfo->handle, c, "+draft/bot-tools");
 
 	/* Copy the client-only tag from incoming to outgoing on every message --
 	 * without this, cmd_message's has_client_mtags() check drops the TAGMSG. */

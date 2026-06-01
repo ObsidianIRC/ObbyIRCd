@@ -44,7 +44,9 @@ $MAKE
 yes ''|$MAKE pem
 $MAKE || exit 1
 $MAKE install || exit 1
-./unrealircd module install third/dumpcmds || exit 1
+# The control binary is installed into BASEPATH and is named obbyircd after the
+# rebrand; run it from there rather than the (binary-less) source dir.
+(cd ~/unrealircd && ./obbyircd module install third/dumpcmds) || exit 1
 
 set +x
 echo ""
@@ -53,9 +55,9 @@ echo "UnrealIRCd build & install successful."
 echo "***********************************************"
 
 if [[ "$OSTYPE" == "darwin"* ]]; then
-	otool -L ~/unrealircd/bin/unrealircd
+	otool -L ~/unrealircd/bin/obbyircd
 else
-	ldd ~/unrealircd/bin/unrealircd
+	ldd ~/unrealircd/bin/obbyircd
 fi
 
 # This was only the 'building' part, so give a hint...

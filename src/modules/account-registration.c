@@ -6209,7 +6209,7 @@ CMD_FUNC(register_account)
         Client *found = find_client(name, NULL);
         if (found && found != client)
         {
-            if (client->name)
+            if (client->name[0])
                 sendto_one(client, NULL,
                            ":%s FAIL REGISTER BAD_ACCOUNT_NAME %s "
                            ":That account name is currently in use.", me.name, name);

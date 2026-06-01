@@ -34,7 +34,7 @@ INCLUDES = ../../include/channel.h \
 R_MODULES= \
 	chanowner.so chanadmin.so chanop.so halfop.so voice.so \
 	key.so limit.so inviteonly.so secret.so private.so \
-	moderated.so noexternalmsgs.so topiclimit.so \
+	moderated.so noexternalmsgs.so \
 	nocolor.so stripcolor.so isregistered.so issecure.so permanent.so floodprot.so \
 	noctcp.so link.so censor.so delayjoin.so noknock.so noinvite.so operonly.so \
 	nonotice.so regonly.so nonickchange.so nokick.so regonlyspeak.so \

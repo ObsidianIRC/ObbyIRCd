@@ -525,7 +525,8 @@ CMD_FUNC(cmd_whois)
 			struct sg_node *next;
 		} *sg_head = NULL, *sg_tail = NULL;
 		int sg_count = 0;
-		int want_sg_batch = HasCapability(client, "obby.world/whois") &&
+		int want_sg_batch = MyUser(client) &&
+		                    HasCapability(client, "obby.world/whois") &&
 		                    HasCapability(client, "batch");
 
 		if (MyUser(client) && (++ntargets > maxtargets))
@@ -920,7 +921,8 @@ CMD_FUNC(cmd_whois)
 			 * base `batch` cap to be negotiated -- we don't emit
 			 * BATCH frames to non-batch clients regardless of the
 			 * vendor cap). */
-			int use_batch = HasCapability(client, "batch") &&
+			int use_batch = MyUser(client) &&
+			                HasCapability(client, "batch") &&
 			                HasCapability(client, "obby.world/whois");
 			char parent_batch[BATCHLEN+1];
 			Client *sessions[16];
@@ -1085,6 +1087,6 @@ CMD_FUNC(cmd_whois)
 	 * actually opted into obby.world/whois -- each parent batch
 	 * already contains its own 318.  Clients without the vendor cap
 	 * still get the legacy single trailing 318. */
-	if (!(HasCapability(client, "batch") && HasCapability(client, "obby.world/whois")))
+	if (!(MyUser(client) && HasCapability(client, "batch") && HasCapability(client, "obby.world/whois")))
 		sendnumeric(client, RPL_ENDOFWHOIS, querybuf);
 }
