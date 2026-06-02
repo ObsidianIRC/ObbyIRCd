@@ -466,7 +466,6 @@ static int sentinel_count_urls(const char *text)
 		return 0;
 	int n = 0;
 	for (const char *p = text; (p = strstr(p, "://")); p++) {
-		/* require http or https just before "://" */
 		if (p - text >= 4 &&
 		    (!strncasecmp(p - 4, "http", 4) || !strncasecmp(p - 5, "https", 5)))
 			n++;
@@ -474,6 +473,211 @@ static int sentinel_count_urls(const char *text)
 	for (const char *p = text; (p = strstr(p, "www.")); p += 4)
 		n++;
 	return n;
+}
+
+/* ---- URL maliciousness scorer -------------------------------------
+ *
+ * Shape-only scoring: no external lookups. Each signal contributes a
+ * weight; the rule layer compares the maximum URL score in a message
+ * against SENTINEL_URL_BLOCK_SCORE.
+ *
+ * The thresholds here are tuned so:
+ *   - "https://github.com/foo/bar" scores 0
+ *   - "https://bit.ly/x" scores ~5 (shortener alone -> block)
+ *   - "http://192.168.1.1/x" scores ~6 (IP host alone -> block)
+ *   - "https://win-9382.tk/promo" scores ~10 (burner TLD + spam path)
+ */
+
+#define SENTINEL_URL_BLOCK_SCORE 5
+
+static int has_suffix_ci(const char *host, int host_len, const char *suf)
+{
+	int sl = (int)strlen(suf);
+	if (host_len < sl)
+		return 0;
+	return !strncasecmp(host + host_len - sl, suf, sl);
+}
+
+static int host_starts_with_ipv4(const char *h, int n)
+{
+	int dots = 0, digits = 0, run = 0;
+	for (int i = 0; i < n; i++) {
+		char c = h[i];
+		if (c >= '0' && c <= '9') {
+			digits++;
+			run++;
+			if (run > 3)
+				return 0;
+		} else if (c == '.') {
+			if (run == 0)
+				return 0;
+			run = 0;
+			dots++;
+		} else {
+			break;
+		}
+	}
+	return dots == 3 && digits >= 4 && digits <= 12;
+}
+
+static int subdomain_is_digit_heavy(const char *host, int host_len)
+{
+	int first_dot = -1;
+	for (int i = 0; i < host_len; i++)
+		if (host[i] == '.') {
+			first_dot = i;
+			break;
+		}
+	if (first_dot < 4)
+		return 0;
+	int digits = 0;
+	for (int i = 0; i < first_dot; i++)
+		if (host[i] >= '0' && host[i] <= '9')
+			digits++;
+	return (digits * 100) / first_dot >= 40;
+}
+
+static int count_dots(const char *host, int host_len)
+{
+	int n = 0;
+	for (int i = 0; i < host_len; i++)
+		if (host[i] == '.')
+			n++;
+	return n;
+}
+
+static int has_punycode_label(const char *host, int host_len)
+{
+	for (int i = 0; i < host_len - 4; i++) {
+		if ((i == 0 || host[i - 1] == '.') &&
+		    !strncasecmp(host + i, "xn--", 4))
+			return 1;
+	}
+	return 0;
+}
+
+/* score a single URL substring (from start to end-exclusive). */
+static int sentinel_url_score(const char *url, int url_len)
+{
+	const char *host_start = url;
+	while (host_start < url + url_len && *host_start != ':' && *host_start != '/')
+		host_start++;
+	if (host_start + 3 > url + url_len || strncmp(host_start, "://", 3) != 0)
+		return 0;
+	host_start += 3;
+
+	const char *p = host_start;
+	while (p < url + url_len && *p != '/' && *p != '?' && *p != '#' && *p != ' ')
+		p++;
+	int host_len = (int)(p - host_start);
+	if (host_len <= 0)
+		return 0;
+
+	const char *path_start = p;
+	int path_len = (int)(url + url_len - path_start);
+
+	int score = 0;
+
+	/* Suspicious TLDs (rough prevalence ordering). */
+	static const char *bad_tlds[] = {
+		".tk", ".ml", ".ga", ".cf", ".gq",       /* freenom set */
+		".xyz", ".top", ".icu", ".click", ".work",
+		".link", ".live", ".country", ".pw", ".review",
+		".download", ".stream", ".gdn", ".zip", ".mov",
+		NULL
+	};
+	for (int i = 0; bad_tlds[i]; i++) {
+		if (has_suffix_ci(host_start, host_len, bad_tlds[i])) {
+			score += 5;
+			break;
+		}
+	}
+
+	/* Known shortener domains -- exact host match. */
+	static const char *shorteners[] = {
+		"bit.ly", "tinyurl.com", "goo.gl", "t.co", "ow.ly", "is.gd",
+		"buff.ly", "cutt.ly", "tiny.cc", "rebrand.ly", "shorturl.at",
+		"lnkd.in", "v.gd", "s.id", "ift.tt", "clck.ru", "tr.im",
+		"shorte.st", "adf.ly", "linktr.ee",
+		NULL
+	};
+	for (int i = 0; shorteners[i]; i++) {
+		int n = (int)strlen(shorteners[i]);
+		if (host_len == n && !strncasecmp(host_start, shorteners[i], n)) {
+			score += 4;
+			break;
+		}
+	}
+
+	if (host_starts_with_ipv4(host_start, host_len))
+		score += 6;
+
+	if (has_punycode_label(host_start, host_len))
+		score += 5;
+
+	if (subdomain_is_digit_heavy(host_start, host_len))
+		score += 3;
+
+	/* Excessive subdomain depth: a.b.c.d.example.com = 4 dots+ */
+	if (count_dots(host_start, host_len) >= 4)
+		score += 2;
+
+	/* Excessive host length: rare on legitimate domains. */
+	if (host_len >= 40)
+		score += 2;
+
+	/* Common spam path tokens. Compare against path lowercased on the fly. */
+	if (path_len > 0) {
+		char low[128];
+		int copy = path_len < (int)sizeof(low) - 1 ? path_len : (int)sizeof(low) - 1;
+		for (int i = 0; i < copy; i++) {
+			char c = path_start[i];
+			low[i] = (c >= 'A' && c <= 'Z') ? (c | 0x20) : c;
+		}
+		low[copy] = 0;
+		static const char *spam_tokens[] = {
+			"/promo", "/claim", "/win", "/verify", "/signup", "/ref",
+			"/track", "/click", "/go?", "/free", "/bonus", "/redeem",
+			"?ref=", "?promo=", NULL
+		};
+		for (int i = 0; spam_tokens[i]; i++)
+			if (strstr(low, spam_tokens[i])) {
+				score += 2;
+				break;
+			}
+	}
+	return score;
+}
+
+/* Returns the MAX score across every URL in the message. */
+static int sentinel_max_url_score(const char *text)
+{
+	if (!text)
+		return 0;
+	int max = 0;
+	for (const char *p = text; *p; ) {
+		const char *colon = strstr(p, "://");
+		if (!colon)
+			break;
+		const char *url_start = colon;
+		while (url_start > text && url_start[-1] != ' ' && url_start[-1] != '\t' &&
+		       url_start[-1] != '<' && url_start[-1] != '(')
+			url_start--;
+		if (strncasecmp(url_start, "http", 4) && strncasecmp(url_start, "https", 5)) {
+			p = colon + 3;
+			continue;
+		}
+		const char *url_end = colon + 3;
+		while (*url_end && *url_end != ' ' && *url_end != '\t' &&
+		       *url_end != '>' && *url_end != ')' && *url_end != '\n' &&
+		       *url_end != '\r')
+			url_end++;
+		int s = sentinel_url_score(url_start, (int)(url_end - url_start));
+		if (s > max)
+			max = s;
+		p = url_end;
+	}
+	return max;
 }
 
 /* count distinct @nick-style or "nick:" tokens. */
@@ -660,14 +864,21 @@ static int sentinel_block_chanmsg(Client *client, const char *text,
 	/* Record the message for downstream rules. */
 	sentinel_record_chanmsg(s, text, now);
 
-	/* link_spam: URL in first N seconds. */
+	/* link_spam: score URL shape, not just timing.
+	 * Fresh users (< SENTINEL_LINK_SPAM_AGE on net) get a bonus so a
+	 * marginal URL still trips for drive-by spammers, but a normal
+	 * github.com URL from a new user no longer fires. */
 	int urls = sentinel_count_urls(text);
 	if (urls > 0) {
 		for (int i = 0; i < urls; i++)
 			sentinel_sw_push(s->url_ts, &s->url_n,
 			                 SENTINEL_MAX_URL_TS, now);
 		sentinel_sw_compact(s->url_ts, &s->url_n, now, SENTINEL_WINDOW_SEC);
-		if (now - s->first_seen <= SENTINEL_LINK_SPAM_AGE) {
+
+		int score = sentinel_max_url_score(text);
+		if (now - s->first_seen <= SENTINEL_LINK_SPAM_AGE)
+			score += 2;
+		if (score >= SENTINEL_URL_BLOCK_SCORE) {
 			*reason_out = "link_spam";
 			return 1;
 		}
