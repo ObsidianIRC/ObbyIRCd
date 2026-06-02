@@ -163,12 +163,47 @@ static int sentinel_quit_hook(Client *client, MessageTag *_mtags, const char *co
 {
 	if (!IsUser(client))
 		return 0;
+
+	/* A QUIT comment of "Killed by <oper> (<reason>)" identifies an
+	 * oper-driven kill regardless of code path (IRC /KILL command,
+	 * /SAKILL, the RPC user.kill method, ...). Excluding our own
+	 * "Killed by Orca" stamp avoids learning from sentinel's own
+	 * decisions. */
+	const char *kind = "quit";
+	const char *oper_name = NULL;
+	char oper_buf[64] = {0};
+	char *kill_reason = NULL;
+	if (comment && !strncmp(comment, "Killed by ", 10) &&
+	    strncmp(comment, "Killed by Orca", 14))
+	{
+		kind = "oper_kill";
+		const char *p = comment + 10;
+		const char *paren = strchr(p, ' ');
+		if (paren) {
+			size_t n = (size_t)(paren - p);
+			if (n >= sizeof(oper_buf)) n = sizeof(oper_buf) - 1;
+			memcpy(oper_buf, p, n);
+			oper_buf[n] = 0;
+			oper_name = oper_buf;
+			const char *open_paren = strchr(paren, '(');
+			if (open_paren) {
+				kill_reason = strdup(open_paren + 1);
+				size_t kl = strlen(kill_reason);
+				if (kl > 0 && kill_reason[kl - 1] == ')')
+					kill_reason[kl - 1] = 0;
+			}
+		}
+	}
+
 	json_t *f = json_object();
-	json_object_set_new(f, "kind", json_string("quit"));
+	json_object_set_new(f, "kind", json_string(kind));
 	put_subject(f, client);
 	if (comment && *comment)
-		json_object_set_new(f, "reason", json_string(comment));
+		json_object_set_new(f, "reason", json_string(kill_reason ? kill_reason : comment));
+	if (oper_name)
+		json_object_set_new(f, "oper", json_string(oper_name));
 	sentinel_emit(f);
+	safe_free(kill_reason);
 	return 0;
 }
 
@@ -288,6 +323,41 @@ static int sentinel_kill_hook(Client *killedby, Client *killed, const char *reas
 		json_object_set_new(f, "oper", json_string(killedby->name));
 	if (reason && *reason)
 		json_object_set_new(f, "reason", json_string(reason));
+	sentinel_emit(f);
+	return 0;
+}
+
+/* Oper added a TKL (K/G/Z-line, shun, namedban, ...). Emit so the
+ * training side can use it as a positive label for any currently-
+ * tracked user whose user@host matches. */
+static int sentinel_tkl_add_hook(Client *client, TKL *tkl)
+{
+	if (!tkl || !client || !IsOper(client))
+		return 0;
+	const char *btype = NULL;
+	if (TKLIsServerBan(tkl)) {
+		if (tkl->type & TKL_KILL)
+			btype = (tkl->type & TKL_GLOBAL) ? "gline" : "kline";
+		else if (tkl->type & TKL_ZAP)
+			btype = (tkl->type & TKL_GLOBAL) ? "gzline" : "zline";
+		else if (tkl->type & TKL_SHUN)
+			btype = "shun";
+	}
+	if (!btype)
+		return 0;
+
+	json_t *f = json_object();
+	json_object_set_new(f, "kind", json_string("oper_kline"));
+	json_object_set_new(f, "oper", json_string(client->name));
+	if (tkl->ptr.serverban) {
+		if (tkl->ptr.serverban->usermask)
+			json_object_set_new(f, "target_ident", json_string(tkl->ptr.serverban->usermask));
+		if (tkl->ptr.serverban->hostmask)
+			json_object_set_new(f, "target_host", json_string(tkl->ptr.serverban->hostmask));
+	}
+	json_object_set_new(f, "ban_type", json_string(btype));
+	if (tkl->set_by)
+		json_object_set_new(f, "reason", json_string(tkl->set_by));
 	sentinel_emit(f);
 	return 0;
 }
@@ -915,6 +985,7 @@ MOD_INIT()
 	HookAdd(modinfo->handle, HOOKTYPE_CHANMSG,             0, sentinel_chanmsg_hook);
 	HookAdd(modinfo->handle, HOOKTYPE_USERMSG,             0, sentinel_usermsg_hook);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_KILL,          0, sentinel_kill_hook);
+	HookAdd(modinfo->handle, HOOKTYPE_TKL_ADD,             0, sentinel_tkl_add_hook);
 
 	return MOD_SUCCESS;
 }
