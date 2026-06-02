@@ -578,12 +578,27 @@ static int sentinel_url_score(const char *url, int url_len)
 
 	int score = 0;
 
-	/* Suspicious TLDs (rough prevalence ordering). */
+	/* Suspicious TLDs. Sources: Spamhaus Domain Reputation Oct 2024
+	 * - Mar 2025, Interisle Phishing Landscape 2024, Cloudflare
+	 * Email Security TLD report, APWG Q2 2025. Ordering reflects
+	 * current-era reality: Freenom set is declining, BinkyMoon
+	 * ultra-cheap new-gTLDs dominate, .top is the volume leader. */
 	static const char *bad_tlds[] = {
-		".tk", ".ml", ".ga", ".cf", ".gq",       /* freenom set */
-		".xyz", ".top", ".icu", ".click", ".work",
-		".link", ".live", ".country", ".pw", ".review",
-		".download", ".stream", ".gdn", ".zip", ".mov",
+		/* Highest normalized phishing rate (Interisle 2024) */
+		".lol", ".bond", ".support", ".top", ".sbs",
+		/* >99% mail malicious (Cloudflare) */
+		".bar", ".rest", ".uno", ".academy", ".directory", ".beauty",
+		/* Spamhaus top-20 worst, toll-road scam vectors */
+		".xin", ".cyou", ".cfd", ".buzz", ".monster",
+		/* Cheap new-gTLD burner pool */
+		".xyz", ".icu", ".click", ".work", ".link", ".live",
+		".country", ".pw", ".review", ".download", ".stream", ".gdn",
+		/* Google confusable-with-filename TLDs */
+		".zip", ".mov",
+		/* Freenom-era (declining but present) */
+		".tk", ".ml", ".ga", ".cf", ".gq",
+		/* ccTLD with >85% malicious mail share (Cloudflare) */
+		".zw",
 		NULL
 	};
 	for (int i = 0; bad_tlds[i]; i++) {
@@ -735,6 +750,42 @@ static int sentinel_has_nickserv_spoof(const char *text)
 	return 0;
 }
 
+/* Recognise IRCBot-family C&C verbs sent as PRIVMSG/CTCP payload.
+ * Sources: Perdisci/Vigna 2014 C&C-signature paper, Stratosphere Labs
+ * 2019 botnet capture, evilxyz/IRC-Bot reference implementation,
+ * jgamblin/Mirai-Source-Code. Verbs are dot- or bang-prefixed short
+ * tokens at the start of a line. */
+static int sentinel_has_cnc_verb(const char *text)
+{
+	if (!text || (text[0] != '.' && text[0] != '!'))
+		return 0;
+	char tok[24];
+	int i = 1;
+	while (i < (int)sizeof(tok) - 1 && text[i] &&
+	       text[i] != ' ' && text[i] != '\t' && text[i] != '\r' &&
+	       text[i] != '\n') {
+		char c = text[i];
+		tok[i - 1] = (c >= 'A' && c <= 'Z') ? (c | 0x20) : c;
+		i++;
+	}
+	tok[i - 1] = 0;
+	if (i < 3)
+		return 0;
+	static const char *verbs[] = {
+		"scan", "ddos", "udp", "tcp", "syn", "ack",
+		"download", "visit", "exec", "shell", "kill",
+		"login", "logout", "auth", "join", "part",
+		"flood", "spam", "raid", "attack",
+		"update", "upgrade", "reload", "restart",
+		"mirai", "kaiten", "sdbot", "rbot",
+		NULL
+	};
+	for (int j = 0; verbs[j]; j++)
+		if (!strcmp(tok, verbs[j]))
+			return 1;
+	return 0;
+}
+
 static uint64_t sentinel_hash_text(const char *text)
 {
 	if (!text)
@@ -864,6 +915,12 @@ static int sentinel_block_chanmsg(Client *client, const char *text,
 	/* Record the message for downstream rules. */
 	sentinel_record_chanmsg(s, text, now);
 
+	/* botnet C&C verb: ".scan", "!login", etc. */
+	if (sentinel_has_cnc_verb(text)) {
+		*reason_out = "botnet_cnc";
+		return 1;
+	}
+
 	/* link_spam: score URL shape, not just timing.
 	 * Fresh users (< SENTINEL_LINK_SPAM_AGE on net) get a bonus so a
 	 * marginal URL still trips for drive-by spammers, but a normal
@@ -968,6 +1025,11 @@ static int sentinel_block_usermsg(Client *client, Client *target,
 
 	if (sentinel_has_nickserv_spoof(text)) {
 		*reason_out = "nickserv_spoof";
+		return 1;
+	}
+
+	if (sentinel_has_cnc_verb(text)) {
+		*reason_out = "botnet_cnc";
 		return 1;
 	}
 
