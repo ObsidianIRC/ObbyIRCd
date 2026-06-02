@@ -112,6 +112,7 @@ MODULES= \
 	member-roles.so \
 	memo.so \
 	voice-channels.so \
+	sentinel.so \
 	redact.so \
 	react.so \
 	channel-rename.so \
@@ -208,6 +209,12 @@ webpush.so: webpush.c $(INCLUDES)
 voice-channels.so: voice-channels.c $(INCLUDES)
 	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
 		-o voice-channels.so voice-channels.c @JANSSON_LIBS@
+
+# sentinel: in-process behavioural detector. Uses jansson for the
+# training-side socket emit; same dep as voice-channels.
+sentinel.so: sentinel.c $(INCLUDES)
+	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
+		-o sentinel.so sentinel.c @JANSSON_LIBS@
 
 # obbyscript embeds Duktape and needs -lm
 obbyscript.so: obbyscript.c duktape.c ../include/duktape.h ../include/duk_config.h $(INCLUDES)
