@@ -18,7 +18,7 @@ VPS as a successor to the existing UnrealIRCd installation there.
 | Core IRCd | UnrealIRCd 6.2.5 (`unreal60_dev`) | Periodically merged from `upstream/unreal60_dev` |
 | ObsidianIRC modules | `src/modules/*.c`, `include/obsidian.h` | First-class in the tree, not third-party |
 | Vendored from `valware/unrealircd-contrib` | `react.c`, `redact.c`, `channel-rename.c` | Imported in-tree, kept in sync manually |
-| Hosted services | [`obbyworld/hosted-backend`](https://github.com/obbyworld/hosted-backend) (Go, separate repo) | Separate binary, talks to the IRCd over JSON-RPC + an AF_UNIX socket. Published as `obbyirc/obby-api:latest` and pulled by this repo's compose. |
+| Hosted services | [`obbyworld/hosted-backend`](https://github.com/obbyworld/hosted-backend) (Go, separate repo) | Separate binary, talks to the IRCd over JSON-RPC + an AF_UNIX socket. Published as `obbyworld/obby-api:latest` and pulled by this repo's compose. |
 | Migration tooling | `tools/obbyircd-migrate/` (Go) | Stand-alone CLI; reads Ergo/Anope/Atheme → writes ObbyIRCd stores |
 
 GPLv2, inherited from upstream. UnrealIRCd authorship and credit are
@@ -31,7 +31,7 @@ preserved everywhere.
 ├── Config, configure, configure.ac, autogen.sh
 ├── Makefile.in, BSDmakefile, Makefile.windows
 ├── obbyircd.in              (init wrapper template, substituted at build)
-├── compose.yaml             (full stack: obbyircd built locally + obby-api pulled from obbyirc/obby-api + obby web pulled from obbyirc/obby, frontend opt-in)
+├── compose.yaml             (full stack: obbyircd built locally + obby-api pulled from obbyworld/obby-api + obby web pulled from obbyworld/obby, frontend opt-in)
 ├── docker/
 │   ├── Dockerfile           (single Alpine stage, builds from this checkout)
 │   ├── docker-entrypoint.sh (first-run template render + custom-module build)
@@ -172,7 +172,7 @@ via `rpc.modules.default.conf`.
 
 ## 5. Hosted-backend
 
-Separate Go binary, source at [obbyworld/hosted-backend](https://github.com/obbyworld/hosted-backend), published as `obbyirc/obby-api:latest`. The image is pulled (not built) by this repo's `compose.yaml`. Two integration channels:
+Separate Go binary, source at [obbyworld/hosted-backend](https://github.com/obbyworld/hosted-backend), published as `obbyworld/obby-api:latest`. The image is pulled (not built) by this repo's `compose.yaml`. Two integration channels:
 
 1. **JSON-RPC over TCP** (typically `127.0.0.1:8600`, opt-in via
    `RPC_PASSWORD`). The backend authenticates as an RPC user and calls
