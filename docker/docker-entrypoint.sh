@@ -185,6 +185,16 @@ else
     echo "Reusing existing config (delete $FIRST_RUN_MARKER to regenerate)"
 fi
 
+# The shipped *.default.conf files are version-locked to the binary --
+# UnrealIRCd refuses to boot when they don't match it.  Refresh them
+# from the image on every start so a binary upgrade doesn't crash on a
+# stale conf volume.  These files are never operator-edited.
+for default_conf in /etc/obbyircd/conf-defaults/*.default.conf; do
+    [ -f "$default_conf" ] || continue
+    cp -f "$default_conf" "$CONF_DIR/$(basename "$default_conf")"
+    chown obbyircd:obbyircd "$CONF_DIR/$(basename "$default_conf")" 2>/dev/null || true
+done
+
 # Splice the custom-modules include into already-rendered configs so
 # pre-existing conf volumes pick up the loadmodule wiring.
 if [ -f "$CONFIG_FILE" ] && ! grep -qE '^[[:space:]]*include[[:space:]]+["'\'']custom-modules\.conf["'\'']' "$CONFIG_FILE"; then
