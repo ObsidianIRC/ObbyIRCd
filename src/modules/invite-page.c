@@ -5,7 +5,7 @@
  * shareable HTTPS link that invites a friend to the network or to a
  * specific channel.  The splash's primary button is an `ircs://`
  * deep-link that the user's OS resolves to the registered IRC client
- * handler (e.g. ObsidianIRC's Tauri build registers itself as the
+ * handler (e.g. obbyworld's Tauri build registers itself as the
  * `ircs://` opener).  Browsers that don't have a registered handler
  * fall back to the optional `client-url` web build, and otherwise
  * just show the URL.
@@ -22,7 +22,7 @@
  *                          minus its #/& prefix; the page reattaches
  *                          # for display + ircs:// link)
  *
- * (C) 2026 Valerie Pond / ObsidianIRC contributors. GPLv2+
+ * (C) 2026 Valerie Pond / obbyworld contributors. GPLv2+
  */
 #include "unrealircd.h"
 #include "obsidian.h"

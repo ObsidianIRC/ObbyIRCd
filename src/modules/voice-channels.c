@@ -1,11 +1,11 @@
 /* src/modules/voice-channels.c
  *
- * Bridge between ObsidianIRC voice channels (`^`-prefixed) and the
+ * Bridge between obbyworld voice channels (`^`-prefixed) and the
  * hosted-backend's WebRTC SFU + TURN server.
  *
  * Wire shape:
  *
- *   ObsidianIRC client            ObbyIRCd                hosted-backend
+ *   obbyworld client            ObbyIRCd                hosted-backend
  *   ─────────────────             ────────                ──────────────
  *   TAGMSG ^vc                    voice-channels.c        voice.go
  *   @+obsidianirc/rtc=…    ─────► (CAN_SEND_TO_CHANNEL    (Unix-socket
@@ -24,7 +24,7 @@
  * shovels frames between IRC and the Unix-socket bridge.
  *
  *  License: GPLv3-or-later
- *  Copyright (c) 2026 ObsidianIRC Team
+ *  Copyright (c) 2026 obbyworld Team
  */
 
 #include "unrealircd.h"
@@ -43,7 +43,7 @@ ModuleHeader MOD_HEADER = {
 	"voice-channels",
 	"1.0",
 	"Voice/video channels (^prefix) bridged to hosted-backend SFU",
-	"ObsidianIRC Team",
+	"obbyworld Team",
 	"unrealircd-6",
 };
 

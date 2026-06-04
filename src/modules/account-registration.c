@@ -4894,7 +4894,7 @@ static int twofa_handle_stepup_authenticate(Client *client, const char *param)
 static const char *twofa_capability_parameter(Client *client)
 {
     /* Credential types this server supports for the second factor.
-     * `oauth` is added so clients (e.g. ObsidianIRC's TwoFactorSettingsModal)
+     * `oauth` is added so clients (e.g. obbyworld's TwoFactorSettingsModal)
      * know to surface "Link with <provider>" enrolment + AUTHENTICATE
      * 2FA-OAUTH step-up. Step-up only accepts a factor type that
      * differs from the one used for primary auth -- see

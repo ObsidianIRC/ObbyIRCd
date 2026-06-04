@@ -11,7 +11,7 @@ extends them with the fork-specific bits.
 ## 1. Orientation
 
 - **Lineage**: fork of UnrealIRCd 6 (`unreal60_dev`). Periodically merged
-  from `upstream/unreal60_dev`. ObsidianIRC modules live in-tree, not as
+  from `upstream/unreal60_dev`. obbyworld modules live in-tree, not as
   third-party drops; the hosted backend is a separate repo (see §5).
 - **License**: GPLv2, inherited from UnrealIRCd. Preserve upstream
   credit; rule #15 of `doc/coding-guidelines` is non-negotiable.
@@ -26,7 +26,7 @@ extends them with the fork-specific bits.
 
 ```
 src/                    core ircd C source
-src/modules/            205 modules; ~20 ObsidianIRC-specific
+src/modules/            205 modules; ~20 obbyworld-specific
 include/                public headers; include "unrealircd.h" gets you everything
 include/obsidian.h      fork-specific types (Account, Metadata, TwoFACredential)
 doc/coding-guidelines   authoritative C style
@@ -65,7 +65,7 @@ Not K&R, not `// comments`, never spaces for indentation. Rule #11, #12,
 ```c
 /*
  *   IRC - Internet Relay Chat, src/modules/example.c
- *   (C) <year> The ObsidianIRC Team
+ *   (C) <year> The obbyworld Team
  *
  *   See file AUTHORS in IRC package for additional names of
  *   the programmers.
@@ -87,7 +87,7 @@ ModuleHeader MOD_HEADER
         "example",
         "1.0",
         "command /example",
-        "ObsidianIRC Team",
+        "obbyworld Team",
         "unrealircd-6",
     };
 

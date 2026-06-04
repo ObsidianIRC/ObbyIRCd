@@ -16,7 +16,7 @@ VPS as a successor to the existing UnrealIRCd installation there.
 | Layer | Comes from | Notes |
 |-------|------------|-------|
 | Core IRCd | UnrealIRCd 6.2.5 (`unreal60_dev`) | Periodically merged from `upstream/unreal60_dev` |
-| ObsidianIRC modules | `src/modules/*.c`, `include/obsidian.h` | First-class in the tree, not third-party |
+| obbyworld modules | `src/modules/*.c`, `include/obsidian.h` | First-class in the tree, not third-party |
 | Vendored from `valware/unrealircd-contrib` | `react.c`, `redact.c`, `channel-rename.c` | Imported in-tree, kept in sync manually |
 | Hosted services | [`obbyworld/hosted-backend`](https://github.com/obbyworld/hosted-backend) (Go, separate repo) | Separate binary, talks to the IRCd over JSON-RPC + an AF_UNIX socket. Published as `obbyworld/obby-api:latest` and pulled by this repo's compose. |
 | Migration tooling | `tools/obbyircd-migrate/` (Go) | Stand-alone CLI; reads Ergo/Anope/Atheme → writes ObbyIRCd stores |
@@ -39,7 +39,7 @@ preserved everywhere.
 │   └── README.md
 ├── src/
 │   ├── *.c                  (core IRCd: dispatch, parser, networking, TLS, ...)
-│   └── modules/*.c          (205 modules; ~20 ObsidianIRC-specific)
+│   └── modules/*.c          (205 modules; ~20 obbyworld-specific)
 ├── include/                 (public headers; `obsidian.h` carries the fork's types)
 ├── doc/
 │   ├── conf/
@@ -104,7 +104,7 @@ $PREFIX/
 The `obbyircd.in` template substitutes `@BINDIR@`, `@CONFDIR@`,
 `@MODULESDIR@`, `@TMPDIR@`, `@PIDFILE@` at `make install` time.
 
-## 4. ObsidianIRC delta vs vanilla UnrealIRCd 6
+## 4. obbyworld delta vs vanilla UnrealIRCd 6
 
 ### 4.1 Modules unique to ObbyIRCd
 
@@ -129,7 +129,7 @@ The `obbyircd.in` template substitutes `@BINDIR@`, `@CONFDIR@`,
 Upstream modules `account-notify`, `account-tag`, `metadata`,
 `chathistory`, `multiline`, `named-modes`, `member-roles` are loaded by
 default — they pair with the modules above to provide a complete
-IRCv3 + ObsidianIRC profile out of the box.
+IRCv3 + obbyworld profile out of the box.
 
 ### 4.2 Headers
 
@@ -154,7 +154,7 @@ draft/persistence            draft/read-marker
 draft/webauthn-rp-id         +obsidianirc/rtc
 ```
 
-These are the "vendored tags" — they are what makes the ObsidianIRC web
+These are the "vendored tags" — they are what makes the obbyworld web
 client coherent with this server and not interchangeable with vanilla
 UnrealIRCd at the protocol surface.
 

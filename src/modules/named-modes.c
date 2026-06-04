@@ -13,7 +13,7 @@
  *   to cap-holders via the HOOKTYPE_LOCAL_CHANMODE hook.
  *
  *  License: GPLv3-or-later
- *  Copyright (c) 2026 ObsidianIRC Team
+ *  Copyright (c) 2026 obbyworld Team
  */
 
 #include "unrealircd.h"
@@ -22,7 +22,7 @@ ModuleHeader MOD_HEADER = {
 	"named-modes",
 	"1.0",
 	"IRCv3 draft/named-modes -- PROP command + RPL_CHMODELIST etc.",
-	"ObsidianIRC Team",
+	"obbyworld Team",
 	"unrealircd-6",
 };
 
