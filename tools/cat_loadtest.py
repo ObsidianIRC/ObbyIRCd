@@ -8,7 +8,7 @@ display-name, status, color, pronouns), and joins them all into
 
 Each METADATA SET produces a metadata-2 push to subscribers, so the
 test exercises both the server-side firehose path and the client-side
-lazy fetch we shipped in ObsidianIRC PR #212.
+lazy fetch we shipped in obbyworld PR #212.
 
 Requires server-side load-test overrides (see obbyircd.conf):
   allow { maxperip 1000; }

@@ -41,7 +41,7 @@ running the handler, extending the server-side timeout from 3 s to
 
 - **Channel bots** (`scope=channel`, umode `+B`) auto-join a list of
   channels and only handle slash commands invoked in those channels.
-  They show up with an amber `channel-bot` badge in ObsidianIRC's
+  They show up with an amber `channel-bot` badge in obbyworld's
   slash popover.
 - **Server-wide bots** (`scope=server`, umodes `+B+S`) don't join any
   channels and are reachable network-wide.  `/help`, `/roll 1d20`,

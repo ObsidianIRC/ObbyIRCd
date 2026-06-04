@@ -11,19 +11,19 @@ import (
 // off disk for one channel. Used by tests to verify our writer's
 // output round-trips through the same logic the ircd will use.
 type ParsedChannel struct {
-	Name           string
-	CreationTime   int64
-	Topic          string
-	TopicNick      string
-	TopicTime      int64
-	Modes1         string // "+nt"
-	Modes2         string // params, space-separated
-	ModeLock       string
-	RegisteredBy   string
-	RegisteredAt   int64
-	Banlist        []ParsedListEntry
-	Excepts        []ParsedListEntry
-	Invex          []ParsedListEntry
+	Name         string
+	CreationTime int64
+	Topic        string
+	TopicNick    string
+	TopicTime    int64
+	Modes1       string // "+nt"
+	Modes2       string // params, space-separated
+	ModeLock     string
+	RegisteredBy string
+	RegisteredAt int64
+	Banlist      []ParsedListEntry
+	Excepts      []ParsedListEntry
+	Invex        []ParsedListEntry
 }
 
 type ParsedListEntry struct {
@@ -62,7 +62,7 @@ func readOneChannel(r *cdbReader, version uint32) (ParsedChannel, error) {
 	if err != nil {
 		return ch, err
 	}
-	if magic != magicChannelStart {
+	if magic != magicEntryStart {
 		return ch, fmt.Errorf("bad magic_start 0x%x", magic)
 	}
 	ch.Name, _ = r.str()
@@ -96,7 +96,7 @@ func readOneChannel(r *cdbReader, version uint32) (ParsedChannel, error) {
 	if err != nil {
 		return ch, err
 	}
-	if endMagic != magicChannelEnd {
+	if endMagic != magicEntryEnd {
 		return ch, fmt.Errorf("bad magic_end 0x%x", endMagic)
 	}
 	return ch, nil

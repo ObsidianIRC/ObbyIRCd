@@ -386,7 +386,7 @@ shape is reused for:
 A single discovery format covers all cases — clients learn one
 parser.
 
-### 6.5 Request-queue UI (ObsidianIRC)
+### 6.5 Request-queue UI (obbyworld)
 
 Dedicated modal accessible from the channel header for users with
 `manage-bots`.  Shows pending requests with requester, bot, message,
@@ -510,7 +510,7 @@ When a `+draft/bot-cmd` TAGMSG arrives, the IRCd MUST:
 @+reply=<original-msgid>;+draft/channel-context=#weather  NOTICE alice :London: 14°C, light rain
 ```
 
-ObsidianIRC renders the NOTICE in the channel's active view as a
+obbyworld renders the NOTICE in the channel's active view as a
 whisper-reply (same as existing `+draft/channel-context` handling).
 
 Bots that don't reply within **3 seconds** → IRCd sends a FAIL
@@ -875,7 +875,7 @@ Uses the existing `rpc-user { }` auth.
   retries, dead-letter table, auto-suspend.
 * **Phase 7 — Channel management cap**.  `obby.world/channel-bots`
   cap, `manage-bots` member-roles permission, request queue REST +
-  IRC commands, discovery bursts, ObsidianIRC modal UI.
+  IRC commands, discovery bursts, obbyworld modal UI.
 * **Phase 8 — Self-registration**.  REST register endpoint, approval
   flow.
 * **Phase 9 — JSON-RPC parity**.  Mirror admin commands.

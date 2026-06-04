@@ -25,14 +25,6 @@ config.settings
 *.bak
 *.swp
 
-# Cloned client checkout used during cross-repo development
-ObsidianIRC/
-
-# Bundled .deb produced by Tauri builds
-*.deb
-*.rpm
-*.AppImage
-
 # CI / IDE noise
 .git
 .github/workflows

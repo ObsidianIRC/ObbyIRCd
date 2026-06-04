@@ -20,7 +20,8 @@ export SSL_PORT="${SSL_PORT:-6697}"
 export WS_PORT="${WS_PORT:-8080}"
 export RPC_PORT="${RPC_PORT:-8600}"
 export RPC_PASSWORD="${RPC_PASSWORD:-}"
-export FILEHOST_URL="${FILEHOST_URL:-}"
+export API_FQDN="${API_FQDN:-}"
+export FILEHOST_URL="${FILEHOST_URL:-${API_FQDN:+https://${API_FQDN}}}"
 export MOTD_TEXT="${MOTD_TEXT:-Welcome to ObbyIRCd!}"
 export OPER_NAME="${OPER_NAME:-admin}"
 export OPER_PASSWORD="${OPER_PASSWORD:-}"
@@ -56,9 +57,14 @@ else
     export WS_CONFIG=""
 fi
 
-# Optional filehost block.
+# Single quotes mark escaped=1 so the URL pre-pass skips it; trailing
+# slash satisfies url_parse.
 if [ -n "$FILEHOST_URL" ]; then
-    export FILEHOST_CONFIG="filehosts { host \"$FILEHOST_URL\"; };"
+    case "$FILEHOST_URL" in
+        */) ;;
+        *)  FILEHOST_URL="$FILEHOST_URL/" ;;
+    esac
+    export FILEHOST_CONFIG="filehosts { host '$FILEHOST_URL'; };"
     echo "Filehost: $FILEHOST_URL"
 else
     export FILEHOST_CONFIG=""
@@ -74,14 +80,53 @@ else
     export RPC_CONFIG=""
 fi
 
-# Random cloak keys if the operator didn't supply any.  Operators
-# running multiple servers should set CLOAK_KEY1/2/3 in .env so all
-# nodes agree.
+# UnrealIRCd's parser has no escape mechanism inside single-quoted
+# values (single-quote = escaped=1, used to skip URL pre-pass).  For
+# values that may contain quote chars, use double-quoted directives
+# (escape \\ and " for the parser) like WS_CONFIG/RPC_CONFIG do.
+voice_dq_escape() {
+    printf "%s" "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# URLs contain '?'; set -f around the loop disables glob expansion.
+# URLs must not contain ' -- there's no way to escape one inside a
+# single-quoted conf value, and ' is not a valid URL character anyway.
+if [ -n "${VOICE_TURN_EXTERNAL_URLS:-}" ]; then
+    case "$VOICE_TURN_EXTERNAL_URLS" in
+        *"'"*)
+            echo "ERROR: VOICE_TURN_EXTERNAL_URLS contains a single quote, refuse to render conf" >&2
+            exit 1
+            ;;
+    esac
+    voice_turn_url_lines=""
+    set -f
+    for u in $VOICE_TURN_EXTERNAL_URLS; do
+        voice_turn_url_lines="$voice_turn_url_lines
+    url '$u';"
+    done
+    set +f
+    export VOICE_TURN_CONFIG="voice { turn {${voice_turn_url_lines}
+    shared-secret \"$(voice_dq_escape "${VOICE_TURN_SHARED_SECRET}")\";
+    ttl ${VOICE_TURN_TTL:-21600};
+}; };"
+    echo "External TURN: enabled (${VOICE_TURN_EXTERNAL_URLS})"
+else
+    export VOICE_TURN_CONFIG=""
+fi
+
+# Random cloak keys if the operator didn't supply any.  UnrealIRCd
+# requires >= 80 chars of mixed a-zA-Z0-9; hex alone is rejected as
+# "not mixed".  Operators running linked nodes should set
+# CLOAK_KEY1/2/3 in .env so all nodes agree.
+gen_cloak_key() {
+    LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 96
+    echo
+}
 if [ -z "${CLOAK_KEY1:-}" ] || [ -z "${CLOAK_KEY2:-}" ] || [ -z "${CLOAK_KEY3:-}" ]; then
     echo "Generating random cloak keys (set CLOAK_KEY1/2/3 in .env to fix them)"
-    CLOAK_KEY1=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-    CLOAK_KEY2=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-    CLOAK_KEY3=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    CLOAK_KEY1=$(gen_cloak_key)
+    CLOAK_KEY2=$(gen_cloak_key)
+    CLOAK_KEY3=$(gen_cloak_key)
 fi
 export CLOAK_KEY1 CLOAK_KEY2 CLOAK_KEY3
 
@@ -140,6 +185,22 @@ else
     echo "Reusing existing config (delete $FIRST_RUN_MARKER to regenerate)"
 fi
 
+# The shipped *.default.conf files are version-locked to the binary --
+# UnrealIRCd refuses to boot when they don't match it.  Refresh them
+# from the image on every start so a binary upgrade doesn't crash on a
+# stale conf volume.  These files are never operator-edited.
+for default_conf in /etc/obbyircd/conf-defaults/*.default.conf; do
+    [ -f "$default_conf" ] || continue
+    cp -f "$default_conf" "$CONF_DIR/$(basename "$default_conf")"
+    chown obbyircd:obbyircd "$CONF_DIR/$(basename "$default_conf")" 2>/dev/null || true
+done
+
+# Splice the custom-modules include into already-rendered configs so
+# pre-existing conf volumes pick up the loadmodule wiring.
+if [ -f "$CONFIG_FILE" ] && ! grep -qE '^[[:space:]]*include[[:space:]]+["'\'']custom-modules\.conf["'\'']' "$CONFIG_FILE"; then
+    printf '\ninclude "custom-modules.conf";\n' >> "$CONFIG_FILE"
+fi
+
 # obbyscript autoloads every *.js it finds in $CONFDIR/scripts/.
 # Make sure the directory exists so the module doesn't log a warning
 # on every restart even when the operator hasn't placed any scripts.
@@ -152,8 +213,10 @@ chown obbyircd:obbyircd "$DATA_DIR" "$LOGS_DIR" "$TLS_DIR" 2>/dev/null || true
 chown obbyircd:obbyircd "$CONF_DIR/scripts" 2>/dev/null || true
 chown obbyircd:obbyircd "$OPER_PASSWORD_FILE" 2>/dev/null || true
 
-# Compile any user-dropped custom modules.  Failures are logged and
-# the server still starts.
+# Rewritten every boot so removed sources don't leave dangling
+# loadmodule lines.
+CUSTOM_MOD_CONF="$CONF_DIR/custom-modules.conf"
+: > "$CUSTOM_MOD_CONF.tmp"
 if [ -d "$CUSTOM_MOD_DIR" ]; then
     for src in "$CUSTOM_MOD_DIR"/*.c; do
         [ -f "$src" ] || continue
@@ -166,11 +229,14 @@ if [ -d "$CUSTOM_MOD_DIR" ]; then
             -I"$SOURCE_TREE/include" -I"$SOURCE_TREE" \
             $(pkg-config --cflags openssl 2>/dev/null || true); then
             echo "  -> $out"
+            echo "loadmodule \"third/${modname}\";" >> "$CUSTOM_MOD_CONF.tmp"
         else
             echo "  WARNING: $modname failed to compile, skipping"
         fi
     done
 fi
+mv "$CUSTOM_MOD_CONF.tmp" "$CUSTOM_MOD_CONF"
+chown obbyircd:obbyircd "$CUSTOM_MOD_CONF" 2>/dev/null || true
 
 cd /home/obbyircd/obby
 

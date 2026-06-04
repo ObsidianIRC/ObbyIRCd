@@ -11,9 +11,11 @@
 FROM alpine:3.19
 
 # Build + runtime dependencies.  sqlite-dev is needed by the
-# account-registration module; the rest cover the core IRCd, TLS, JSON
-# logging, PCRE2 regexes, argon2 password hashing, libsodium for the
-# RPC subsystem and gettext for the entrypoint's envsubst.
+# account-registration module; python3-dev backs obbypy's embedded
+# CPython (uses python3-embed pkg-config -- see src/modules/Makefile.in).
+# The rest cover the core IRCd, TLS, JSON logging, PCRE2 regexes,
+# argon2 password hashing, libsodium for the RPC subsystem and
+# gettext for the entrypoint's envsubst.
 RUN apk add --no-cache \
     build-base \
     openssl-dev \
@@ -24,6 +26,7 @@ RUN apk add --no-cache \
     jansson-dev \
     curl-dev \
     sqlite-dev \
+    python3-dev \
     pkgconf \
     wget \
     tar \
@@ -35,7 +38,7 @@ RUN apk add --no-cache \
 RUN adduser -D -s /bin/sh obbyircd
 
 # Copy the entire repository in.  .dockerignore keeps build artifacts,
-# the ObsidianIRC client checkout, and other dev junk out.
+# the obbyworld client checkout, and other dev junk out.
 WORKDIR /tmp/obbyircd-source
 COPY --chown=obbyircd:obbyircd . .
 

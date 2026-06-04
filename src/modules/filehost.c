@@ -11,7 +11,7 @@
  *       host "https://your-filehost.example/";
  *   };
  *
- * Originally written by the ObsidianIRC team as the third-party module
+ * Originally written by the obbyworld team as the third-party module
  * "third/o-filehost"; integrated as a native ObbyIRCd module.
  *
  * License: GPLv3

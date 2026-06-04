@@ -20,9 +20,9 @@ import (
 type ConflictPolicy int
 
 const (
-	ConflictSkip ConflictPolicy = iota // default: leave existing row alone
-	ConflictFail                       // abort the migration on first collision
-	ConflictMerge                      // overwrite metadata-ish fields, keep identity
+	ConflictSkip  ConflictPolicy = iota // default: leave existing row alone
+	ConflictFail                        // abort the migration on first collision
+	ConflictMerge                       // overwrite metadata-ish fields, keep identity
 )
 
 func (p ConflictPolicy) String() string {
@@ -65,6 +65,7 @@ type Report struct {
 	Accounts []AccountReport
 	Channels []ChannelReport
 	Bans     int
+	Metadata int
 	Warnings []string
 }
 

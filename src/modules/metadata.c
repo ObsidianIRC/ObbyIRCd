@@ -822,7 +822,10 @@ void metadata_set_user(Client *user, const char *key, const char *value, Client 
 		}
 		if (!set)
 		{
-			if (!client || count < metadata_settings.max_user_metadata)
+			/* Local-server-initiated SETs (e.g. metadata-db replay on
+			 * boot) must not be rate-limited; otherwise restored
+			 * persistent metadata is silently dropped. */
+			if (!client || client == &me || count < metadata_settings.max_user_metadata)
 			{ /* add new entry for user */
 				*metadata = safe_alloc(sizeof(struct metadata));
 				(*metadata)->next = NULL;
@@ -900,7 +903,7 @@ void metadata_set_channel(Channel *channel, const char *key, const char *value, 
 		}
 		if (!set)
 		{
-			if (!client || count < metadata_settings.max_channel_metadata)
+			if (!client || client == &me || count < metadata_settings.max_channel_metadata)
 			{ /* add new entry for user */
 				*metadata = safe_alloc(sizeof(struct metadata));
 				(*metadata)->next = NULL;

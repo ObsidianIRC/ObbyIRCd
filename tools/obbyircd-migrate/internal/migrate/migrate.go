@@ -44,6 +44,7 @@ type PlanInputs struct {
 	ObsidianPath string // path to write obsidian.db (sqlite). Optional.
 	ChannelPath  string // path to write channel.db (UnrealDB). Optional.
 	TKLPath      string // path to write tkldb.db (UnrealDB). Optional.
+	MetadataPath string // path to write metadata.db (k4be format). Optional.
 	DryRun       bool
 	OnConflict   writer.ConflictPolicy
 }
@@ -77,6 +78,11 @@ func Run(in PlanInputs) (*ir.Bundle, *writer.Report, error) {
 		}
 	} else {
 		rep.Bans = len(bundle.Bans)
+	}
+	if in.MetadataPath != "" {
+		if err := writer.WriteMetadataDB(in.MetadataPath, bundle, opts, rep); err != nil {
+			return bundle, rep, fmt.Errorf("write metadata.db: %w", err)
+		}
 	}
 	return bundle, rep, nil
 }

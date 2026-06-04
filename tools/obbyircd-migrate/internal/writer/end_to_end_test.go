@@ -253,8 +253,8 @@ func TestWriteChannelDBRoundTrip(t *testing.T) {
 
 	// Magic start should appear right after the count.
 	magic := binary.LittleEndian.Uint32(data[12:16])
-	if magic != magicChannelStart {
-		t.Errorf("magic = %x, want %x", magic, magicChannelStart)
+	if magic != magicEntryStart {
+		t.Errorf("magic = %x, want %x", magic, magicEntryStart)
 	}
 
 	// The output should contain Alice's automode extban for the
@@ -297,9 +297,9 @@ func TestWriteChannelDBRoundTrip(t *testing.T) {
 	}
 	// Check the +e (excepts) list has the founder + ACL grants.
 	wantBans := map[string]bool{
-		"~automode:q:~account:Alice":           false,
-		"~automode:o:~account:Bob":             false,
-		"~automode:h:*!*@helper.example":       false,
+		"~automode:q:~account:Alice":     false,
+		"~automode:o:~account:Bob":       false,
+		"~automode:h:*!*@helper.example": false,
 	}
 	for _, e := range pc.Excepts {
 		if _, ok := wantBans[e.BanStr]; ok {

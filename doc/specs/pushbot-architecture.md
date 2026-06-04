@@ -18,7 +18,7 @@ A PushBot is two things at once:
 flowchart LR
     subgraph Users["IRC users"]
         Alice([alice])
-        Bob([bob — ObsidianIRC])
+        Bob([bob — obbyworld])
     end
 
     subgraph IRCd["obbyircd"]
@@ -132,7 +132,7 @@ auto-suspended with a server-notice to opers.
 
 ## 4. Command discovery
 
-The popover in ObsidianIRC populates from `+draft/bot-cmds-query` TAGMSGs
+The popover in obbyworld populates from `+draft/bot-cmds-query` TAGMSGs
 sent to each `+B` user the client shares a channel with.  The server
 either answers directly (for PushBots) or relays the query to the bot
 which answers itself (for obbyscript/obbypy bots that implement the
@@ -141,7 +141,7 @@ description, options, types, choices, requirements.
 
 ```mermaid
 sequenceDiagram
-    participant C as ObsidianIRC (bob)
+    participant C as obbyworld (bob)
     participant S as obbyircd
     participant B as weatherbot
 

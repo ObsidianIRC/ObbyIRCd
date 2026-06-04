@@ -1,7 +1,7 @@
 /* src/modules/cmdslist.c
  *
  * obsidianirc/cmdslist: tell connected clients which IRC commands they
- * are allowed to invoke right now.  Used by the ObsidianIRC web client
+ * are allowed to invoke right now.  Used by the obbyworld web client
  * to drive a "/" slash-command suggestion popover.
  *
  * Wire shape:

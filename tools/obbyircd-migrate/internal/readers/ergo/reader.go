@@ -113,6 +113,30 @@ func Read(path string) (*ir.Bundle, error) {
 					}
 				}
 			}
+			// Pre-metadata-2 Ergo stashed realname + email in scattered
+			// keys; account.metadata wins when present.
+			if a.Metadata == nil {
+				a.Metadata = map[string]string{}
+			}
+			if _, set := a.Metadata["realname"]; !set {
+				if rn := fetch("account.realname", cf); rn != "" {
+					a.Metadata["realname"] = rn
+				}
+			}
+			if settings := fetch("account.settings", cf); settings != "" {
+				var s struct{ Email string }
+				if err := json.Unmarshal([]byte(settings), &s); err == nil && s.Email != "" {
+					if a.Email == "" {
+						a.Email = s.Email
+					}
+					if _, set := a.Metadata["email"]; !set {
+						a.Metadata["email"] = s.Email
+					}
+				}
+			}
+			if len(a.Metadata) == 0 {
+				a.Metadata = nil
+			}
 		}
 
 		// Channels: TableChannels prefix is "1 ".
@@ -195,11 +219,11 @@ func readErgoChannel(jsonStr string) *ir.Channel {
 		Topic          string
 		TopicSetBy     string
 		TopicSetTime   time.Time
-		Modes          []int32           // mode runes as integers
+		Modes          []int32 // mode runes as integers
 		Key            string
 		Forward        string
 		UserLimit      int
-		AccountToUMode map[string]int32  // value is a single mode rune
+		AccountToUMode map[string]int32 // value is a single mode rune
 		Bans           map[string]maskInfo
 		Excepts        map[string]maskInfo
 		Invites        map[string]maskInfo

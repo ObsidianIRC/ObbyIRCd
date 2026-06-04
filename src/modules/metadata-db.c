@@ -113,6 +113,7 @@ struct cfgstruct {
 };
 static struct cfgstruct cfg;
 static struct metadata_storage *metadata_storage;
+static long metadatadb_next_event = 0;
 
 MOD_TEST(){
 	memset(&cfg, 0, sizeof(cfg));
@@ -121,16 +122,8 @@ MOD_TEST(){
 }
 
 MOD_INIT(){
+	LoadPersistentLong(modinfo, metadatadb_next_event);
 	setcfg();
-
-	if (!read_metadatadb()){
-		char fname[512];
-		snprintf(fname, sizeof(fname), "%s.corrupt", cfg.database);
-		if (rename(cfg.database, fname) == 0)
-			config_warn("[metadata-db] Existing database renamed to %s and starting a new one...", fname);
-		else
-			config_warn("[metadata-db] Failed to rename database from %s to %s: %s", cfg.database, fname, strerror(errno));
-	}
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, metadatadb_configrun);
 	return MOD_SUCCESS;
 }
@@ -145,6 +138,24 @@ MOD_LOAD(){
 	HookAdd(modinfo->handle, HOOKTYPE_ACCOUNT_LOGIN, 0, account_login);
 	HookAdd(modinfo->handle, HOOKTYPE_REMOTE_QUIT, 0, user_quit);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_QUIT, 0, user_quit);
+
+	/* Deferred to MOD_LOAD so the metadata module's MOD_LOAD has set
+	 * its limit defaults (max_channel_metadata etc); otherwise
+	 * set_channel_metadata would silently hit LIMIT_REACHED on every
+	 * stored entry and the file's contents would be lost on boot.
+	 * Gated on first-load (matches channeldb/tkldb) so /REHASH doesn't
+	 * re-replay and double-insert the stored entries. */
+	if (!metadatadb_next_event){
+		if (!read_metadatadb()){
+			char fname[512];
+			snprintf(fname, sizeof(fname), "%s.corrupt", cfg.database);
+			if (rename(cfg.database, fname) == 0)
+				config_warn("[metadata-db] Existing database renamed to %s and starting a new one...", fname);
+			else
+				config_warn("[metadata-db] Failed to rename database from %s to %s: %s", cfg.database, fname, strerror(errno));
+		}
+		metadatadb_next_event = TStime() + METADATADB_SAVE_EVERY;
+	}
 
 	Client *acptr;
 
@@ -168,6 +179,7 @@ void free_metadata_storage(void){
 }
 
 MOD_UNLOAD(){
+	SavePersistentLong(modinfo, metadatadb_next_event);
 	write_metadatadb();
 	freecfg();
 	free_metadata_storage();

@@ -147,7 +147,7 @@ extbans and a Windows crash bug has been resolved.
   if you are pasting more lines.
 
   Only a couple clients support sending multiline at the moment:
-  IRCCloud, WeeChat, ObsidianIRC, Halloy, and the bots BitBot & Limnoria.
+  IRCCloud, WeeChat, obbyworld, Halloy, and the bots BitBot & Limnoria.
   Incoming lines with multilines are displayed normally in unsupporting clients,
   using a fallback algorithm.
 
@@ -457,7 +457,7 @@ Christmas and a happy new year!
 
 ### Enhancements:
 * Support for IRCv3 [network icon](https://ircv3.net/specs/extensions/network-icon).
-  At the moment IRCCloud and ObsidianIRC display this.  
+  At the moment IRCCloud and obbyworld display this.  
   Simply provide an image URL (be sure to use single quotes): `set { network-icon 'https://.....'; }`
 * New [JSON-RPC](https://www.unrealircd.org/docs/JSON-RPC) functions:
   * [`message`](https://www.unrealircd.org/docs/JSON-RPC:Message):
