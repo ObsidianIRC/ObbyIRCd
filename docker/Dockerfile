@@ -84,7 +84,19 @@ RUN chmod +x Config \
     && chown -R obbyircd:obbyircd /tmp/obbyircd-source /home/obbyircd
 
 USER obbyircd
-RUN ./Config -quick && make -j"$(nproc)" && make install
+# UnrealIRCd's bundled argon2 (extras/argon2.tar.gz) builds with -march=native
+# by default, baking the build host's CPU instructions into the binary; the
+# image then SIGILLs on any host with a smaller instruction set (e.g. an
+# AVX2-only machine running an AVX-512-built lib).  Pin a portable per-arch
+# baseline so the image runs on every CPU of its architecture.
+RUN ARCH="$(uname -m)" \
+    && case "$ARCH" in \
+        x86_64)  OPTTARGET="x86-64" ;; \
+        aarch64) OPTTARGET="armv8-a" ;; \
+        *)       OPTTARGET="native" ;; \
+    esac \
+    && export OPTTARGET \
+    && ./Config -quick && make -j"$(nproc)" && make install
 
 USER root
 
