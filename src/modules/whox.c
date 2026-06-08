@@ -98,7 +98,7 @@ MOD_INIT()
 
 	MARK_AS_OFFICIAL_MODULE(modinfo);
 
-	if (!CommandAdd(modinfo->handle, "WHO", cmd_whox, MAXPARA, CMD_USER))
+	if (!CommandAdd(modinfo->handle, "WHO", cmd_whox, MAXPARA, CMD_USER|CMD_NOLAG))
 	{
 		config_warn("You cannot load both cmd_whox and cmd_who. You should ONLY load the cmd_whox module.");
 		return MOD_FAILED;

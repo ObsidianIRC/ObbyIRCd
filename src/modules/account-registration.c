@@ -61,6 +61,21 @@ static void  set_accreg_conf(void);
 static void  free_accreg_conf(void);
 static void  oauth_free_providers(void);
 
+/* Pair every ERR_SASLFAIL with an audit log so operators can diagnose
+ * failures the same way they can for successes (SASL_LOGIN). */
+static inline void log_sasl_fail(Client *client,
+                                 const char *mech,
+                                 const char *account,
+                                 const char *reason)
+{
+    unreal_log(ULOG_INFO, "account", "SASL_FAIL", client,
+               "SASL $mech failure for $client.details "
+               "[account: $account] [reason: $reason]",
+               log_data_string("mech", mech ? mech : "?"),
+               log_data_string("account", account && *account ? account : "?"),
+               log_data_string("reason", reason ? reason : "?"));
+}
+
 CMD_FUNC(register_account);
 CMD_FUNC(list_accounts);
 CMD_FUNC(cmd_identify);
@@ -2877,8 +2892,14 @@ static int scram_parse_client_first(const char *msg,
 
 static void scram_fail(Client *client)
 {
+    ScramState *st = ScramGet(client);
+    const char *username = (st && st->account) ? st->account->name : NULL;
     client->local->sasl_sent_time = 0;
     add_fake_lag(client, 5000);
+    log_sasl_fail(client, "SCRAM-SHA-256", username,
+                  st ? (st->step == 0 ? "client_first_invalid"
+                                      : "client_final_invalid_or_proof_mismatch")
+                     : "no_state");
     sendnumeric(client, ERR_SASLFAIL);
     DelSaslType(client);
     scram_clear(client);
@@ -3315,6 +3336,7 @@ static int authenticate_attempt(Client *client, int first, const char *param)
         {
             client->local->sasl_sent_time = 0;
             add_fake_lag(client, 3000);
+            log_sasl_fail(client, "EXTERNAL", NULL, "no_certfp");
             sendnumeric(client, ERR_SASLFAIL);
             DelSaslType(client);
             return 0;
@@ -3362,6 +3384,8 @@ static int authenticate_attempt(Client *client, int first, const char *param)
         {
             client->local->sasl_sent_time = 0;
             add_fake_lag(client, 3000);
+            log_sasl_fail(client, "EXTERNAL", NULL,
+                          "no_account_for_certfp");
             sendnumeric(client, ERR_SASLFAIL);
             DelSaslType(client);
             return 0;
@@ -3434,6 +3458,7 @@ static int authenticate_attempt(Client *client, int first, const char *param)
         {
             client->local->sasl_sent_time = 0;
             add_fake_lag(client, 7000);
+            log_sasl_fail(client, "PLAIN", NULL, "decode_failed");
             sendnumeric(client, ERR_SASLFAIL);
             DelSaslType(client);
             return 0;
@@ -3441,6 +3466,8 @@ static int authenticate_attempt(Client *client, int first, const char *param)
 
         if (BadPtr(username) || BadPtr(password))
         {
+            log_sasl_fail(client, "PLAIN", username,
+                          "missing username or password");
             sendnumeric(client, ERR_SASLFAIL);
             DelSaslType(client);
             return 0;
@@ -3500,6 +3527,11 @@ static int authenticate_attempt(Client *client, int first, const char *param)
         {
             client->local->sasl_sent_time = 0;
             add_fake_lag(client, 7000);
+            log_sasl_fail(client, "PLAIN", username,
+                          account ? (account->password_scheme
+                                         ? account->password_scheme
+                                         : "argon2id_or_legacy")
+                                  : "account_not_found");
             sendnumeric(client, ERR_SASLFAIL);
             DelSaslType(client);
         }

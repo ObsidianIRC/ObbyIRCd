@@ -62,15 +62,11 @@
 #define PB_OP_INTERACTION_RESPONSE 21  /* bot -> server */
 #define PB_OP_INTERACTION_DEFER    22  /* bot -> server (extend window) */
 #define PB_OP_WORKFLOW_EVENT       30  /* bot -> server (emit workflow/step) */
+#define PB_OP_SEND_MESSAGE         31  /* bot -> server: spontaneous PRIVMSG/NOTICE */
+#define PB_OP_SEND_TAGMSG          32  /* bot -> server: TAGMSG with client-only tags */
 
-/* Fallback time-to-live for a tracked workflow when the bot forgets to
- * send a terminal state. After this the GC drops it. */
 #define PB_WORKFLOW_TTL_SEC          3600
-/* GC cadence (ms). */
 #define PB_WORKFLOW_GC_INTERVAL_MS   60000
-/* Compact-JSON budget under one +draft/bot-tools tag. base64 expands by
- * ~4/3, the IRCv3 client-tag limit is 4094, leaving us a safe ceiling
- * of roughly 3000 bytes of JSON before we MUST truncate or stream. */
 #define PB_WORKFLOW_JSON_BUDGET      3000
 
 #define PB_INTERACTION_TIMEOUT_SEC 3
@@ -409,6 +405,8 @@ static void pb_handle_command_register(Client *client, json_t *frame);
 static void pb_handle_interaction_response(Client *client, json_t *frame);
 static void pb_handle_interaction_defer(Client *client, json_t *frame);
 static void pb_handle_workflow_event(Client *client, json_t *frame);
+static void pb_handle_send_message(Client *client, json_t *frame);
+static void pb_handle_send_tagmsg(Client *client, json_t *frame);
 static PbWorkflow *pb_workflow_find(const char *wid);
 static PbWorkflow *pb_workflow_find_by_sid(const char *sid);
 static PbWorkflow *pb_workflow_touch(PbBot *bot, const char *wid, const char *target);
@@ -718,7 +716,9 @@ static int pb_test_bot_block(ConfigFile *cf, ConfigEntry *bot_ce, int *errs)
 		} else if (!strcmp(cep->name, "auto-join")) {
 			/* Block of channel names; values inside are channels. */
 			for (ConfigEntry *ch = cep->items; ch; ch = ch->next) {
-				if (!ch->name || ch->name[0] != '#') {
+				if (!ch->name ||
+				    (ch->name[0] != '#' && ch->name[0] != '&' &&
+				     ch->name[0] != '^' && ch->name[0] != '$')) {
 					config_error("%s:%d: pushbot::bot::auto-join entries must be channel names",
 					             ch->file->filename, ch->line_number);
 					errors++;
@@ -812,7 +812,9 @@ static void pb_parse_bot_block(ConfigEntry *bot_ce)
 		else if (!strcmp(cep->name, "prefix")) safe_strdup(b->prefix, cep->value);
 		else if (!strcmp(cep->name, "auto-join")) {
 			for (ConfigEntry *ch = cep->items; ch; ch = ch->next) {
-				if (ch->name && ch->name[0] == '#')
+				if (ch->name &&
+				    (ch->name[0] == '#' || ch->name[0] == '&' ||
+				     ch->name[0] == '^' || ch->name[0] == '$'))
 					add_name_list(b->auto_join, ch->name);
 			}
 		}
@@ -1959,6 +1961,8 @@ static void pb_handle_ws_message(Client *client, char *msg, int len)
 	case PB_OP_INTERACTION_RESPONSE: pb_handle_interaction_response(client, frame); break;
 	case PB_OP_INTERACTION_DEFER:    pb_handle_interaction_defer(client, frame); break;
 	case PB_OP_WORKFLOW_EVENT:       pb_handle_workflow_event(client, frame); break;
+	case PB_OP_SEND_MESSAGE:         pb_handle_send_message(client, frame); break;
+	case PB_OP_SEND_TAGMSG:          pb_handle_send_tagmsg(client, frame); break;
 	default:
 		unreal_log(ULOG_DEBUG, "pushbot", "WS_UNKNOWN_OP", client,
 		           "Received unknown opcode $op",
@@ -2749,8 +2753,11 @@ static MessageTag *pb_make_reply_tags(const char *reply_msgid,
 {
 	MessageTag *head = NULL, *tail = NULL;
 	if (reply_msgid && *reply_msgid) {
+		/* Only +draft/reply, NOT also +reply: obsidian client treats
+		 * each as a separate reply annotation and renders the message
+		 * twice when both are present. Matches fluffilloo. */
 		MessageTag *m = safe_alloc(sizeof(*m));
-		safe_strdup(m->name, "+reply");
+		safe_strdup(m->name, "+draft/reply");
 		safe_strdup(m->value, reply_msgid);
 		AddListItem(m, head);
 		if (!tail) tail = m;
@@ -3320,8 +3327,127 @@ static void pb_handle_command_register(Client *client, json_t *frame)
 	pb_broadcast_bot_event(s->bot, "update");
 }
 
+static void pb_append_tags(MessageTag **head, MessageTag *extra)
+{
+	for (MessageTag *m = extra; m; m = m->next) {
+		MessageTag *cp = safe_alloc(sizeof(*cp));
+		safe_strdup(cp->name, m->name);
+		if (m->value) safe_strdup(cp->value, m->value);
+		AddListItem(cp, *head);
+	}
+}
+
+/* Split content on \n into up to 128 trimmed lines (returned as
+ * pointers into the caller-supplied `dup` buffer, which the caller
+ * must safe_free after use). Returns line count. */
+static int pb_split_lines(char *dup, char *lines[128])
+{
+	int n = strlen(dup);
+	while (n > 0 && (dup[n-1] == '\n' || dup[n-1] == '\r'))
+		dup[--n] = '\0';
+	int count = 0;
+	char *p = dup;
+	while (p && count < 128) {
+		char *nl = strchr(p, '\n');
+		if (nl) *nl = '\0';
+		int len = strlen(p);
+		if (len > 0 && p[len-1] == '\r') p[len-1] = '\0';
+		lines[count++] = p;
+		if (!nl) break;
+		p = nl + 1;
+	}
+	return count;
+}
+
+/* Send a (possibly multi-line) reply to a channel OR a single user
+ * as an IRCv3 draft/multiline batch when >1 line, or a single
+ * PRIVMSG/NOTICE when 1 line. outer_tags are attached to the batch
+ * open (multi-line) or the single message (one-line); inside the
+ * batch each line carries only the inherited @batch tag. */
+static void pb_send_multiline(Channel *ch, Client *target, Client *ghost,
+                              const char *verb, MessageTag *outer_tags,
+                              const char *content)
+{
+	if (!ghost || !content) return;
+
+	char *dup = raw_strdup(content);
+	char *lines[128];
+	int n = pb_split_lines(dup, lines);
+
+	if (n <= 1) {
+		const char *one = (n == 1) ? lines[0] : "";
+		/* new_message() injects msgid/time/account so the obsidian
+		 * client can dedupe; without msgid it renders the same
+		 * PRIVMSG twice (once via +draft/reply as a reply tile,
+		 * once as a generic channel line). */
+		MessageTag *mtags = NULL;
+		new_message(ghost, NULL, &mtags);
+		pb_append_tags(&mtags, outer_tags);
+		if (ch) {
+			sendto_channel(ch, ghost, NULL, NULL, 0, SEND_ALL, mtags,
+			               ":%s %s %s :%s",
+			               ghost->name, verb, ch->name, one);
+		} else if (target) {
+			sendto_one(target, mtags, ":%s %s %s :%s",
+			           ghost->name, verb, target->name, one);
+		}
+		free_message_tags(mtags);
+		safe_free(dup);
+		return;
+	}
+
+	char batch_id[BATCHLEN+1];
+	generate_batch_id(batch_id);
+	const char *object = ch ? ch->name : (target ? target->name : "*");
+
+	MessageTag *open_mtags = NULL;
+	new_message(ghost, NULL, &open_mtags);
+	pb_append_tags(&open_mtags, outer_tags);
+	if (ch) {
+		sendto_channel(ch, ghost, NULL, NULL, 0, SEND_ALL, open_mtags,
+		               ":%s BATCH +%s draft/multiline %s",
+		               ghost->name, batch_id, object);
+	} else {
+		sendto_one(target, open_mtags, ":%s BATCH +%s draft/multiline %s",
+		           ghost->name, batch_id, object);
+	}
+	free_message_tags(open_mtags);
+
+	for (int i = 0; i < n; i++) {
+		MessageTag *line_mtags = NULL;
+		new_message(ghost, NULL, &line_mtags);
+		MessageTag *bt = safe_alloc(sizeof(*bt));
+		safe_strdup(bt->name, "batch");
+		safe_strdup(bt->value, batch_id);
+		AddListItem(bt, line_mtags);
+		if (ch) {
+			sendto_channel(ch, ghost, NULL, NULL, 0, SEND_ALL, line_mtags,
+			               ":%s %s %s :%s",
+			               ghost->name, verb, ch->name, lines[i]);
+		} else {
+			sendto_one(target, line_mtags, ":%s %s %s :%s",
+			           ghost->name, verb, target->name, lines[i]);
+		}
+		free_message_tags(line_mtags);
+	}
+
+	MessageTag *close_mtags = NULL;
+	new_message(ghost, NULL, &close_mtags);
+	if (ch) {
+		sendto_channel(ch, ghost, NULL, NULL, 0, SEND_ALL, close_mtags,
+		               ":%s BATCH -%s", ghost->name, batch_id);
+	} else {
+		sendto_one(target, close_mtags, ":%s BATCH -%s",
+		           ghost->name, batch_id);
+	}
+	free_message_tags(close_mtags);
+
+	safe_free(dup);
+}
+
 static void pb_send_interaction_reply(PbInteraction *it, const char *content,
-                                      const char *visibility, int ephemeral)
+                                      const char *visibility, int ephemeral,
+                                      MessageTag *extra_tags)
 {
 	if (!it || !content) return;
 	Client *target = find_user(it->invoker_nick, NULL);
@@ -3337,23 +3463,21 @@ static void pb_send_interaction_reply(PbInteraction *it, const char *content,
 	                     (visibility && !strcasecmp(visibility, "public"));
 
 	if (it->channel && public_visible) {
-		/* Public reply in-channel: PRIVMSG <ch> from bot ghost. */
 		Channel *ch = find_channel(it->channel);
 		if (!ch) return;
 		MessageTag *tags = pb_make_reply_tags(it->invoker_msgid, NULL,
 		                                      it->invoker_cmd_b64);
-		sendto_channel(ch, it->bot->ghost, NULL, NULL, 0, SEND_ALL, tags,
-		               ":%s PRIVMSG %s :%s", it->bot->ghost->name, ch->name, content);
+		pb_append_tags(&tags, extra_tags);
+		pb_send_multiline(ch, NULL, it->bot->ghost, "PRIVMSG", tags, content);
 		free_message_tags(tags);
 		return;
 	}
 
-	/* Private reply: NOTICE/PRIVMSG to invoker with channel-context tag. */
 	MessageTag *tags = pb_make_reply_tags(it->invoker_msgid, it->channel,
 	                                      it->invoker_cmd_b64);
-	const char *cmd = as_notice ? "NOTICE" : "PRIVMSG";
-	sendto_one(target, tags, ":%s %s %s :%s",
-	           it->bot->ghost->name, cmd, target->name, content);
+	pb_append_tags(&tags, extra_tags);
+	pb_send_multiline(NULL, target, it->bot->ghost,
+	                  as_notice ? "NOTICE" : "PRIVMSG", tags, content);
 	free_message_tags(tags);
 }
 
@@ -3388,7 +3512,23 @@ static void pb_handle_interaction_response(Client *client, json_t *frame)
 	json_t *ej = json_object_get(d, "ephemeral");
 	if (json_is_boolean(ej)) ephemeral = json_is_true(ej) ? 1 : 0;
 
-	pb_send_interaction_reply(it, content, vis, ephemeral);
+	MessageTag *extra = NULL;
+	json_t *tagj = json_object_get(d, "tags");
+	if (json_is_object(tagj)) {
+		const char *key;
+		json_t *val;
+		json_object_foreach(tagj, key, val) {
+			if (!key || key[0] != '+') continue;
+			if (!json_is_string(val)) continue;
+			MessageTag *m = safe_alloc(sizeof(*m));
+			safe_strdup(m->name, key);
+			safe_strdup(m->value, json_string_value(val));
+			AddListItem(m, extra);
+		}
+	}
+
+	pb_send_interaction_reply(it, content, vis, ephemeral, extra);
+	free_message_tags(extra);
 	pb_interaction_free(it);
 }
 
@@ -3404,6 +3544,118 @@ static void pb_handle_interaction_defer(Client *client, json_t *frame)
 	if (!it || it->bot != s->bot) return;
 	it->expires_at = TStime() + PB_INTERACTION_DEFER_SEC;
 	it->deferred = 1;
+}
+
+/* PB_OP_SEND_MESSAGE: bot sends a spontaneous PRIVMSG/NOTICE from its
+ * ghost. d = { target, content, [is_notice] }. Target may be a
+ * channel (#/^/&/$) or a nick. Not tied to any interaction -- used by
+ * e.g. Orca voice subsystem to mirror transcripts into the text side
+ * of a voice channel without piggybacking on a user invocation. */
+static void pb_handle_send_message(Client *client, json_t *frame)
+{
+	PbSession *s = PB_SESS(client);
+	if (!s || !s->bot || !s->identified) {
+		pb_close_ws(client, PB_CLOSE_AUTH_FAILED, "Not authenticated");
+		return;
+	}
+	if (!s->bot->ghost) return;
+
+	json_t *d = json_object_get(frame, "d");
+	if (!json_is_object(d)) return;
+
+	json_t *tj = json_object_get(d, "target");
+	json_t *cj = json_object_get(d, "content");
+	if (!json_is_string(tj) || !json_is_string(cj)) return;
+	const char *target = json_string_value(tj);
+	const char *content = json_string_value(cj);
+	if (!target || !*target || !content) return;
+
+	int as_notice = 0;
+	json_t *nj = json_object_get(d, "is_notice");
+	if (json_is_true(nj)) as_notice = 1;
+
+	const char *verb = as_notice ? "NOTICE" : "PRIVMSG";
+
+	/* Optional client-only tags to attach to the outgoing message. */
+	MessageTag *tags = NULL;
+	json_t *tagj = json_object_get(d, "tags");
+	if (json_is_object(tagj)) {
+		const char *key;
+		json_t *val;
+		json_object_foreach(tagj, key, val) {
+			if (!key || key[0] != '+') continue;
+			if (!json_is_string(val)) continue;
+			MessageTag *m = safe_alloc(sizeof(*m));
+			safe_strdup(m->name, key);
+			safe_strdup(m->value, json_string_value(val));
+			AddListItem(m, tags);
+		}
+	}
+
+	if (target[0] == '#' || target[0] == '&' ||
+	    target[0] == '^' || target[0] == '$') {
+		Channel *ch = find_channel(target);
+		if (!ch) { free_message_tags(tags); return; }
+		pb_send_multiline(ch, NULL, s->bot->ghost, verb, tags, content);
+	} else {
+		Client *to = find_user(target, NULL);
+		if (!to) { free_message_tags(tags); return; }
+		pb_send_multiline(NULL, to, s->bot->ghost, verb, tags, content);
+	}
+	free_message_tags(tags);
+}
+
+/* d = { target, tags: { "+name": "value", ... } } */
+static void pb_handle_send_tagmsg(Client *client, json_t *frame)
+{
+	PbSession *s = PB_SESS(client);
+	if (!s || !s->bot || !s->identified) {
+		pb_close_ws(client, PB_CLOSE_AUTH_FAILED, "Not authenticated");
+		return;
+	}
+	if (!s->bot->ghost) return;
+
+	json_t *d = json_object_get(frame, "d");
+	if (!json_is_object(d)) return;
+
+	json_t *tj = json_object_get(d, "target");
+	json_t *tagj = json_object_get(d, "tags");
+	if (!json_is_string(tj) || !json_is_object(tagj)) return;
+	const char *target = json_string_value(tj);
+	if (!target || !*target) return;
+
+	MessageTag *head = NULL;
+	const char *key;
+	json_t *val;
+	json_object_foreach(tagj, key, val) {
+		if (!key || key[0] != '+') continue;
+		if (!json_is_string(val)) continue;
+		MessageTag *m = safe_alloc(sizeof(*m));
+		safe_strdup(m->name, key);
+		safe_strdup(m->value, json_string_value(val));
+		AddListItem(m, head);
+	}
+	if (!head) return;
+
+	MessageTag *mtags = NULL;
+	new_message(s->bot->ghost, NULL, &mtags);
+	pb_append_tags(&mtags, head);
+	free_message_tags(head);
+
+	if (target[0] == '#' || target[0] == '&' ||
+	    target[0] == '^' || target[0] == '$') {
+		Channel *ch = find_channel(target);
+		if (!ch) { free_message_tags(mtags); return; }
+		sendto_channel(ch, s->bot->ghost, NULL, NULL, 0, SEND_ALL, mtags,
+		               ":%s TAGMSG %s",
+		               s->bot->ghost->name, ch->name);
+	} else {
+		Client *to = find_user(target, NULL);
+		if (!to) { free_message_tags(mtags); return; }
+		sendto_one(to, mtags, ":%s TAGMSG %s",
+		           s->bot->ghost->name, to->name);
+	}
+	free_message_tags(mtags);
 }
 
 EVENT(pb_interaction_timeout_check)

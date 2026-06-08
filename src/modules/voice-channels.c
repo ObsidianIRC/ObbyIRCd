@@ -437,6 +437,8 @@ static int voice_can_join(Client *client, Channel *channel,
 		return 0; /* trust remote servers for federated joins */
 	if (HasCapabilityFast(client, CAP_OBSIDIANIRC_VOICE))
 		return 0;
+	if (IsUser(client) && has_user_mode(client, 'B'))
+		return 0; /* bot ghosts (pushbot, etc.) don't negotiate caps */
 
 	snprintf(fmt, sizeof(fmt),
 	         "%%s :Voice channels require the " VOICE_CAP_NAME

@@ -105,11 +105,14 @@ MODULES= \
 	emoji.so \
 	account-recovery.so \
 	read-marker.so \
+	pm_history.so \
+	webpush.so \
 	cmdslist.so \
 	named-modes.so \
 	member-roles.so \
 	memo.so \
 	voice-channels.so \
+	sentinel.so \
 	redact.so \
 	react.so \
 	channel-rename.so \
@@ -186,12 +189,32 @@ read-marker.so: read-marker.c $(INCLUDES)
 	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
 		-o read-marker.so read-marker.c -lsqlite3
 
+# pm_history persists PMs between account-holders so CHATHISTORY can
+# replay them on reconnect (Ergo-style).  Its own sqlite handle on
+# obsidian.db, no link-time dep on account-registration.so.
+pm_history.so: pm_history.c $(INCLUDES)
+	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
+		-o pm_history.so pm_history.c -lsqlite3
+
+# webpush stores per-account Web Push subscriptions in obsidian.db and
+# POSTs notification jobs to the hosted-backend (which owns the VAPID
+# private key + does the RFC 8291 encryption).
+webpush.so: webpush.c $(INCLUDES)
+	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
+		-o webpush.so webpush.c -lsqlite3
+
 # voice-channels needs jansson for the Unix-socket bridge JSON.
 # Use @JANSSON_LIBS@ from configure -- system jansson via pkg-config
 # if found, else the bundled extras/jansson copy at $(PRIVATELIBDIR).
 voice-channels.so: voice-channels.c $(INCLUDES)
 	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
 		-o voice-channels.so voice-channels.c @JANSSON_LIBS@
+
+# sentinel: in-process behavioural detector. Uses jansson for the
+# training-side socket emit; same dep as voice-channels.
+sentinel.so: sentinel.c $(INCLUDES)
+	$(CC) $(CFLAGS) $(MODULEFLAGS) -DDYNAMIC_LINKING \
+		-o sentinel.so sentinel.c @JANSSON_LIBS@
 
 # obbyscript embeds Duktape and needs -lm
 # obbyscript bundles the vendored duktape amalgamation, which uses dynamic

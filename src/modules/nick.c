@@ -327,8 +327,7 @@ CMD_FUNC(cmd_nick_local)
 		/* fallthrough for ircops that have sufficient privileges */
 	}
 
-	if (!ValidatePermissionsForPath("immune:nick-flood",client,NULL,NULL,NULL))
-		add_fake_lag(client, 3000);
+	/* FLD_NICK below handles flood rejection; no pre-emptive lag. */
 
 	if ((acptr = find_client(nick, NULL)))
 	{
