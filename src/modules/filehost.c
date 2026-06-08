@@ -24,9 +24,12 @@
 /* FILEHOST config struct */
 struct
 {
-	char *isupport_line;
+	char *isupport_line;            /* in-house hosts -> obby.world/FILEHOST */
 	MultiLine *hosts;
 	unsigned short int has_hosts;
+	char *external_isupport_line;   /* tokenless hosts -> draft/FILEHOST */
+	MultiLine *external;
+	unsigned short int has_external;
 } cfg;
 
 ModuleHeader MOD_HEADER = {
@@ -124,10 +127,22 @@ MOD_INIT()
 
 MOD_LOAD()
 {
+	/* In-house `host` uploaders are account-gated (clients mint a
+	 * draft/authtoken Bearer), so they're advertised under the vendor token
+	 * rather than the tokenless standard draft/FILEHOST. */
 	if (cfg.has_hosts)
 	{
 		ISupport *is;
-		if (!(is = ISupportAdd(modinfo->handle, "draft/FILEHOST", cfg.isupport_line)))
+		if (!(is = ISupportAdd(modinfo->handle, "obby.world/FILEHOST", cfg.isupport_line)))
+			return MOD_FAILED;
+	}
+	/* `external` uploaders are plain tokenless endpoints (e.g. s.h4ks.com):
+	 * the standard draft/FILEHOST -- a space-separated list clients POST to
+	 * directly. */
+	if (cfg.has_external)
+	{
+		ISupport *is;
+		if (!(is = ISupportAdd(modinfo->handle, "draft/FILEHOST", cfg.external_isupport_line)))
 			return MOD_FAILED;
 	}
 	return MOD_SUCCESS;
@@ -387,6 +402,35 @@ char *extract_url_from_message(const char *text)
 		result = safe_alloc(url_len + 1);
 		memcpy(result, text + ovector[0], url_len);
 		result[url_len] = '\0';
+
+		/* Strip trailing punctuation that the regex greedily grabbed.
+		 * Balanced brackets stay (e.g. Wikipedia URLs ending in `)`);
+		 * unbalanced trailing ) ] } and naked .,;:!?'" come off. */
+		while (url_len > 0)
+		{
+			char c = result[url_len - 1];
+			if (c == '.' || c == ',' || c == ';' || c == ':' ||
+			    c == '!' || c == '?' || c == '\'' || c == '"')
+			{
+				result[--url_len] = '\0';
+				continue;
+			}
+			if (c == ')' || c == ']' || c == '}')
+			{
+				char open = (c == ')') ? '(' : (c == ']') ? '[' : '{';
+				int balance = 0;
+				for (size_t i = 0; i < url_len - 1; i++)
+				{
+					if (result[i] == open) balance++;
+					else if (result[i] == c) balance--;
+				}
+				if (balance > 0)
+					break; /* matched, keep the closer */
+				result[--url_len] = '\0';
+				continue;
+			}
+			break;
+		}
 	}
 
 	pcre2_match_data_free(match_data);
@@ -744,14 +788,19 @@ void setconf(void)
 {
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.has_hosts = 0;
+	cfg.has_external = 0;
 	safe_strdup(cfg.isupport_line, "");
+	safe_strdup(cfg.external_isupport_line, "");
 }
 
 void freeconf(void)
 {
 	freemultiline(cfg.hosts);
+	freemultiline(cfg.external);
 	cfg.has_hosts = 0;
+	cfg.has_external = 0;
 	safe_free(cfg.isupport_line);
+	safe_free(cfg.external_isupport_line);
 	memset(&cfg, 0, sizeof(cfg));
 }
 
@@ -788,6 +837,16 @@ int filehost_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 
 			continue;
 		}
+		if (!strcasecmp(cep->name, "external"))
+		{
+			if (!BadPtr(cep->value))
+				cfg.has_external = 1;
+
+			else
+				config_error("%s:%i: Empty external at %s::%s", cep->file->filename, cep->line_number, CONF_FILEHOST, cep->name);
+
+			continue;
+		}
 
 		// Anything else is unknown to us =]
 		config_warn("%s:%i: unknown item %s::%s", cep->file->filename, cep->line_number, CONF_FILEHOST, cep->name); // So display just a warning
@@ -819,6 +878,9 @@ int filehost_configrun(ConfigFile *cf, ConfigEntry *ce, int type)
 		if (!strcmp(cep->name, "host"))
 			addmultiline(&cfg.hosts, cep->value);
 
+		if (!strcmp(cep->name, "external"))
+			addmultiline(&cfg.external, cep->value);
+
 	}
 
 	for (MultiLine *m = cfg.hosts; m; m = m->next)
@@ -829,6 +891,18 @@ int filehost_configrun(ConfigFile *cf, ConfigEntry *ce, int type)
 	}
 	if (strlen(buf))
 		safe_strdup(cfg.isupport_line, buf);
+
+	/* ISUPPORT values can't contain literal spaces, so a multi-host list is
+	 * joined with the \x20 escape the client unescapes. */
+	buf[0] = '\0';
+	for (MultiLine *m = cfg.external; m; m = m->next)
+	{
+		strlcat(buf, m->line, sizeof(buf));
+		if (m->next)
+			strlcat(buf, "\\x20", sizeof(buf));
+	}
+	if (strlen(buf))
+		safe_strdup(cfg.external_isupport_line, buf);
 
 
 	return 1; // We good
