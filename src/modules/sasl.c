@@ -103,10 +103,7 @@ void _sasl_failed(Client *client)
 	add_fake_lag(client, 7000); /* bump fakelag due to failed authentication attempt */
 	unreal_log(ULOG_INFO, "account", "SASL_FAIL", client,
 	           "SASL failure for $client.details "
-	           "[mech: $mech] [reason: services_dispatch_failed]",
-	           log_data_string("mech", GetSaslType(client)
-	                                       ? "services"
-	                                       : "unknown"));
+	           "[reason: services_dispatch_failed]");
 	RunHookReturn(HOOKTYPE_SASL_RESULT, !=0, client, 0);
 	sendnumeric(client, ERR_SASLFAIL);
 }
