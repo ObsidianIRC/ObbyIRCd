@@ -3,7 +3,8 @@ services:
     build:
       context: .
       dockerfile: ./docker/Dockerfile
-    image: ${OBBYIRCD_IMAGE:-obbyircd:local}
+    # renovate: datasource=docker depName=obbyworld/obbyircd versioning=docker
+    image: ${OBBYIRCD_IMAGE:-obbyworld/obbyircd:6.2.6.1}
     container_name: obbyircd
     restart: unless-stopped
     expose:
