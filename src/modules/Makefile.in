@@ -98,6 +98,7 @@ MODULES= \
 	metadata.so \
 	metadata-db.so \
 	filehost.so \
+	relaymsg.so \
 	invite-page.so \
 	invitation.so \
 	authtoken.so \

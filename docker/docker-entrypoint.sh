@@ -208,7 +208,7 @@ if [ -d "$CUSTOM_MOD_DIR" ]; then
         [ -f "$src" ] || continue
         modname=$(basename "$src" .c)
         case "$modname" in
-            obby-filehost|server-icon)
+            obby-filehost|server-icon|relaymsg)
                 echo "WARNING: $modname is now a built-in module; the third-party copy in $CUSTOM_MOD_DIR will shadow it. Remove $src to use the built-in."
                 continue
                 ;;
