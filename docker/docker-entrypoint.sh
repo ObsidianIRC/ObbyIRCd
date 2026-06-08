@@ -21,7 +21,6 @@ export WS_PORT="${WS_PORT:-8080}"
 export RPC_PORT="${RPC_PORT:-8600}"
 export RPC_PASSWORD="${RPC_PASSWORD:-}"
 export API_FQDN="${API_FQDN:-}"
-export FILEHOST_URL="${FILEHOST_URL:-${API_FQDN:+https://${API_FQDN}}}"
 export MOTD_TEXT="${MOTD_TEXT:-Welcome to ObbyIRCd!}"
 export OPER_NAME="${OPER_NAME:-admin}"
 export OPER_PASSWORD="${OPER_PASSWORD:-}"
@@ -55,19 +54,6 @@ listen {
 };"
 else
     export WS_CONFIG=""
-fi
-
-# Single quotes mark escaped=1 so the URL pre-pass skips it; trailing
-# slash satisfies url_parse.
-if [ -n "$FILEHOST_URL" ]; then
-    case "$FILEHOST_URL" in
-        */) ;;
-        *)  FILEHOST_URL="$FILEHOST_URL/" ;;
-    esac
-    export FILEHOST_CONFIG="filehosts { host '$FILEHOST_URL'; };"
-    echo "Filehost: $FILEHOST_URL"
-else
-    export FILEHOST_CONFIG=""
 fi
 
 # Optional JSON-RPC.  Off by default; set RPC_PASSWORD to enable.
@@ -221,6 +207,12 @@ if [ -d "$CUSTOM_MOD_DIR" ]; then
     for src in "$CUSTOM_MOD_DIR"/*.c; do
         [ -f "$src" ] || continue
         modname=$(basename "$src" .c)
+        case "$modname" in
+            obby-filehost|server-icon)
+                echo "WARNING: $modname is now a built-in module; the third-party copy in $CUSTOM_MOD_DIR will shadow it. Remove $src to use the built-in."
+                continue
+                ;;
+        esac
         out="/home/obbyircd/obby/modules/third/${modname}.so"
         echo "Compiling custom module: $modname"
         if su-exec obbyircd gcc -shared -fPIC -DPIC -DDYNAMIC_LINKING \

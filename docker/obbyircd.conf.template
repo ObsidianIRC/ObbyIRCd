@@ -69,8 +69,7 @@ loadmodule "cloak_sha256";
  * reverse proxy in production). */
 ${WS_CONFIG}
 
-/* Optional filehost {} block (set FILEHOST_URL). */
-${FILEHOST_CONFIG}
+/* Add a filehosts { host '<url>'; } block here to enable client uploads. */
 
 /* Optional JSON-RPC (set RPC_PASSWORD). */
 ${RPC_CONFIG}
