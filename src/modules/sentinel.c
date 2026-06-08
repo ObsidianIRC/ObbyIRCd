@@ -118,16 +118,16 @@ static void sentinel_emit(json_t *frame)
 static void put_subject(json_t *frame, Client *c)
 {
 	if (!c) return;
-	if (c->name && *c->name)
+	if (*c->name)
 		json_object_set_new(frame, "nick", json_string(c->name));
-	if (c->id && *c->id)
+	if (*c->id)
 		json_object_set_new(frame, "uid", json_string(c->id));
 	if (c->user) {
-		if (c->user->username && *c->user->username)
+		if (*c->user->username)
 			json_object_set_new(frame, "ident", json_string(c->user->username));
-		if (c->user->realhost && *c->user->realhost)
+		if (*c->user->realhost)
 			json_object_set_new(frame, "host", json_string(c->user->realhost));
-		if (c->user->account && *c->user->account)
+		if (*c->user->account)
 			json_object_set_new(frame, "account", json_string(c->user->account));
 	}
 	if (c->ip && *c->ip)
@@ -243,7 +243,7 @@ static int sentinel_kick_hook(Client *client, Client *victim, Channel *channel,
 	 * oper kicks. */
 	if (victim) put_subject(f, victim);
 	json_object_set_new(f, "channel", json_string(channel->name));
-	if (client && client->name)
+	if (client && *client->name)
 		json_object_set_new(f, "oper", json_string(client->name));
 	if (comment && *comment)
 		json_object_set_new(f, "reason", json_string(comment));
@@ -299,7 +299,7 @@ static int sentinel_chanmsg_hook(Client *client, Channel *channel, int sendflags
 static int sentinel_usermsg_hook(Client *client, Client *to,
                                   MessageTag *_mtags, const char *text, SendType sendtype)
 {
-	const char *kind = (sendtype == SEND_TYPE_NOTICE) ? "usermsg" : "usermsg";
+	const char *kind = (sendtype == SEND_TYPE_NOTICE) ? "usernotice" : "usermsg";
 	if (sendtype == SEND_TYPE_TAGMSG)
 		return 0;
 	if (is_ctcp(text))
@@ -308,7 +308,7 @@ static int sentinel_usermsg_hook(Client *client, Client *to,
 	json_t *f = json_object();
 	json_object_set_new(f, "kind", json_string(kind));
 	put_subject(f, client);
-	if (to && to->name)
+	if (to && *to->name)
 		json_object_set_new(f, "target", json_string(to->name));
 	if (text && *text)
 		json_object_set_new(f, "text", json_string(text));
@@ -323,7 +323,7 @@ static int sentinel_kill_hook(Client *killedby, Client *killed, const char *reas
 	json_t *f = json_object();
 	json_object_set_new(f, "kind", json_string("oper_kill"));
 	put_subject(f, killed);
-	if (killedby && killedby->name)
+	if (killedby && *killedby->name)
 		json_object_set_new(f, "oper", json_string(killedby->name));
 	if (reason && *reason)
 		json_object_set_new(f, "reason", json_string(reason));
@@ -1147,7 +1147,7 @@ static int sentinel_can_send_user(Client *client, Client *target,
 	json_t *f = json_object();
 	json_object_set_new(f, "kind", json_string("sentinel_block"));
 	put_subject(f, client);
-	if (target && target->name)
+	if (target && *target->name)
 		json_object_set_new(f, "target", json_string(target->name));
 	json_object_set_new(f, "reason", json_string(reason));
 	sentinel_emit(f);
