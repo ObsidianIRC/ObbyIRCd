@@ -419,7 +419,7 @@ MOD_INIT() {
 	cap.name = "draft/metadata-notify-2"; /* for old client compatibility */
 	c = ClientCapabilityAdd(modinfo->handle, &cap, &CAP_METADATA_NOTIFY);
 	
-	CommandAdd(modinfo->handle, "METADATA", cmd_metadata, MAXPARA, CMD_USER|CMD_SERVER|CMD_UNREGISTERED);
+	CommandAdd(modinfo->handle, "METADATA", cmd_metadata, MAXPARA, CMD_USER|CMD_SERVER|CMD_UNREGISTERED|CMD_NOLAG);
 	
 	memset(&mreq, 0 , sizeof(mreq));
 	mreq.type = MODDATATYPE_CLIENT;

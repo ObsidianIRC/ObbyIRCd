@@ -48,7 +48,7 @@ MOD_INIT()
 	c.name = "userhost-in-names";
 	ClientCapabilityAdd(modinfo->handle, &c, &CAP_USERHOST_IN_NAMES);
 
-	CommandAdd(modinfo->handle, MSG_NAMES, cmd_names, MAXPARA, CMD_USER|CMD_SERVER);
+	CommandAdd(modinfo->handle, MSG_NAMES, cmd_names, MAXPARA, CMD_USER|CMD_SERVER|CMD_NOLAG);
 	MARK_AS_OFFICIAL_MODULE(modinfo);
 	return MOD_SUCCESS;
 }

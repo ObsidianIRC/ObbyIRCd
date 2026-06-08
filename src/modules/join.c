@@ -71,7 +71,8 @@ MOD_INIT()
 	c.name = "extended-join";
 	ClientCapabilityAdd(modinfo->handle, &c, &CAP_EXTENDED_JOIN);
 
-	CommandAdd(modinfo->handle, MSG_JOIN, cmd_join, MAXPARA, CMD_USER);
+	/* jointhrottle enforces per-channel rate; no extra parse-time lag. */
+	CommandAdd(modinfo->handle, MSG_JOIN, cmd_join, MAXPARA, CMD_USER|CMD_NOLAG);
 	MARK_AS_OFFICIAL_MODULE(modinfo);
 	return MOD_SUCCESS;
 }

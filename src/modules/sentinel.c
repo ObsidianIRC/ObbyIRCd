@@ -64,13 +64,17 @@ static int sentinel_connect(void)
 	addr.sun_family = AF_UNIX;
 	strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
 
-	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		close(fd);
-		return -1;
-	}
 	int flags = fcntl(fd, F_GETFL, 0);
 	if (flags >= 0)
 		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+	/* Non-blocking connect; EINPROGRESS is fine (later writev EAGAINs
+	 * silently until the socket comes up). */
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0
+	    && errno != EINPROGRESS) {
+		close(fd);
+		return -1;
+	}
 	sentinel_fd = fd;
 	return 0;
 }
