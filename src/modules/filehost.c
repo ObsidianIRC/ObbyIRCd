@@ -97,13 +97,7 @@ MOD_INIT()
 	HookAdd(modinfo->handle, HOOKTYPE_CHANMSG, 0, link_preview_chanmsg);
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, filehost_configrun);
 
-	/* Register our custom message tags */
-	memset(&mtag, 0, sizeof(mtag));
-	mtag.name = "+reply";
-	mtag.is_ok = link_preview_mtag_is_ok;
-	mtag.flags = MTAG_HANDLER_FLAGS_NO_CAP_NEEDED;
-	MessageTagHandlerAdd(modinfo->handle, &mtag);
-
+	/* Register our custom message tags. +reply is owned by reply-tag.c. */
 	memset(&mtag, 0, sizeof(mtag));
 	mtag.name = "obsidianirc/link-preview-title";
 	mtag.is_ok = link_preview_mtag_is_ok;
