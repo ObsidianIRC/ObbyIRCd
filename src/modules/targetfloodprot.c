@@ -63,7 +63,7 @@ void targetfloodprot_defaults(void)
 	channelcfg->cnt[TFP_NOTICE] = 15;
 	channelcfg->t[TFP_NOTICE] = 5;
 	/* set::anti-flood::target-flood::channel-tagmsg */
-	channelcfg->cnt[TFP_TAGMSG] = 15;
+	channelcfg->cnt[TFP_TAGMSG] = 60;
 	channelcfg->t[TFP_TAGMSG] = 5;
 
 	/* set::anti-flood::target-flood::private-privmsg */
@@ -73,7 +73,7 @@ void targetfloodprot_defaults(void)
 	privatecfg->cnt[TFP_NOTICE] = 10;
 	privatecfg->t[TFP_NOTICE] = 5;
 	/* set::anti-flood::target-flood::private-tagmsg */
-	privatecfg->cnt[TFP_TAGMSG] = 10;
+	privatecfg->cnt[TFP_TAGMSG] = 60;
 	privatecfg->t[TFP_TAGMSG] = 5;
 }
 
