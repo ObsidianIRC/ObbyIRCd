@@ -290,8 +290,8 @@ int client_accepts_tag(const char *token, Client *client)
  */
 const char *_mtags_to_string(MessageTag *m, Client *client)
 {
-	static char buf[4096], name[8192], value[8192];
-	static char tbuf[4094];
+	static char buf[16384], name[8192], value[8192];
+	static char tbuf[8192];
 
 	if (!m)
 		return NULL;
