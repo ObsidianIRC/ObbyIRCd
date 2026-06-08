@@ -490,6 +490,10 @@ static void pmh_send_history(Client *client, const char *target_nick,
 			use_between = 1;
 			sql_order_inner = (a_ms <= b_ms) ? "ASC" : "DESC";
 			break;
+		case HFC_SIMPLE:
+			/* legacy "last N lines / N seconds"; treat as LATEST */
+			sql_order_inner = "DESC";
+			break;
 	}
 	(void)sql_where;
 
