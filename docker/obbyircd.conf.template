@@ -107,6 +107,17 @@ set {
 
     default-bantime 30d;
     modef-default-unsettime 60;
+
+    modes-on-join "+nH 1000:1d";
+    history {
+        channel {
+            playback-on-join { lines 1000; time 1d; }
+            max-storage-per-channel {
+                registered { lines 5000; time 31d; }
+                unregistered { lines 1000; time 7d; }
+            }
+        }
+    };
 };
 
 except ban {
