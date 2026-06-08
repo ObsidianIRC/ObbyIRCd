@@ -8,7 +8,7 @@
 # Build:   docker build -f docker/Dockerfile -t obbyircd .
 # Compose: docker compose up -d
 
-FROM alpine:3.19
+FROM alpine:3.23
 
 # Build + runtime dependencies.  sqlite-dev is needed by the
 # account-registration module; python3-dev backs obbypy's embedded
