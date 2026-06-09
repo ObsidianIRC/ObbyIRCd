@@ -3478,13 +3478,14 @@ static int authenticate_attempt(Client *client, int first, const char *param)
             verify_password_for_scheme(account->password_scheme,
                                        account->password, password))
         {
-            /* Opportunistic SCRAM credentials backfill: pre-existing accounts
-             * have no scram_* columns; we have plaintext now, so populate. */
-            if (!account->scram_salt || !account->scram_stored_key)
-            {
-                if (scram_make_credentials(account, password))
-                    update_account_scram(account);
-            }
+            /* Regenerate SCRAM credentials on every successful PLAIN
+             * verify: migrated accounts may carry a SCRAM verifier from
+             * a different derivation (e.g. Ergo) that this server's
+             * SCRAM-SHA-256 verifier won't accept. Rederiving from the
+             * verified plaintext guarantees the on-disk SCRAM is
+             * consistent with how we'd compute it locally. */
+            if (scram_make_credentials(account, password))
+                update_account_scram(account);
             /* Migrated non-argon2id accounts get rolled forward on first
              * successful login: rehash with argon2id and persist. Best
              * effort -- failure is logged but doesn't abort login. */
@@ -6487,11 +6488,14 @@ CMD_FUNC(cmd_identify)
 
     if (verify_password_for_scheme(acc->password_scheme, acc->password, password))
     {
-        if (!acc->scram_salt || !acc->scram_stored_key)
-        {
-            if (scram_make_credentials(acc, password))
-                update_account_scram(acc);
-        }
+        /* Always regenerate SCRAM here: a migrated account's
+         * scram_stored_key may be from a different SCRAM derivation
+         * (e.g. Ergo) that obbyircd's verifier won't accept. Rederiving
+         * locally from the freshly-verified plaintext password
+         * guarantees the SCRAM blob is consistent with how this server
+         * verifies it. */
+        if (scram_make_credentials(acc, password))
+            update_account_scram(acc);
         /* Roll forward migrated non-argon2id accounts. */
         if (acc->password_scheme && strcmp(acc->password_scheme, "argon2id"))
         {
