@@ -1156,7 +1156,15 @@ static int persist_local_quit(Client *client, MessageTag *mtags, const char *com
 
 	e = find_entry(client->user->account);
 	if (!persistence_effective(client, e))
+	{
+		/* persistence is OFF for this account but a prior session with
+		 * persistence ON may have left e->canonical pointing at us.
+		 * Clear it now so a subsequent reconnect's session-attach check
+		 * doesn't latch onto a use-after-free Client pointer. */
+		if (e && e->canonical == client)
+			e->canonical = NULL;
 		return 0;
+	}
 
 	e = get_or_create_entry(client->user->account);
 
@@ -1268,6 +1276,17 @@ static int persist_account_login(Client *client, MessageTag *mtags)
 
 	if (!e)
 		return 0; /* No entry, nothing to restore */
+
+	/* If the user has turned persistence OFF on their account, do not
+	 * attach as a session and do not queue silent channel restoration.
+	 * The expected user model is "I'm a regular IRC user now": their
+	 * QUIT broadcasts normally, their JOIN on reconnect must broadcast
+	 * normally too.  Without this gate, restore_channels' same_nick
+	 * path silently re-adds them to every saved channel and observers
+	 * see no JOIN line -- only the prior QUIT -- leaving the user
+	 * invisible to everyone else in the channel until they /CYCLE. */
+	if (!persistence_effective(client, e))
+		return 0;
 
 	/* --- Session detection ---
 	 * If a live canonical is already online for this account, attach as
