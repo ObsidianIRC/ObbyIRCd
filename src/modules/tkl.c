@@ -1281,11 +1281,28 @@ char *spamfilter_id(TKL *tk)
 	return buf;
 }
 
+/** Build "<reason> [ID: <id>]" into buf, or just "<reason>" if the TKL has no id.
+ * The id is appended to the reject-message so the client can quote it back to
+ * an oper when reporting "why am I banned" -- matches upstream and the
+ * unrealircd-tests opercommands/tkl assertions.
+ */
+static const char *tkl_reason_with_id(TKL *tkl, char *buf, size_t buflen, const char *reason)
+{
+	if (!tkl || !tkl->id[0])
+		return reason;
+	snprintf(buf, buflen, "%s [ID: %s]", reason ? reason : "", tkl->id);
+	return buf;
+}
+
 int tkl_ip_change(Client *client, const char *oldip)
 {
 	TKL *tkl;
 	if ((tkl = find_tkline_match_zap(client)))
-		banned_client(client, "Z-Lined", tkl->ptr.serverban->reason, (tkl->type & TKL_GLOBAL)?1:0, NO_EXIT_CLIENT);
+	{
+		char rbuf[512];
+		const char *r = tkl_reason_with_id(tkl, rbuf, sizeof(rbuf), tkl->ptr.serverban->reason);
+		banned_client(client, "Z-Lined", r, (tkl->type & TKL_GLOBAL)?1:0, NO_EXIT_CLIENT);
+	}
 	return 0;
 }
 
@@ -1294,7 +1311,9 @@ int tkl_accept(Client *client)
 	TKL *tkl;
 	if ((tkl = find_tkline_match_zap(client)))
 	{
-		banned_client(client, "Z-Lined", tkl->ptr.serverban->reason, (tkl->type & TKL_GLOBAL)?1:0, NO_EXIT_CLIENT);
+		char rbuf[512];
+		const char *r = tkl_reason_with_id(tkl, rbuf, sizeof(rbuf), tkl->ptr.serverban->reason);
+		banned_client(client, "Z-Lined", r, (tkl->type & TKL_GLOBAL)?1:0, NO_EXIT_CLIENT);
 		return 2; // TODO: HOOK_DENY_ALWAYS;
 	}
 	return 0;
@@ -2680,6 +2699,31 @@ int _tkl_hash(unsigned int c)
 #endif
 }
 
+/** Generate (and store) a fresh locally-unique id on this TKL.
+ * Layout: one uppercase letter from tkl_typetochar() + 10 random
+ * Crockford base32 chars (no I/L/O/U so people don't misread them
+ * when reading the id aloud). The id is purely a display-side
+ * convenience — used in the rejected client's message and in
+ * /STATS spamfilter — and is not synced across servers (each
+ * server generates its own id for the same TKL).
+ */
+static void tkl_generate_id(TKL *tkl)
+{
+	static const char b32[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+	char prefix;
+	int i;
+
+	if (!tkl)
+		return;
+	prefix = _tkl_typetochar(tkl->type);
+	if (prefix == 0)
+		prefix = 'X'; /* should not happen, but keep the id well-formed */
+	tkl->id[0] = (char)toupper((unsigned char)prefix);
+	for (i = 1; i <= 10; i++)
+		tkl->id[i] = b32[getrandom8() % 32];
+	tkl->id[i] = '\0';
+}
+
 /** tkl type to tkl character.
  * NOTE: type is assumed to be valid.
  */
@@ -2952,6 +2996,7 @@ TKL *_tkl_add_spamfilter(int type, const char *id, unsigned short target, BanAct
 	tkl->set_at = set_at;
 	safe_strdup(tkl->set_by, set_by);
 	tkl->expire_at = expire_at;
+	tkl_generate_id(tkl);
 	tkl->ptr.spamfilter = safe_alloc(sizeof(Spamfilter));
 	if (rule)
 	{
@@ -3032,6 +3077,7 @@ TKL *_tkl_add_serverban(int type, const char *usermask, const char *hostmask, Se
 	tkl->set_at = set_at;
 	safe_strdup(tkl->set_by, set_by);
 	tkl->expire_at = expire_at;
+	tkl_generate_id(tkl);
 	/* Now the server ban fields */
 	tkl->ptr.serverban = safe_alloc(sizeof(ServerBan));
 	if (soft)
@@ -3100,6 +3146,7 @@ TKL *_tkl_add_banexception(int type, const char *usermask, const char *hostmask,
 	tkl->set_at = set_at;
 	safe_strdup(tkl->set_by, set_by);
 	tkl->expire_at = expire_at;
+	tkl_generate_id(tkl);
 	/* Now the ban except fields */
 	tkl->ptr.banexception = safe_alloc(sizeof(BanException));
 	safe_strdup(tkl->ptr.banexception->usermask, usermask);
@@ -3161,6 +3208,7 @@ TKL *_tkl_add_nameban(int type, const char *name, int hold, const char *reason, 
 	tkl->set_at = set_at;
 	safe_strdup(tkl->set_by, set_by);
 	tkl->expire_at = expire_at;
+	tkl_generate_id(tkl);
 	/* Now the name ban fields */
 	tkl->ptr.nameban = safe_alloc(sizeof(ServerBan));
 	safe_strdup(tkl->ptr.nameban->name, name);
@@ -3657,17 +3705,21 @@ int _find_tkline_match(Client *client, int skip_soft)
 
 	if (tkl->type & TKL_KILL)
 	{
+		char rbuf[512];
+		const char *r = tkl_reason_with_id(tkl, rbuf, sizeof(rbuf), tkl->ptr.serverban->reason);
 		ircstats.is_ref++;
 		if (tkl->type & TKL_GLOBAL)
-			banned_client(client, "G-Lined", tkl->ptr.serverban->reason, 1, 0);
+			banned_client(client, "G-Lined", r, 1, 0);
 		else
-			banned_client(client, "K-Lined", tkl->ptr.serverban->reason, 0, 0);
+			banned_client(client, "K-Lined", r, 0, 0);
 		return 1; /* killed */
 	} else
 	if (tkl->type & TKL_ZAP)
 	{
+		char rbuf[512];
+		const char *r = tkl_reason_with_id(tkl, rbuf, sizeof(rbuf), tkl->ptr.serverban->reason);
 		ircstats.is_ref++;
-		banned_client(client, "Z-Lined", tkl->ptr.serverban->reason, (tkl->type & TKL_GLOBAL)?1:0, 0);
+		banned_client(client, "Z-Lined", r, (tkl->type & TKL_GLOBAL)?1:0, 0);
 		return 1; /* killed */
 	}
 
