@@ -642,11 +642,53 @@ static void BF_set_key(const char *key, BF_key expanded, BF_key initial,
 	initial[0] ^= sign;
 }
 
+/*
+ * Length-aware variant of BF_set_key for binary password input (e.g.
+ * Ergo's sha3-512(password) hash, which contains 0x00 bytes ~22% of
+ * the time). Cycles using key_len bytes instead of stopping at the
+ * first NUL. The sign-extension bug compatibility is not relevant for
+ * this binary path -- it's only used by callers verifying hashes
+ * produced by a known modern bcrypt impl with explicit key length.
+ */
+static void BF_set_key_n(const char *key, int key_len,
+    BF_key expanded, BF_key initial, unsigned char flags)
+{
+	unsigned int i, j;
+	BF_word tmp;
+	BF_word safety = ((BF_word)flags & 2) << 15;
+	int pos = 0;
+	int cycle_len;
+
+	if (key_len <= 0)
+		key_len = 0;
+	/* Match golang.org/x/crypto/bcrypt and the standard openssh bcrypt:
+	 * cycle through key_len bytes of key, then 1 implicit NUL byte, then
+	 * wrap back. Without the implicit NUL the output diverges from
+	 * any other bcrypt impl that expects a C-string-style key. */
+	cycle_len = key_len + 1;
+
+	for (i = 0; i < BF_N + 2; i++) {
+		tmp = 0;
+		for (j = 0; j < 4; j++) {
+			tmp <<= 8;
+			tmp |= (pos < key_len)
+			    ? (unsigned char)key[pos]
+			    : 0u; /* implicit NUL at position key_len */
+			pos++;
+			if (pos >= cycle_len)
+				pos = 0;
+		}
+		expanded[i] = tmp;
+		initial[i] = BF_init_state.P[i] ^ tmp;
+	}
+	(void)safety; /* no anti-collision adjustment needed for binary path */
+}
+
 static const unsigned char flags_by_subtype[26] =
 	{2, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 4, 0};
 
-static char *BF_crypt(const char *key, const char *setting,
+static char *BF_crypt(const char *key, int key_len, const char *setting,
 	char *output, int size,
 	BF_word min)
 {
@@ -692,8 +734,13 @@ static char *BF_crypt(const char *key, const char *setting,
 	}
 	BF_swap(data.binary.salt, 4);
 
-	BF_set_key(key, data.expanded_key, data.ctx.P,
-	    flags_by_subtype[(unsigned int)(unsigned char)setting[2] - 'a']);
+	if (key_len < 0) {
+		BF_set_key(key, data.expanded_key, data.ctx.P,
+		    flags_by_subtype[(unsigned int)(unsigned char)setting[2] - 'a']);
+	} else {
+		BF_set_key_n(key, key_len, data.expanded_key, data.ctx.P,
+		    flags_by_subtype[(unsigned int)(unsigned char)setting[2] - 'a']);
+	}
 
 	memcpy(data.ctx.S, BF_init_state.S, sizeof(data.ctx.S));
 
@@ -832,7 +879,7 @@ char *_crypt_blowfish_rn(const char *key, const char *setting,
 
 /* Hash the supplied password */
 	_crypt_output_magic(setting, output, size);
-	retval = BF_crypt(key, setting, output, size, 16);
+	retval = BF_crypt(key, -1, setting, output, size, 16);
 	save_errno = errno;
 
 /*
@@ -851,7 +898,7 @@ char *_crypt_blowfish_rn(const char *key, const char *setting,
 	}
 	memset(buf.o, 0x55, sizeof(buf.o));
 	buf.o[sizeof(buf.o) - 1] = 0;
-	p = BF_crypt(test_key, buf.s, buf.o, sizeof(buf.o) - (1 + 1), 1);
+	p = BF_crypt(test_key, -1, buf.s, buf.o, sizeof(buf.o) - (1 + 1), 1);
 
 	ok = (p == buf.o &&
 	    !memcmp(p, buf.s, 7 + 22) &&
@@ -904,4 +951,16 @@ char *_crypt_gensalt_blowfish_rn(const char *prefix, unsigned long count,
 	output[7 + 22] = '\0';
 
 	return output;
+}
+
+/* Length-aware bcrypt entry point: processes key_len bytes of `key`
+ * cyclically WITHOUT terminating at 0x00 bytes. Required for verifying
+ * hashes produced by impls that pre-hash the password (e.g. Ergo's
+ * sha3-512 → bcrypt path), since SHA3 output contains a NUL byte ~22%
+ * of the time and the standard NUL-terminated API would truncate it. */
+char *_crypt_blowfish_rn_n(const char *key, int key_len,
+	const char *setting, char *output, int size)
+{
+	_crypt_output_magic(setting, output, size);
+	return BF_crypt(key, key_len, setting, output, size, 16);
 }

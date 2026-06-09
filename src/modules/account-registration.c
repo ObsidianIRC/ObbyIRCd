@@ -1434,6 +1434,7 @@ void sat_unserialize(const char *str, ModData *m)
 #include <openssl/param_build.h>
 #include <jansson.h>
 #include <crypt.h>     /* for libcrypt's crypt_r() — bcrypt + crypt-sha256/512 */
+#include "crypt_blowfish.h" /* for ergo's sha3-prehash bcrypt path */
 #include <string.h>
 
 /* base64url-decode `in` of length `inlen` into `out`. Accepts
@@ -2353,6 +2354,33 @@ static int crypt_verify_via_libcrypt(const char *stored, const char *password)
     return eq;
 }
 
+/* Verify a bcrypt hash whose input was produced by sha3-512(password),
+ * i.e. Ergo's "Dropbox-style" derivation. Uses obbyircd's bundled
+ * crypt_blowfish (length-aware variant) instead of libcrypt's crypt_r:
+ * libcrypt would NUL-truncate the binary sha3 output, and sha3-512
+ * outputs contain a 0x00 byte ~22% of the time, so the libcrypt path
+ * silently fails for a large minority of users. */
+static int ergo_bcrypt_verify(const char *stored, const char *password)
+{
+    unsigned char sum[EVP_MAX_MD_SIZE];
+    unsigned int sumlen = 0;
+    char out[80]; /* bcrypt output is at most 60 + NUL */
+    char *p;
+
+    if (!stored || stored[0] != '$' || stored[1] != '2')
+        return 0;
+    if (!EVP_Digest(password, strlen(password), sum, &sumlen,
+                    EVP_sha3_512(), NULL))
+        return 0;
+    if (sumlen != 64)
+        return 0;
+    p = _crypt_blowfish_rn_n((const char *)sum, (int)sumlen,
+                             stored, out, sizeof(out));
+    if (!p)
+        return 0;
+    return strcmp(p, stored) == 0;
+}
+
 /* base64 decoding shim using OpenSSL EVP. Returns number of decoded
  * bytes, or -1 on failure. `out` must be at least len(in) bytes.
  * Atheme's pbkdf2v2 module emits "url-safe" b64 with no padding for
@@ -2627,13 +2655,31 @@ static int verify_password_for_scheme(const char *scheme,
          * fallback chain. This protects against a rehash loop where
          * the column wasn't set during a partial migration. */
         if (stored[0] == '$' && (stored[1] == '2' || stored[1] == '5' || stored[1] == '6'))
-            return crypt_verify_via_libcrypt(stored, password);
+        {
+            if (crypt_verify_via_libcrypt(stored, password))
+                return 1;
+            if (stored[1] == '2')
+                return ergo_bcrypt_verify(stored, password);
+            return 0;
+        }
         if (!strncmp(stored, "$z$pbkdf2-", 10))
             return pbkdf2v2_verify(stored, password);
         return 0;
     }
     if (!strcmp(scheme, "bcrypt"))
-        return crypt_verify_via_libcrypt(stored, password);
+    {
+        if (crypt_verify_via_libcrypt(stored, password))
+            return 1;
+        /* Ergo-migrated bcrypt hashes were tagged "bcrypt" by the
+         * migration tool but were produced via sha3-512 prehash + bcrypt
+         * (Dropbox style). The direct-bcrypt path can't verify them,
+         * so try the prehashed path as a fallback. Successful match
+         * here triggers the same roll-forward to argon2id at the call
+         * site, so accounts only do the fallback dance once. */
+        return ergo_bcrypt_verify(stored, password);
+    }
+    if (!strcmp(scheme, "ergo-bcrypt"))
+        return ergo_bcrypt_verify(stored, password);
     if (!strcmp(scheme, "pbkdf2v2"))
         return pbkdf2v2_verify(stored, password);
     if (!strcmp(scheme, "crypt-sha256") || !strcmp(scheme, "crypt-sha512"))
