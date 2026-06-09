@@ -71,6 +71,14 @@ ${WS_CONFIG}
 
 /* Add a filehosts { host '<url>'; } block here to enable client uploads. */
 
+/* Invite-link base URL: the obbyworld `invitation` module emits the
+ * machine-readable INVITELINK reply with this prefix + the share-id, so
+ * the panel can render a clickable link instead of just a bare token.
+ * Set INVITE_BASE_URL (e.g. 'https://chat.example.com/invite/'); when
+ * unset, the line below is replaced with an empty string and the reply
+ * still works but only ships the bare id. */
+${INVITE_CONFIG}
+
 /* Optional JSON-RPC (set RPC_PASSWORD). */
 ${RPC_CONFIG}
 

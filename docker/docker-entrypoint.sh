@@ -100,6 +100,13 @@ else
     export VOICE_TURN_CONFIG=""
 fi
 
+if [ -n "${INVITE_BASE_URL:-}" ]; then
+    export INVITE_CONFIG="set { invitation { base-url \"${INVITE_BASE_URL}\"; }; };"
+    echo "Invite base URL: ${INVITE_BASE_URL}"
+else
+    export INVITE_CONFIG=""
+fi
+
 # Random cloak keys if the operator didn't supply any.  UnrealIRCd
 # requires >= 80 chars of mixed a-zA-Z0-9; hex alone is rejected as
 # "not mixed".  Operators running linked nodes should set
