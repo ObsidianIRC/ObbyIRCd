@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gettext-base \
         netcat-openbsd \
         gosu \
+        procps \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --shell /bin/sh obbyircd
