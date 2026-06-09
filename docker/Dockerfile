@@ -8,35 +8,34 @@
 # Build:   docker build -f docker/Dockerfile -t obbyircd .
 # Compose: docker compose up -d
 
-FROM alpine:3.21
+FROM debian:bookworm-slim
 
-# Build + runtime dependencies.  sqlite-dev is needed by the
-# account-registration module; python3-dev backs obbypy's embedded
-# CPython (uses python3-embed pkg-config -- see src/modules/Makefile.in).
-# The rest cover the core IRCd, TLS, JSON logging, PCRE2 regexes,
-# argon2 password hashing, libsodium for the RPC subsystem and
-# gettext for the entrypoint's envsubst.
-RUN apk add --no-cache \
-    build-base \
-    openssl-dev \
-    openssl \
-    pcre2-dev \
-    argon2-dev \
-    libsodium-dev \
-    jansson-dev \
-    curl-dev \
-    sqlite-dev \
-    python3-dev \
-    pkgconf \
-    wget \
-    tar \
-    gettext \
-    su-exec \
-    netcat-openbsd \
-    libxcrypt \
-    && rm -rf /var/cache/apk/*
+# Build + runtime dependencies.  glibc + libxcrypt-compat give us
+# bcrypt support in crypt_r() out of the box, which the Alpine/musl
+# image did not -- migrated bcrypt-hashed accounts could not
+# SASL-login on the old base.  libsqlite3-dev backs account-
+# registration; libpython3-dev backs obbypy's embedded CPython.
+# gettext-base ships envsubst for the entrypoint conf rendering.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        libssl-dev openssl \
+        libpcre2-dev \
+        libargon2-dev \
+        libsodium-dev \
+        libjansson-dev \
+        libcurl4-openssl-dev \
+        libsqlite3-dev \
+        libpython3-dev python3-dev \
+        pkg-config \
+        wget \
+        tar \
+        gettext-base \
+        netcat-openbsd \
+        gosu \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN adduser -D -s /bin/sh obbyircd
+RUN useradd --create-home --shell /bin/sh obbyircd
 
 # Copy the entire repository in.  .dockerignore keeps build artifacts,
 # the obbyworld client checkout, and other dev junk out.

@@ -215,7 +215,7 @@ if [ -d "$CUSTOM_MOD_DIR" ]; then
         esac
         out="/home/obbyircd/obby/modules/third/${modname}.so"
         echo "Compiling custom module: $modname"
-        if su-exec obbyircd gcc -shared -fPIC -DPIC -DDYNAMIC_LINKING \
+        if gosu obbyircd gcc -shared -fPIC -DPIC -DDYNAMIC_LINKING \
             -Wl,-export-dynamic -Wl,-z,relro -Wl,-z,now \
             -o "$out" "$src" \
             -I"$SOURCE_TREE/include" -I"$SOURCE_TREE" \
@@ -233,7 +233,7 @@ chown obbyircd:obbyircd "$CUSTOM_MOD_CONF" 2>/dev/null || true
 cd /home/obbyircd/obby
 
 echo "Validating configuration..."
-if ! su-exec obbyircd ./bin/obbyircd -c; then
+if ! gosu obbyircd ./bin/obbyircd -c; then
     echo "ERROR: configuration validation failed (see output above)"
     echo "Fix the offending environment variable and restart -- the"
     echo "container will re-render the conf because no init marker has"
@@ -244,12 +244,12 @@ fi
 # Validation passed; promote first-run marker so we don't re-render
 # the rendered conf on every restart.
 if [ ! -f "$FIRST_RUN_MARKER" ]; then
-    su-exec obbyircd touch "$FIRST_RUN_MARKER"
+    gosu obbyircd touch "$FIRST_RUN_MARKER"
     echo "First-run initialisation complete"
 fi
 
 echo "Starting ObbyIRCd..."
 if [ "$#" -ge 2 ] && [ "$1" = "./bin/obbyircd" ] && [ "$2" = "-F" ]; then
-    exec su-exec obbyircd "$@"
+    exec gosu obbyircd "$@"
 fi
-exec su-exec obbyircd "$@"
+exec gosu obbyircd "$@"
