@@ -33,6 +33,7 @@ RUN apk add --no-cache \
     gettext \
     su-exec \
     netcat-openbsd \
+    libxcrypt-dev \
     && rm -rf /var/cache/apk/*
 
 RUN adduser -D -s /bin/sh obbyircd
