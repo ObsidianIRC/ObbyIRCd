@@ -1155,7 +1155,7 @@ static int sentinel_can_send_user(Client *client, Client *target,
 	unreal_log(ULOG_INFO, "sentinel", "BLOCK_USER", client,
 	           "Blocked $client.name -> $target: $reason",
 	           log_data_string("reason", reason),
-	           log_data_string("target", target && target->name ? target->name : ""));
+	           log_data_string("target", target && *target->name ? target->name : ""));
 
 	exit_client(client, NULL, "Killed by Orca");
 	return HOOK_DENY;
