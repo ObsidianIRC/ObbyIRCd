@@ -4104,6 +4104,14 @@ int tkl_stats_matcher(Client *client, int type, const char *para, TKLFlag *tklfl
 			tkl->set_by,
 			tkl->ptr.spamfilter->hits,
 			tkl->ptr.spamfilter->hits_except,
+			/* lasthit / lasthit_except: upstream added these to TKL +
+			 * Spamfilter to expose when a rule last fired. We don't
+			 * track them yet; emit 0 so the field count matches the
+			 * upstream protocol and unrealircd-tests' /STATS regex.
+			 * id_str is the deletion handle, computed on demand. */
+			0LL,
+			0LL,
+			spamfilter_id(tkl),
 			tkl->ptr.spamfilter->match->str);
 		if (para && !strcasecmp(para, "del"))
 		{

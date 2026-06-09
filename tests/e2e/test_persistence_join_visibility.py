@@ -32,7 +32,7 @@ async def _register(host, port, account, password):
         await c.send("CAP END")
         await c.register()
         await _drain_motd(c)
-        await c.send(f"REGISTER {account} * {password}")
+        await c.send(f"REGISTER {account} {account}@test.local {password}")
         # 944 = REGISTER_SUCCESS or a fail numeric.  Tolerate "already
         # registered" so the test can rerun against a stateful container.
         await c.expect(
