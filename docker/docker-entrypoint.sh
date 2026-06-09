@@ -107,6 +107,17 @@ else
     export INVITE_CONFIG=""
 fi
 
+if [ -n "${INVITE_PAGE_PORT:-}" ]; then
+    export INVITE_PAGE_CONFIG="listen {
+    ip *;
+    port ${INVITE_PAGE_PORT};
+    options { invite-page; };
+};"
+    echo "Invite page listener: port ${INVITE_PAGE_PORT}"
+else
+    export INVITE_PAGE_CONFIG=""
+fi
+
 # Random cloak keys if the operator didn't supply any.  UnrealIRCd
 # requires >= 80 chars of mixed a-zA-Z0-9; hex alone is rejected as
 # "not mixed".  Operators running linked nodes should set

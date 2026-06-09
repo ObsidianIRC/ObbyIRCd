@@ -74,10 +74,17 @@ ${WS_CONFIG}
 /* Invite-link base URL: the obbyworld `invitation` module emits the
  * machine-readable INVITELINK reply with this prefix + the share-id, so
  * the panel can render a clickable link instead of just a bare token.
- * Set INVITE_BASE_URL (e.g. 'https://chat.example.com/invite/'); when
+ * Set INVITE_BASE_URL (e.g. 'https://invite.example.com:8661/i/'); when
  * unset, the line below is replaced with an empty string and the reply
  * still works but only ships the bare id. */
 ${INVITE_CONFIG}
+
+/* Invite-page HTTP listener: served by the in-tree webserver via
+ * `options { invite-page; }`. Renders a join-the-network splash with
+ * connect details when someone opens the INVITELINK URL in a browser.
+ * Set INVITE_PAGE_PORT (default unset = no listener). Put a reverse
+ * proxy with TLS in front of it in production. */
+${INVITE_PAGE_CONFIG}
 
 /* Optional JSON-RPC (set RPC_PASSWORD). */
 ${RPC_CONFIG}
