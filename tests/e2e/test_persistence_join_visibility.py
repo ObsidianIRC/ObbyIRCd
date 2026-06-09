@@ -110,12 +110,18 @@ async def test_persistence_off_reconnect_broadcasts_join(ircd):
         timeout=10,
     )
 
-    # Valware reconnects.  Note: with_persistence still True client-side;
+    # Valware reconnects.  with_persistence cap is still requested client-side;
     # the SERVER preference is OFF so the bug condition applies.
     b = await _login(host, port, account, password, with_persistence=True)
 
-    # CRITICAL: the observer must see a JOIN line for Valware in the
-    # channel they were previously in.  Pre-fix this never arrives.
+    # Send an explicit JOIN — the fix removes auto-restore for OFF'd
+    # accounts (correct behaviour: the user is a regular non-persistent
+    # IRC user again, so they must JOIN themselves and the JOIN must
+    # broadcast). Pre-fix, restore_channels silently re-adds Valware
+    # before this JOIN runs, and the subsequent explicit JOIN is a
+    # no-op ("already on channel"), so the observer sees nothing.
+    await b.send(f"JOIN {channel}")
+
     try:
         line = await obs.expect(
             lambda l: " JOIN " in l and "valware" in l.lower() and channel in l,
