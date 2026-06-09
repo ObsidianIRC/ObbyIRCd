@@ -2699,17 +2699,25 @@ int _tkl_hash(unsigned int c)
 #endif
 }
 
-/** Generate (and store) a fresh locally-unique id on this TKL.
- * Layout: one uppercase letter from tkl_typetochar() + 10 random
- * Crockford base32 chars (no I/L/O/U so people don't misread them
- * when reading the id aloud). The id is purely a display-side
- * convenience — used in the rejected client's message and in
- * /STATS spamfilter — and is not synced across servers (each
- * server generates its own id for the same TKL).
+/** Generate (and store) a deterministic id on this TKL.
+ *
+ * Layout: one uppercase letter from tkl_typetochar() + 10 Crockford
+ * base32 chars (no I/L/O/U so people don't misread them when reading
+ * the id aloud). The base32 body is the first 50 bits of SHA1 over
+ * stable, network-identical TKL attributes (set_by, set_at, and the
+ * union's discriminating fields), which means every server on the
+ * network independently computes the same id for the same TKL --
+ * no s2s message-tag plumbing required.
+ *
+ * The id is exposed in /STATS and in the rejected client's reject
+ * message so a user can quote it back to an oper.
  */
 static void tkl_generate_id(TKL *tkl)
 {
 	static const char b32[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+	unsigned char sum[EVP_MAX_MD_SIZE];
+	unsigned int sumlen = 0;
+	char buf[1024];
 	char prefix;
 	int i;
 
@@ -2717,11 +2725,78 @@ static void tkl_generate_id(TKL *tkl)
 		return;
 	prefix = _tkl_typetochar(tkl->type);
 	if (prefix == 0)
-		prefix = 'X'; /* should not happen, but keep the id well-formed */
+		prefix = 'X';
+
+	/* Hash stable, network-identical attributes only. The union
+	 * payload differs by ban kind so we walk it discriminately;
+	 * pointer addresses or local hash buckets must never appear.
+	 */
+	if (TKLIsServerBan(tkl) && tkl->ptr.serverban)
+	{
+		snprintf(buf, sizeof(buf), "S\x1e%s\x1e%lld\x1e%s\x1e%s\x1e%s\x1e%u",
+		         tkl->set_by ? tkl->set_by : "",
+		         (long long)tkl->set_at,
+		         tkl->ptr.serverban->usermask ? tkl->ptr.serverban->usermask : "",
+		         tkl->ptr.serverban->hostmask ? tkl->ptr.serverban->hostmask : "",
+		         tkl->ptr.serverban->reason ? tkl->ptr.serverban->reason : "",
+		         tkl->type);
+	}
+	else if (TKLIsSpamfilter(tkl) && tkl->ptr.spamfilter && tkl->ptr.spamfilter->match)
+	{
+		snprintf(buf, sizeof(buf), "F\x1e%s\x1e%lld\x1e%u\x1e%s\x1e%s",
+		         tkl->set_by ? tkl->set_by : "",
+		         (long long)tkl->set_at,
+		         tkl->ptr.spamfilter->target,
+		         ban_actions_to_string(tkl->ptr.spamfilter->action),
+		         tkl->ptr.spamfilter->match->str ? tkl->ptr.spamfilter->match->str : "");
+	}
+	else if (TKLIsBanException(tkl) && tkl->ptr.banexception)
+	{
+		snprintf(buf, sizeof(buf), "E\x1e%s\x1e%lld\x1e%s\x1e%s\x1e%s",
+		         tkl->set_by ? tkl->set_by : "",
+		         (long long)tkl->set_at,
+		         tkl->ptr.banexception->usermask ? tkl->ptr.banexception->usermask : "",
+		         tkl->ptr.banexception->hostmask ? tkl->ptr.banexception->hostmask : "",
+		         tkl->ptr.banexception->bantypes ? tkl->ptr.banexception->bantypes : "");
+	}
+	else if (TKLIsNameBan(tkl) && tkl->ptr.nameban)
+	{
+		snprintf(buf, sizeof(buf), "N\x1e%s\x1e%lld\x1e%s",
+		         tkl->set_by ? tkl->set_by : "",
+		         (long long)tkl->set_at,
+		         tkl->ptr.nameban->name ? tkl->ptr.nameban->name : "");
+	}
+	else
+	{
+		/* Unknown discriminator: fall back to set_by + set_at; still
+		 * deterministic, just lower entropy. */
+		snprintf(buf, sizeof(buf), "?\x1e%s\x1e%lld",
+		         tkl->set_by ? tkl->set_by : "",
+		         (long long)tkl->set_at);
+	}
+
+	if (!EVP_Digest(buf, strlen(buf), sum, &sumlen, EVP_sha1(), NULL) || sumlen < 7)
+	{
+		/* Fall back to random if hashing somehow fails. */
+		tkl->id[0] = (char)toupper((unsigned char)prefix);
+		for (i = 1; i <= 10; i++)
+			tkl->id[i] = b32[getrandom8() % 32];
+		tkl->id[i] = '\0';
+		return;
+	}
+
 	tkl->id[0] = (char)toupper((unsigned char)prefix);
-	for (i = 1; i <= 10; i++)
-		tkl->id[i] = b32[getrandom8() % 32];
-	tkl->id[i] = '\0';
+	/* Pack the first 50 bits of the hash into 10 base32 chars. */
+	for (i = 0; i < 10; i++)
+	{
+		int bit = i * 5;
+		int byte = bit / 8;
+		int shift = 11 - (bit % 8) - 5; /* bits left in the next 2 bytes after `bit` */
+		unsigned int v = (sum[byte] << 8) | sum[byte + 1];
+		v = (v >> shift) & 0x1f;
+		tkl->id[1 + i] = b32[v];
+	}
+	tkl->id[11] = '\0';
 }
 
 /** tkl type to tkl character.
