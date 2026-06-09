@@ -460,7 +460,7 @@ MOD_LOAD()
     /* Advertise ourselves as the SASL server so sasl.c routes AUTHENTICATE here */
     safe_strdup(iConf.sasl_server, me.name);
     moddata_client_set(&me, "saslmechlist",
-                       "PLAIN,SCRAM-SHA-256,TOTP,DRAFT-WEBAUTHN-BIO,ANONYMOUS");
+                       "PLAIN,TOTP,DRAFT-WEBAUTHN-BIO,ANONYMOUS");
 
     return MOD_SUCCESS;
 }
@@ -6175,7 +6175,7 @@ static const char *saslmechs(Client *client)
      * oauth-provider {} is loaded; advertise both unconditionally so
      * clients can negotiate -- the dispatcher will reject with
      * ERR_SASLFAIL if no provider matches the token's issuer. */
-    return "PLAIN,SCRAM-SHA-256,TOTP,EXTERNAL,DRAFT-WEBAUTHN-BIO,OAUTHBEARER,IRCV3BEARER,ANONYMOUS";
+    return "PLAIN,TOTP,EXTERNAL,DRAFT-WEBAUTHN-BIO,OAUTHBEARER,IRCV3BEARER,ANONYMOUS";
 }
 
 /* ===================================================================
