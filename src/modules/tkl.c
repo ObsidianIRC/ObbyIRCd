@@ -1281,6 +1281,17 @@ char *spamfilter_id(TKL *tk)
 	return buf;
 }
 
+/** Record that this TKL fired locally: bump hits and stamp lasthit.
+ * /STATS gline and the upstream test rely on these being non-zero
+ * after a rejection. Counters are local-only -- not synced over s2s. */
+static inline void tkl_record_hit(TKL *tkl)
+{
+	if (!tkl)
+		return;
+	tkl->hits++;
+	tkl->lasthit = TStime();
+}
+
 /** Build "<reason> [ID: <id>]" into buf, or just "<reason>" if the TKL has no id.
  * The id is appended to the reject-message so the client can quote it back to
  * an oper when reporting "why am I banned" -- matches upstream and the
@@ -1300,6 +1311,8 @@ int tkl_ip_change(Client *client, const char *oldip)
 	if ((tkl = find_tkline_match_zap(client)))
 	{
 		char rbuf[512];
+		tkl_record_hit(tkl);
+
 		const char *r = tkl_reason_with_id(tkl, rbuf, sizeof(rbuf), tkl->ptr.serverban->reason);
 		banned_client(client, "Z-Lined", r, (tkl->type & TKL_GLOBAL)?1:0, NO_EXIT_CLIENT);
 	}
@@ -1312,6 +1325,8 @@ int tkl_accept(Client *client)
 	if ((tkl = find_tkline_match_zap(client)))
 	{
 		char rbuf[512];
+		tkl_record_hit(tkl);
+
 		const char *r = tkl_reason_with_id(tkl, rbuf, sizeof(rbuf), tkl->ptr.serverban->reason);
 		banned_client(client, "Z-Lined", r, (tkl->type & TKL_GLOBAL)?1:0, NO_EXIT_CLIENT);
 		return 2; // TODO: HOOK_DENY_ALWAYS;
@@ -3781,6 +3796,8 @@ int _find_tkline_match(Client *client, int skip_soft)
 	if (tkl->type & TKL_KILL)
 	{
 		char rbuf[512];
+		tkl_record_hit(tkl);
+
 		const char *r = tkl_reason_with_id(tkl, rbuf, sizeof(rbuf), tkl->ptr.serverban->reason);
 		ircstats.is_ref++;
 		if (tkl->type & TKL_GLOBAL)
@@ -3792,6 +3809,8 @@ int _find_tkline_match(Client *client, int skip_soft)
 	if (tkl->type & TKL_ZAP)
 	{
 		char rbuf[512];
+		tkl_record_hit(tkl);
+
 		const char *r = tkl_reason_with_id(tkl, rbuf, sizeof(rbuf), tkl->ptr.serverban->reason);
 		ircstats.is_ref++;
 		banned_client(client, "Z-Lined", r, (tkl->type & TKL_GLOBAL)?1:0, 0);
@@ -4179,7 +4198,9 @@ int tkl_stats_matcher(Client *client, int type, const char *para, TKLFlag *tklfl
 			{
 				sendnumeric(client, RPL_STATSGLINE, 'K', namevalue_nospaces(m),
 					   (tkl->expire_at != 0) ? (long long)(tkl->expire_at - TStime()) : 0,
-					   (long long)(TStime() - tkl->set_at), tkl->set_by, tkl->ptr.serverban->reason);
+					   (long long)(TStime() - tkl->set_at), tkl->set_by,
+					   tkl->hits, (long long)tkl->lasthit, "*", tkl->id[0] ? tkl->id : "*",
+					   tkl->ptr.serverban->reason);
 
 			}
 		} else {
@@ -4189,31 +4210,41 @@ int tkl_stats_matcher(Client *client, int type, const char *para, TKLFlag *tklfl
 			{
 				sendnumeric(client, RPL_STATSGLINE, 'G', uhost,
 					   (tkl->expire_at != 0) ? (long long)(tkl->expire_at - TStime()) : 0,
-					   (long long)(TStime() - tkl->set_at), tkl->set_by, tkl->ptr.serverban->reason);
+					   (long long)(TStime() - tkl->set_at), tkl->set_by,
+					   tkl->hits, (long long)tkl->lasthit, "*", tkl->id[0] ? tkl->id : "*",
+					   tkl->ptr.serverban->reason);
 			} else
 			if (tkl->type == (TKL_ZAP | TKL_GLOBAL))
 			{
 				sendnumeric(client, RPL_STATSGLINE, 'Z', uhost,
 					   (tkl->expire_at != 0) ? (long long)(tkl->expire_at - TStime()) : 0,
-					   (long long)(TStime() - tkl->set_at), tkl->set_by, tkl->ptr.serverban->reason);
+					   (long long)(TStime() - tkl->set_at), tkl->set_by,
+					   tkl->hits, (long long)tkl->lasthit, "*", tkl->id[0] ? tkl->id : "*",
+					   tkl->ptr.serverban->reason);
 			} else
 			if (tkl->type == (TKL_SHUN | TKL_GLOBAL))
 			{
 				sendnumeric(client, RPL_STATSGLINE, 's', uhost,
 					   (tkl->expire_at != 0) ? (long long)(tkl->expire_at - TStime()) : 0,
-					   (long long)(TStime() - tkl->set_at), tkl->set_by, tkl->ptr.serverban->reason);
+					   (long long)(TStime() - tkl->set_at), tkl->set_by,
+					   tkl->hits, (long long)tkl->lasthit, "*", tkl->id[0] ? tkl->id : "*",
+					   tkl->ptr.serverban->reason);
 			} else
 			if (tkl->type == (TKL_KILL))
 			{
 				sendnumeric(client, RPL_STATSGLINE, 'K', uhost,
 					   (tkl->expire_at != 0) ? (long long)(tkl->expire_at - TStime()) : 0,
-					   (long long)(TStime() - tkl->set_at), tkl->set_by, tkl->ptr.serverban->reason);
+					   (long long)(TStime() - tkl->set_at), tkl->set_by,
+					   tkl->hits, (long long)tkl->lasthit, "*", tkl->id[0] ? tkl->id : "*",
+					   tkl->ptr.serverban->reason);
 			} else
 			if (tkl->type == (TKL_ZAP))
 			{
 				sendnumeric(client, RPL_STATSGLINE, 'z', uhost,
 					   (tkl->expire_at != 0) ? (long long)(tkl->expire_at - TStime()) : 0,
-					   (long long)(TStime() - tkl->set_at), tkl->set_by, tkl->ptr.serverban->reason);
+					   (long long)(TStime() - tkl->set_at), tkl->set_by,
+					   tkl->hits, (long long)tkl->lasthit, "*", tkl->id[0] ? tkl->id : "*",
+					   tkl->ptr.serverban->reason);
 			}
 		}
 	} else

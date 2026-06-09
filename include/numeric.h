@@ -387,7 +387,7 @@
 #define STR_RPL_STATSYLINE		/* 218 */	"Y %s %d %d %d %d %d"
 #define STR_RPL_ENDOFSTATS		/* 219 */	"%c :End of /STATS report"
 #define STR_RPL_UMODEIS			/* 221 */	"%s"
-#define STR_RPL_STATSGLINE		/* 223 */	"%c %s %lld %lld %s :%s"
+#define STR_RPL_STATSGLINE		/* 223 */	"%c %s %lld %lld %s %lld %lld %s %s :%s"
 #define STR_RPL_STATSTLINE		/* 224 */	"T %s %s %s"
 #define STR_RPL_STATSNLINE		/* 226 */	"n %s %s"
 #define STR_RPL_STATSVLINE		/* 227 */	"v %s %s %s"

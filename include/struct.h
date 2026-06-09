@@ -1330,10 +1330,11 @@ struct TKL {
 	char *set_by; /**< By who was this entry added */
 	time_t set_at; /**< When this entry was added */
 	time_t expire_at; /**< When this entry will expire */
-	char id[TKLIDLEN]; /**< Locally-generated random id ("G"+base32 etc.), exposed in /STATS and the
-	                    *   reject message so users can quote it back. Generated per-server, so the
-	                    *   id seen on irc1 for a global gline is not necessarily the same as on
-	                    *   irc2. Empty string means "no id assigned yet". */
+	char id[TKLIDLEN]; /**< Stable per-TKL identifier exposed in /STATS and the reject message:
+	                    *   "<typechar>+base32(SHA1(stable fields))". Deterministic, so peer servers
+	                    *   independently compute the same id for the same TKL. */
+	long long hits; /**< How many times this TKL has fired locally since boot. */
+	time_t lasthit; /**< Absolute unix timestamp of the most recent local hit, or 0 if never. */
 	union {
 		Spamfilter *spamfilter;
 		ServerBan *serverban;
