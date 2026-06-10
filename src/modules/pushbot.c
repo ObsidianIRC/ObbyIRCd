@@ -385,6 +385,7 @@ RPC_CALL_FUNC(pb_rpc_delete);
 
 /* obby.world/channel-bots cap helpers */
 static int  pb_mtag_bot_info_is_ok(Client *c, const char *n, const char *v);
+static int  pb_mtag_invoked_by_is_ok(Client *c, const char *n, const char *v);
 static int  pb_hook_welcome_burst(Client *client);
 static int  pb_hook_oper_change(Client *client, int add,
                                 const char *oper_block, const char *operclass);
@@ -521,7 +522,7 @@ MOD_INIT()
 		 * without tracking outgoing msgids itself. */
 		memset(&m, 0, sizeof(m));
 		m.name = "+draft/invoked-by";
-		m.is_ok = pb_mtag_bot_info_is_ok; /* same base64 validation */
+		m.is_ok = pb_mtag_invoked_by_is_ok;
 		m.flags = MTAG_HANDLER_FLAGS_NO_CAP_NEEDED;
 		MessageTagHandlerAdd(modinfo->handle, &m);
 	}
@@ -3783,6 +3784,17 @@ static int pb_mtag_bot_info_is_ok(Client *c, const char *n, const char *v)
 {
 	/* Server-emitted tag.  Reject if a client tries to send one. */
 	return IsServer(c) ? 1 : 0;
+}
+
+static int pb_mtag_invoked_by_is_ok(Client *c, const char *n, const char *v)
+{
+	/* Bots emit this on their channel replies to attribute the
+	 * triggering slash invocation. Accept from any registered
+	 * client; payload shape is validated downstream by clients. */
+	if (IsServer(c)) return 1;
+	if (!IsUser(c)) return 0;
+	if (!v || !*v) return 0;
+	return 1;
 }
 
 /* Decide whether `client` is allowed to see `bot` in burst/push events.
