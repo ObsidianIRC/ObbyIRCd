@@ -2697,6 +2697,7 @@ static void pb_mtag_forward(Client *sender, MessageTag *recv_mtags,
 		"+draft/bot-cmd", "+draft/bot-cmds-query",
 		"+draft/bot-cmds", "+draft/bot-cmds-changed",
 		"+draft/bot-tools",
+		"batch",
 		NULL
 	};
 	for (int i = 0; names[i]; i++) {
