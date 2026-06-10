@@ -822,6 +822,24 @@ static void promote_session(PersistEntry *e)
 	if (session_md)
 		moddata_client(new_canonical, session_md).i = 0;
 
+	/* The promoted client inherits Memberships from its prior life as
+	 * a session, which set MEMB_FLAG_SHADOW on every channel via
+	 * setup_session / persist_local_join. Now that this is the
+	 * canonical -- the only representation of the account -- we must
+	 * clear the shadow flag, otherwise NAMES (which filters shadows
+	 * to avoid duplicates) hides the user from everyone in the
+	 * channel while WHOIS (which iterates client->user->channel
+	 * directly) keeps reporting them as a member. */
+	{
+		Membership *mb;
+		for (mb = new_canonical->user->channel; mb; mb = mb->next)
+		{
+			mb->memb_flags &= ~MEMB_FLAG_SHADOW;
+			if (mb->related)
+				mb->related->memb_flags &= ~MEMB_FLAG_SHADOW;
+		}
+	}
+
 	/* Restore channels (same_nick path: client->name now equals e->nick) */
 	restore_channels(new_canonical, e);
 
