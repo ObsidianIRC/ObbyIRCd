@@ -1258,6 +1258,19 @@ CMD_FUNC(cmd_metadata_local)
 		key = parv[3];
 		if (!metadata_check_perms(user, channel, client, key, MODE_SET))
 			return;
+		/* The IRCv3 metadata-2 "bot" key is bot-identity attribution;
+		 * gate it so a regular nick can't spoof a CloudBot-style
+		 * "<nick> owned by <owner>" payload.  Only +B users may set it
+		 * on themselves; servers + U-lined services keep working. */
+		if (user && !strcasecmp(key, "bot") &&
+		    !IsServer(client) && !IsULine(client) &&
+		    !has_user_mode(client, 'B'))
+		{
+			sendto_one(client, NULL,
+				":%s FAIL METADATA KEY_NO_PERMISSION %s %s :only +B (bot) clients may set this key",
+				me.name, user->name, key);
+			return;
+		}
 		if (parc > 3 && !BadPtr(parv[4]))
 			value = parv[4];
 
