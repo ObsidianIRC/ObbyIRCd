@@ -3328,8 +3328,9 @@ static int pb_route_botcmd_channel(Client *invoker, Channel *channel,
 
 	PbBot *bot = pb_resolve_channel_botcmd(channel, cmd, target_nick);
 	if (!bot) {
-		pb_send_botcmd_error(invoker, me.name, channel ? channel->name : NULL,
-		                     msgid, "INVALID_COMMAND", "No such command.");
+		/* Not a pushbot-registered bot; let the TAGMSG flow to the
+		 * channel so a spec-compliant bot in it (draft/bot-cmds via
+		 * its own TAGMSG handler) can answer. */
 		json_decref(cmd);
 		return 0;
 	}
