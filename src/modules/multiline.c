@@ -843,7 +843,7 @@ CMD_OVERRIDE_FUNC(multiline_override_batch)
 		batch = moddata_local_client(client, multiline_md).ptr;
 		if (!batch || strcmp(batch->batch_id, ref))
 		{
-			sendto_one(client, NULL, ":%s FAIL BATCH MULTILINE_INVALID :No matching open batch", me.name);
+			CALL_NEXT_COMMAND_OVERRIDE();
 			return;
 		}
 
