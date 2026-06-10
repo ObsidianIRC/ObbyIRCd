@@ -167,7 +167,7 @@ struct PbInteraction {
 	char *channel;            /* channel context (NULL = DM with bot) */
 	char *invoker_msgid;      /* msgid of the TAGMSG (for +reply) */
 	char *invoker_cmd_b64;    /* base64-JSON of {nick, name, options}; sent
-	                           * back as +obby.world/invoked-by on the bot's
+	                           * back as +draft/invoked-by on the bot's
 	                           * reply so the client can render a quote
 	                           * attribution without local state. */
 	int invoked_public;       /* 1 = invoked publicly in-channel; 0 = private/pm.
@@ -401,6 +401,7 @@ static int  pb_mtag_botcmds_changed_is_ok(Client *c, const char *n, const char *
 static void pb_send_botcmds_to(Client *client, PbBot *b);
 static void pb_mtag_forward(Client *sender, MessageTag *recv_mtags,
                             MessageTag **mtag_list, const char *signature);
+CMD_OVERRIDE_FUNC(pb_override_batch);
 static void pb_handle_command_register(Client *client, json_t *frame);
 static void pb_handle_interaction_response(Client *client, json_t *frame);
 static void pb_handle_interaction_defer(Client *client, json_t *frame);
@@ -514,12 +515,12 @@ MOD_INIT()
 		m.flags = MTAG_HANDLER_FLAGS_NO_CAP_NEEDED;
 		MessageTagHandlerAdd(modinfo->handle, &m);
 
-		/* +obby.world/invoked-by carries a base64 JSON describing the
+		/* +draft/invoked-by carries a base64 JSON describing the
 		 * original slash-command invocation; emitted on the bot's
 		 * channel reply so the client can render an attribution quote
 		 * without tracking outgoing msgids itself. */
 		memset(&m, 0, sizeof(m));
-		m.name = "+obby.world/invoked-by";
+		m.name = "+draft/invoked-by";
 		m.is_ok = pb_mtag_bot_info_is_ok; /* same base64 validation */
 		m.flags = MTAG_HANDLER_FLAGS_NO_CAP_NEEDED;
 		MessageTagHandlerAdd(modinfo->handle, &m);
@@ -611,6 +612,8 @@ static int pb_on_rehash_complete(void)
 
 MOD_LOAD()
 {
+	CommandOverrideAdd(modinfo->handle, "BATCH", 0, pb_override_batch);
+
 	if (pb_open_db() < 0) {
 		config_error("[pushbot] cannot open database at %s", cfg.database_path);
 		return MOD_FAILED;
@@ -2278,14 +2281,7 @@ static int pb_mtag_botcmd_is_ok(Client *c, const char *n, const char *v)
 }
 static int pb_mtag_botcmds_query_is_ok(Client *c, const char *n, const char *v)
 {
-	/* +draft/bot-cmds-query is valueless per the IRCv3 bot-tools spec:
-	 *     @+draft/bot-cmds-query TAGMSG <channel>
-	 * Requiring a non-empty value silently strips every legitimate
-	 * discovery query at the parser, then has_client_mtags() in
-	 * cmd_message sees an empty client-tag list and drops the TAGMSG
-	 * entirely. Result: bots in the channel never receive the query,
-	 * and clients in the channel never see those bots' commands. */
-	return 1;
+	return 1; /* spec-defined valueless tag */
 }
 static int pb_mtag_botcmds_is_ok(Client *c, const char *n, const char *v)
 {
@@ -2711,6 +2707,101 @@ static void pb_mtag_forward(Client *sender, MessageTag *recv_mtags,
 	}
 }
 
+typedef struct PbBotCmdsBatch {
+	struct PbBotCmdsBatch *prev, *next;
+	Client *opener;
+	char ref[64];
+	char target_nick[NICKLEN + 1];
+} PbBotCmdsBatch;
+
+static PbBotCmdsBatch *pb_botcmds_batches = NULL;
+
+static PbBotCmdsBatch *pb_botcmds_batch_find(Client *c, const char *ref)
+{
+	for (PbBotCmdsBatch *b = pb_botcmds_batches; b; b = b->next)
+		if (b->opener == c && !strcmp(b->ref, ref))
+			return b;
+	return NULL;
+}
+
+static void pb_botcmds_batch_remove(PbBotCmdsBatch *b)
+{
+	DelListItem(b, pb_botcmds_batches);
+	safe_free(b);
+}
+
+/* BATCH override: claim draft/bot-cmds so cmd_batch doesn't reject it
+ * as UNKNOWN_TYPE. Syntax: BATCH +ref draft/bot-cmds <target>. */
+CMD_OVERRIDE_FUNC(pb_override_batch)
+{
+	if (!MyUser(client) || parc < 2 || BadPtr(parv[1]))
+	{
+		CALL_NEXT_COMMAND_OVERRIDE();
+		return;
+	}
+
+	if (parv[1][0] == '+')
+	{
+		if (parc < 3 || BadPtr(parv[2]) || strcmp(parv[2], "draft/bot-cmds"))
+		{
+			CALL_NEXT_COMMAND_OVERRIDE();
+			return;
+		}
+		if (!valid_batch_reference_tag(parv[1] + 1))
+		{
+			sendto_one(client, NULL, ":%s FAIL BATCH INVALID_REFTAG %s :Invalid batch reference tag",
+			           me.name, parv[1] + 1);
+			return;
+		}
+		if (parc < 4 || BadPtr(parv[3]))
+		{
+			sendto_one(client, NULL, ":%s FAIL BATCH BOT_CMDS_INVALID :draft/bot-cmds requires target nick",
+			           me.name);
+			return;
+		}
+
+		Client *target = find_user(parv[3], NULL);
+		if (!target)
+		{
+			sendnumeric(client, ERR_NOSUCHNICK, parv[3]);
+			return;
+		}
+
+		PbBotCmdsBatch *b = safe_alloc(sizeof(*b));
+		strlcpy(b->ref, parv[1] + 1, sizeof(b->ref));
+		strlcpy(b->target_nick, target->name, sizeof(b->target_nick));
+		b->opener = client;
+		AddListItem(b, pb_botcmds_batches);
+
+		if (MyUser(target) && HasCapability(target, "batch") && HasCapability(target, "message-tags"))
+		{
+			sendto_prefix_one(target, client, NULL, ":%s BATCH %s draft/bot-cmds",
+			                  client->name, parv[1]);
+		}
+		return;
+	}
+
+	if (parv[1][0] == '-')
+	{
+		PbBotCmdsBatch *b = pb_botcmds_batch_find(client, parv[1] + 1);
+		if (!b)
+		{
+			CALL_NEXT_COMMAND_OVERRIDE();
+			return;
+		}
+		Client *target = find_user(b->target_nick, NULL);
+		if (target && MyUser(target) && HasCapability(target, "batch"))
+		{
+			sendto_prefix_one(target, client, NULL, ":%s BATCH %s",
+			                  client->name, parv[1]);
+		}
+		pb_botcmds_batch_remove(b);
+		return;
+	}
+
+	CALL_NEXT_COMMAND_OVERRIDE();
+}
+
 static PbInteraction *pb_interaction_find(const char *id)
 {
 	if (!id) return NULL;
@@ -2752,7 +2843,7 @@ static void pb_interaction_free(PbInteraction *it)
 }
 
 /* Build a NameValuePrioList holding +reply / +draft/channel-context
- * / +obby.world/invoked-by for use with sendto_one() etc.  Caller
+ * / +draft/invoked-by for use with sendto_one() etc.  Caller
  * must free_message_tags(). */
 static MessageTag *pb_make_reply_tags(const char *reply_msgid,
                                       const char *channel_ctx,
@@ -2777,7 +2868,7 @@ static MessageTag *pb_make_reply_tags(const char *reply_msgid,
 	}
 	if (invoked_by_b64 && *invoked_by_b64) {
 		MessageTag *m = safe_alloc(sizeof(*m));
-		safe_strdup(m->name, "+obby.world/invoked-by");
+		safe_strdup(m->name, "+draft/invoked-by");
 		safe_strdup(m->value, invoked_by_b64);
 		AddListItem(m, head);
 	}

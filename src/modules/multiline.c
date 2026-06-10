@@ -717,22 +717,24 @@ CMD_OVERRIDE_FUNC(multiline_override_batch)
 			return;
 		}
 
-		if (parc < 4 || BadPtr(parv[2]) || BadPtr(parv[3]))
+		if (parc < 3 || BadPtr(parv[2]))
+		{
+			CALL_NEXT_COMMAND_OVERRIDE();
+			return;
+		}
+		batch_type = parv[2];
+		if (strcmp(batch_type, "draft/multiline"))
+		{
+			CALL_NEXT_COMMAND_OVERRIDE();
+			return;
+		}
+
+		if (parc < 4 || BadPtr(parv[3]))
 		{
 			sendto_one(client, NULL, ":%s FAIL BATCH MULTILINE_INVALID :Insufficient parameters", me.name);
 			return;
 		}
-
-		batch_type = parv[2];
 		target = parv[3];
-
-		/* Only handle draft/multiline batch type */
-		if (strcmp(batch_type, "draft/multiline"))
-		{
-			/* Not a multiline batch - fall through */
-			CALL_NEXT_COMMAND_OVERRIDE();
-			return;
-		}
 
 		/* Check capabilities */
 		if (!HasMultiline(client))

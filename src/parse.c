@@ -72,24 +72,7 @@ int process_packet(Client *client, char *readbuf, int length, int killsafely)
 		return 0;
 	}
 
-	/* excess flood check.
-	 *
-	 * Bots that implement the IRCv3 draft/bot-cmds discovery protocol
-	 * legitimately answer a single +draft/bot-cmds-query with many
-	 * back-to-back TAGMSGs (one per chunk of their command list). With
-	 * a 700+ command bot like CloudBot, that's ~50+ TAGMSGs arriving
-	 * within a few hundred ms; the default recvq fills before the bot
-	 * is done responding and the server kills the bot for "Excess Flood".
-	 * Bots are also the natural callers of draft/bot-tools workflow
-	 * streaming, which can emit dozens of step events in a tight burst.
-	 *
-	 * Give clients in +B (bot mode) substantially more headroom -- 8x
-	 * the configured recvq -- so a legitimate bot's burst doesn't trip
-	 * the flood-kill. A malicious unbotted client can self-apply +B but
-	 * by doing so it accepts being marked as a bot in WHOIS/NAMES, which
-	 * server policy (rate-limited registration, oper review) covers
-	 * separately. The class::recvq for non-bot users is unchanged.
-	 */
+	/* excess flood check; +B bots get 8x recvq for burst replies (draft/bot-cmds, draft/bot-tools). */
 	if (IsUser(client))
 	{
 		long recvq_limit = get_recvq(client);
