@@ -3793,7 +3793,7 @@ static int pb_mtag_invoked_by_is_ok(Client *c, const char *n, const char *v)
 	 * triggering slash invocation. Accept from any registered
 	 * client; payload shape is validated downstream by clients. */
 	if (IsServer(c)) return 1;
-	if (!IsUser(c)) return 0;
+	if (!IsBot(c)) return 0;
 	if (!v || !*v) return 0;
 	return 1;
 }
