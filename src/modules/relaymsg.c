@@ -23,6 +23,7 @@ const char *relay_msg_cap_parameter(Client *client);
 
 CMD_FUNC(cmd_relaymsg);
 CMD_FUNC(cmd_rrelaymsg);
+static void relay_to_channel(Channel *channel, MessageTag *mtags, const char *nick, const char *text);
 
 struct MyConfStruct
 {
@@ -213,6 +214,19 @@ const char *relay_msg_cap_parameter(Client *client)
 	return "/";
 }
 
+/* Deliver a relayed message to the channel under the spoofed nick, and record
+ * it in +H history -- sendto_channel() bypasses the CHANMSG hook that normally
+ * feeds history, so without this relayed lines never show up in CHATHISTORY. */
+static void relay_to_channel(Channel *channel, MessageTag *mtags, const char *nick, const char *text)
+{
+	char line[512];
+
+	ircsnprintf(line, sizeof(line), ":%s!%s PRIVMSG %s :%s", nick, MyConf.hostmask, channel->name, text);
+	sendto_channel(channel, &me, NULL, NULL, 0, SEND_LOCAL, mtags, "%s", line);
+	if (has_channel_mode(channel, 'H'))
+		history_add(channel->name, mtags, line);
+}
+
 // Command to send a message to a channel as a spoofed nick
 CMD_FUNC(cmd_relaymsg)
 {
@@ -274,8 +288,7 @@ CMD_FUNC(cmd_relaymsg)
 	new_message(client, recv_mtags, &mtags);
 
 
-	sendto_channel(channel, &me, NULL, NULL, 0, SEND_LOCAL, mtags,
-						":%s!%s PRIVMSG %s :%s", parv[2], MyConf.hostmask, parv[1], parv[3]);
+	relay_to_channel(channel, mtags, parv[2], parv[3]);
 	sendto_server(NULL, 0, 0, mtags,
 						 ":%s RRELAYMSG %s %s %s :%s", me.name, client->id, parv[1], parv[2], parv[3]);
 }
@@ -299,8 +312,7 @@ CMD_FUNC(cmd_rrelaymsg)
 	if (!channel)
 		return;
 	
-	sendto_channel(channel, &me, NULL, NULL, 0, SEND_LOCAL, recv_mtags,
-				 ":%s!%s PRIVMSG %s :%s", parv[2], MyConf.hostmask, parv[3], parv[4]);
+	relay_to_channel(channel, recv_mtags, parv[3], parv[4]);
 	sendto_server(client, 0, 0, recv_mtags,
 				 ":%s RRELAYMSG %s %s %s :%s", me.name, parv[1], parv[2], parv[3], parv[4]);
 }
