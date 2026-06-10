@@ -1295,22 +1295,15 @@ static int persist_account_login(Client *client, MessageTag *mtags)
 	if (!e)
 		return 0; /* No entry, nothing to restore */
 
-	/* If the user has turned persistence OFF on their account, do not
-	 * attach as a session and do not queue silent channel restoration.
-	 * The expected user model is "I'm a regular IRC user now": their
-	 * QUIT broadcasts normally, their JOIN on reconnect must broadcast
-	 * normally too.  Without this gate, restore_channels' same_nick
-	 * path silently re-adds them to every saved channel and observers
-	 * see no JOIN line -- only the prior QUIT -- leaving the user
-	 * invisible to everyone else in the channel until they /CYCLE. */
-	if (!persistence_effective(client, e))
-		return 0;
-
 	/* --- Session detection ---
 	 * If a live canonical is already online for this account, attach as
-	 * a session rather than restoring channels.
-	 * Rename to account nick here (pre-001) so 001 carries the right nick.
-	 * We remove from the old hash slot and don't re-add; canonical holds it. */
+	 * a session rather than restoring channels.  This path runs even
+	 * when persistence is OFF on the account: multi-session attach is
+	 * what stops a second tab from being renamed to "Valware_" -- it's
+	 * orthogonal to whether channels get preserved across reconnects.
+	 * Rename to account nick here (pre-001) so 001 carries the right
+	 * nick.  We remove from the old hash slot and don't re-add;
+	 * canonical holds it. */
 	if (e->canonical && !IsDead(e->canonical) &&
 	    IsUser(e->canonical) && !is_ghost_client(e->canonical))
 	{
@@ -1339,6 +1332,18 @@ static int persist_account_login(Client *client, MessageTag *mtags)
 
 	/* Clear stale canonical pointer */
 	e->canonical = NULL;
+
+	/* No live canonical: this client becomes one. If persistence is
+	 * OFF on the account, skip the silent channel-restore path --
+	 * restore_channels' same_nick branch silently re-adds the user
+	 * to every saved channel without broadcasting a JOIN, which
+	 * leaves observers seeing only the prior QUIT and the user
+	 * invisible to everyone in the channel until they /CYCLE.
+	 * The expected user model with persistence OFF is "I'm a regular
+	 * non-persistent IRC user now", so QUIT broadcasts normally and
+	 * JOIN on reconnect must broadcast normally too. */
+	if (!persistence_effective(client, e))
+		return 0;
 
 	/* Queue channel restoration for after 376 */
 	moddata_client(client, restore_md).ptr = (void *)e;
