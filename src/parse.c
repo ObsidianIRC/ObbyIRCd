@@ -72,18 +72,45 @@ int process_packet(Client *client, char *readbuf, int length, int killsafely)
 		return 0;
 	}
 
-	/* excess flood check */
-	if (IsUser(client) && DBufLength(&client->local->recvQ) > get_recvq(client))
+	/* excess flood check.
+	 *
+	 * Bots that implement the IRCv3 draft/bot-cmds discovery protocol
+	 * legitimately answer a single +draft/bot-cmds-query with many
+	 * back-to-back TAGMSGs (one per chunk of their command list). With
+	 * a 700+ command bot like CloudBot, that's ~50+ TAGMSGs arriving
+	 * within a few hundred ms; the default recvq fills before the bot
+	 * is done responding and the server kills the bot for "Excess Flood".
+	 * Bots are also the natural callers of draft/bot-tools workflow
+	 * streaming, which can emit dozens of step events in a tight burst.
+	 *
+	 * Give clients in +B (bot mode) substantially more headroom -- 8x
+	 * the configured recvq -- so a legitimate bot's burst doesn't trip
+	 * the flood-kill. A malicious unbotted client can self-apply +B but
+	 * by doing so it accepts being marked as a bot in WHOIS/NAMES, which
+	 * server policy (rate-limited registration, oper review) covers
+	 * separately. The class::recvq for non-bot users is unchanged.
+	 */
+	if (IsUser(client))
 	{
-		unreal_log(ULOG_INFO, "flood", "RECVQ_EXCEEDED", client,
-		           "Flood from $client.details [$client.ip] exceeds class::recvq ($recvq > $class_recvq) (Client sending too much data)",
-		           log_data_integer("recvq", DBufLength(&client->local->recvQ)),
-		           log_data_integer("class_recvq", get_recvq(client)));
-		if (!killsafely)
-			exit_client(client, NULL, "Excess Flood");
-		else
-			dead_socket(client, "Excess Flood");
-		return 0;
+		long recvq_limit = get_recvq(client);
+		static long bot_umode_bit = -1;
+		if (bot_umode_bit == -1)
+			bot_umode_bit = find_user_mode('B');
+		if (bot_umode_bit && (client->umodes & bot_umode_bit))
+			recvq_limit *= 8;
+
+		if (DBufLength(&client->local->recvQ) > recvq_limit)
+		{
+			unreal_log(ULOG_INFO, "flood", "RECVQ_EXCEEDED", client,
+			           "Flood from $client.details [$client.ip] exceeds class::recvq ($recvq > $class_recvq) (Client sending too much data)",
+			           log_data_integer("recvq", DBufLength(&client->local->recvQ)),
+			           log_data_integer("class_recvq", recvq_limit));
+			if (!killsafely)
+				exit_client(client, NULL, "Excess Flood");
+			else
+				dead_socket(client, "Excess Flood");
+			return 0;
+		}
 	}
 
 	return 1;
