@@ -2278,7 +2278,14 @@ static int pb_mtag_botcmd_is_ok(Client *c, const char *n, const char *v)
 }
 static int pb_mtag_botcmds_query_is_ok(Client *c, const char *n, const char *v)
 {
-	return v && *v ? 1 : 0;
+	/* +draft/bot-cmds-query is valueless per the IRCv3 bot-tools spec:
+	 *     @+draft/bot-cmds-query TAGMSG <channel>
+	 * Requiring a non-empty value silently strips every legitimate
+	 * discovery query at the parser, then has_client_mtags() in
+	 * cmd_message sees an empty client-tag list and drops the TAGMSG
+	 * entirely. Result: bots in the channel never receive the query,
+	 * and clients in the channel never see those bots' commands. */
+	return 1;
 }
 static int pb_mtag_botcmds_is_ok(Client *c, const char *n, const char *v)
 {

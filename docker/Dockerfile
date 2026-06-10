@@ -85,18 +85,31 @@ RUN chmod +x Config \
     && chown -R obbyircd:obbyircd /tmp/obbyircd-source /home/obbyircd
 
 USER obbyircd
+
+# CI passes the commit SHA via --build-arg so BuildKit can never serve a
+# stale make/install layer for a different revision. Without this, an
+# observed regression: the source-tree COPY changed but BuildKit reused
+# the previous build's compiled .so files, shipping pre-fix binaries with
+# post-fix sources. The CACHE_KEY value is intentionally consumed by the
+# RUN below (echoed before the build) so a different SHA invalidates the
+# layer; default value lets local `docker build` work without --build-arg.
+ARG CACHE_KEY=local
+
 # UnrealIRCd's bundled argon2 (extras/argon2.tar.gz) builds with -march=native
 # by default, baking the build host's CPU instructions into the binary; the
 # image then SIGILLs on any host with a smaller instruction set (e.g. an
 # AVX2-only machine running an AVX-512-built lib).  Pin a portable per-arch
 # baseline so the image runs on every CPU of its architecture.
-RUN ARCH="$(uname -m)" \
+RUN echo "Building for CACHE_KEY=${CACHE_KEY}" \
+    && ARCH="$(uname -m)" \
     && case "$ARCH" in \
         x86_64)  OPTTARGET="x86-64" ;; \
         aarch64) OPTTARGET="armv8-a" ;; \
         *)       OPTTARGET="native" ;; \
     esac \
     && export OPTTARGET \
+    && find src -name '*.o' -delete 2>/dev/null \
+    && find src -name '*.so' -delete 2>/dev/null \
     && ./Config -quick && make -j"$(nproc)" && make install
 
 USER root

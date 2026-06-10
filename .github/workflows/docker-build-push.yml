@@ -53,6 +53,13 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           push: ${{ github.event_name != 'pull_request' }}
           provenance: false
+          # Pass the commit SHA as a build-arg the Dockerfile consumes.
+          # This makes BuildKit's layer cache key for the compile step
+          # change on every commit, so a source change cannot silently
+          # reuse a pre-fix .so layer (observed regression on the
+          # +draft/bot-cmds-query handler fix).
+          build-args: |
+            CACHE_KEY=${{ github.sha }}
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:sha-${{ steps.meta.outputs.short_sha }}-${{ matrix.arch }}
           cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:cache-${{ matrix.arch }}
           cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:cache-{2},mode=max,image-manifest=true,oci-mediatypes=true', secrets.DOCKERHUB_USERNAME, inputs.image_name, matrix.arch) || '' }}
