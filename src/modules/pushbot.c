@@ -1,3 +1,4 @@
+/* cache-buster: force CI to recompile -- see commit b5e on stale Docker layer */
 /*
  * pushbot -- Discord-style out-of-process bot framework for obbyircd.
  *
