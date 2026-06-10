@@ -97,7 +97,12 @@ RUN ARCH="$(uname -m)" \
         *)       OPTTARGET="native" ;; \
     esac \
     && export OPTTARGET \
-    && ./Config -quick && make -j"$(nproc)" && make install
+    && ./Config -quick \
+    && make -j"$(nproc)" clean 2>/dev/null || true \
+    && find src/modules -name '*.so' -delete 2>/dev/null || true \
+    && find src/modules -name '*.o'  -delete 2>/dev/null || true \
+    && make -j"$(nproc)" \
+    && make install
 
 USER root
 
