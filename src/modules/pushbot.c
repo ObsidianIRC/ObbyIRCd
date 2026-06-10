@@ -2278,11 +2278,7 @@ static int pb_mtag_botcmd_is_ok(Client *c, const char *n, const char *v)
 }
 static int pb_mtag_botcmds_query_is_ok(Client *c, const char *n, const char *v)
 {
-	/* +draft/bot-cmds-query is valueless per the spec ("@+draft/bot-cmds-query
-	 * TAGMSG <channel>"). Requiring a value silently strips every legitimate
-	 * discovery query at the parser, leaving channel members with no commands
-	 * advertised. Accept any value (including absent / empty). */
-	return 1;
+	return v && *v ? 1 : 0;
 }
 static int pb_mtag_botcmds_is_ok(Client *c, const char *n, const char *v)
 {
