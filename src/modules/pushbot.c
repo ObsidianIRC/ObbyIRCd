@@ -71,6 +71,13 @@
 
 #define PB_INTERACTION_TIMEOUT_SEC 3
 #define PB_INTERACTION_DEFER_SEC   15
+/* When the bot acks an interaction with a workflow:start, or emits a
+ * step event, the interaction's expires_at is bumped by this much. The
+ * window slides forward on every step so a long-running workflow that
+ * keeps reporting progress never expires. 30 minutes leaves enough
+ * head-room for a stall to be obvious but isn't so long that a crashed
+ * bot leaves a stuck "in flight" interaction forever. */
+#define PB_INTERACTION_WORKFLOW_SEC (30 * 60)
 
 ModuleHeader MOD_HEADER = {
 	"pushbot",
@@ -177,6 +184,11 @@ struct PbInteraction {
 	PbBot *bot;
 	time_t expires_at;        /* hard timeout: 3s default, 15s after defer */
 	int deferred;
+	char *workflow_id;        /* if the bot acked with workflow:start, the wid
+	                           * that's keeping this interaction alive -- every
+	                           * step event on this wid slides expires_at
+	                           * forward, so a long-running workflow that keeps
+	                           * reporting progress never times out. */
 };
 static PbInteraction *interactions = NULL;
 
@@ -342,6 +354,35 @@ static void pb_rest_get_bot(Client *client, WebRequest *web, PbBot *b);
 static void pb_rest_get_channels(Client *client, WebRequest *web, PbBot *b);
 static void pb_rest_get_members(Client *client, WebRequest *web, PbBot *b,
                                 const char *channel);
+
+/* Shared cores: behaviours called by gateway op handlers, REST handlers,
+ * AND webhook inline-action dispatch. */
+typedef enum {
+	PB_CORE_OK,
+	PB_CORE_BAD_REQUEST,
+	PB_CORE_NOT_FOUND,
+	PB_CORE_FORBIDDEN,
+} PbCoreResult;
+static MessageTag *pb_build_tags(json_t *tagj);
+static PbCoreResult pb_core_register_commands(PbBot *b, json_t *cmds_array);
+static PbCoreResult pb_core_interaction_respond(PbBot *b, const char *iid,
+                                                const char *content,
+                                                const char *visibility,
+                                                int ephemeral,
+                                                MessageTag *extra_tags);
+static PbCoreResult pb_core_interaction_defer(PbBot *b, const char *iid,
+                                              int seconds);
+static PbCoreResult pb_core_workflow_event(PbBot *b, const char *target,
+                                           json_t *payload);
+static void pb_rest_register_commands(Client *client, WebRequest *web, PbBot *b);
+static void pb_rest_interaction_respond(Client *client, WebRequest *web,
+                                        PbBot *b, const char *iid);
+static void pb_rest_interaction_defer(Client *client, WebRequest *web,
+                                      PbBot *b, const char *iid);
+static void pb_rest_workflow_event(Client *client, WebRequest *web,
+                                   PbBot *b, const char *wid_in_path);
+static void pb_webhook_dispatch_inline_action(PbBot *b, const char *iid,
+                                              json_t *action);
 
 /* Gateway -- forward decls */
 static int pb_config_test_listen(ConfigFile *cf, ConfigEntry *ce, int type, int *errs);
@@ -2584,35 +2625,7 @@ static void pb_handle_workflow_event(Client *client, json_t *frame)
 	json_t *payload = json_object_get(d, "payload");
 	if (!json_is_string(targetj) || !json_is_object(payload)) return;
 
-	const char *target = json_string_value(targetj);
-	json_t *msgj = json_object_get(payload, "msg");
-	if (!json_is_string(msgj)) return;
-	const char *msg = json_string_value(msgj);
-
-	if (!strcmp(msg, "workflow")) {
-		json_t *idj = json_object_get(payload, "id");
-		json_t *statej = json_object_get(payload, "state");
-		if (!json_is_string(idj) || !json_is_string(statej)) return;
-		const char *wid = json_string_value(idj);
-		const char *state = json_string_value(statej);
-		PbWorkflow *w = pb_workflow_touch(s->bot, wid, target);
-		if (!w) return;
-		if (!strcmp(state, "complete") || !strcmp(state, "failed") ||
-		    !strcmp(state, "cancelled"))
-			pb_workflow_terminate(w);
-	} else if (!strcmp(msg, "step")) {
-		json_t *widj = json_object_get(payload, "wid");
-		json_t *sidj = json_object_get(payload, "sid");
-		if (!json_is_string(widj) || !json_is_string(sidj)) return;
-		PbWorkflow *w = pb_workflow_touch(s->bot, json_string_value(widj),
-		                                 target);
-		if (w) pb_workflow_remember_sid(w, json_string_value(sidj));
-	} else {
-		/* Unknown msg type. The bot may be reporting something the
-		 * spec adds later; relay anyway after sanity-encoding. */
-	}
-
-	pb_workflow_send_tag(s->bot, target, payload);
+	pb_core_workflow_event(s->bot, json_string_value(targetj), payload);
 }
 
 /* Inbound action routing.
@@ -2842,6 +2855,7 @@ static void pb_interaction_free(PbInteraction *it)
 	safe_free(it->channel);
 	safe_free(it->invoker_msgid);
 	safe_free(it->invoker_cmd_b64);
+	safe_free(it->workflow_id);
 	safe_free(it);
 }
 
@@ -3411,22 +3425,8 @@ static void pb_handle_command_register(Client *client, json_t *frame)
 		return;
 	}
 	json_t *cmds = json_object_get(d, "commands");
-	if (!json_is_array(cmds)) {
+	if (pb_core_register_commands(s->bot, cmds) != PB_CORE_OK)
 		pb_close_ws(client, PB_CLOSE_INVALID_SESSION, "commands must be array");
-		return;
-	}
-	if (s->bot->commands) json_decref(s->bot->commands);
-	s->bot->commands = json_incref(cmds);
-
-	json_t *ack_d = json_object();
-	json_object_set_new(ack_d, "count", json_integer(json_array_size(cmds)));
-	pb_dispatch_event(s->bot, "COMMANDS_REGISTERED", ack_d);
-
-	unreal_log(ULOG_INFO, "pushbot", "CMDS_REGISTERED", NULL,
-	           "Bot $nick registered $n slash commands",
-	           log_data_string("nick", s->bot->nick),
-	           log_data_integer("n", (int)json_array_size(cmds)));
-	pb_broadcast_bot_event(s->bot, "update");
 }
 
 static void pb_append_tags(MessageTag **head, MessageTag *extra)
@@ -3594,15 +3594,6 @@ static void pb_handle_interaction_response(Client *client, json_t *frame)
 	if (!json_is_object(d)) return;
 	json_t *idj = json_object_get(d, "id");
 	if (!json_is_string(idj)) return;
-	PbInteraction *it = pb_interaction_find(json_string_value(idj));
-	if (!it) {
-		unreal_log(ULOG_INFO, "pushbot", "INT_LATE", NULL,
-		           "Bot $nick responded to unknown/expired interaction $id",
-		           log_data_string("nick", s->bot->nick),
-		           log_data_string("id", json_string_value(idj)));
-		return;
-	}
-	if (it->bot != s->bot) return;  /* impersonation guard */
 
 	const char *content = "";
 	const char *vis = "public";
@@ -3614,24 +3605,17 @@ static void pb_handle_interaction_response(Client *client, json_t *frame)
 	json_t *ej = json_object_get(d, "ephemeral");
 	if (json_is_boolean(ej)) ephemeral = json_is_true(ej) ? 1 : 0;
 
-	MessageTag *extra = NULL;
-	json_t *tagj = json_object_get(d, "tags");
-	if (json_is_object(tagj)) {
-		const char *key;
-		json_t *val;
-		json_object_foreach(tagj, key, val) {
-			if (!key || key[0] != '+') continue;
-			if (!json_is_string(val)) continue;
-			MessageTag *m = safe_alloc(sizeof(*m));
-			safe_strdup(m->name, key);
-			safe_strdup(m->value, json_string_value(val));
-			AddListItem(m, extra);
-		}
-	}
-
-	pb_send_interaction_reply(it, content, vis, ephemeral, extra);
+	MessageTag *extra = pb_build_tags(json_object_get(d, "tags"));
+	PbCoreResult r = pb_core_interaction_respond(s->bot,
+	                                             json_string_value(idj),
+	                                             content, vis, ephemeral,
+	                                             extra);
 	free_message_tags(extra);
-	pb_interaction_free(it);
+	if (r == PB_CORE_NOT_FOUND)
+		unreal_log(ULOG_INFO, "pushbot", "INT_LATE", NULL,
+		           "Bot $nick responded to unknown/expired interaction $id",
+		           log_data_string("nick", s->bot->nick),
+		           log_data_string("id", json_string_value(idj)));
 }
 
 static void pb_handle_interaction_defer(Client *client, json_t *frame)
@@ -3642,10 +3626,7 @@ static void pb_handle_interaction_defer(Client *client, json_t *frame)
 	if (!json_is_object(d)) return;
 	json_t *idj = json_object_get(d, "id");
 	if (!json_is_string(idj)) return;
-	PbInteraction *it = pb_interaction_find(json_string_value(idj));
-	if (!it || it->bot != s->bot) return;
-	it->expires_at = TStime() + PB_INTERACTION_DEFER_SEC;
-	it->deferred = 1;
+	pb_core_interaction_defer(s->bot, json_string_value(idj), 0);
 }
 
 /* PB_OP_SEND_MESSAGE: bot sends a spontaneous PRIVMSG/NOTICE from its
@@ -4113,6 +4094,36 @@ static void pb_webhook_response(OutgoingWebRequest *req, OutgoingWebResponse *re
 		           "Webhook delivered for $nick event=$ev",
 		           log_data_string("nick", b->nick),
 		           log_data_string("ev", ctx->event_name));
+
+		/* Inline-action body: the bot may answer a COMMAND_INVOKE in
+		 * the 200 response with {type: "send_message"|..} so a
+		 * serverless bot can reply without ever opening a connection
+		 * back. The iid for the action is the same as the iid we
+		 * delivered in the request body's `d.id`. */
+		if (resp && resp->memory && resp->memory_len > 0 &&
+		    ctx->event_name && !strcmp(ctx->event_name, "COMMAND_INVOKE")) {
+			const char *iid = NULL;
+			json_error_t je;
+			/* Recover the iid from the body we sent. */
+			json_t *sent = ctx->body
+			    ? json_loads(ctx->body, 0, &je) : NULL;
+			if (sent) {
+				json_t *dj = json_object_get(sent, "d");
+				if (json_is_object(dj)) {
+					json_t *idj = json_object_get(dj, "id");
+					if (json_is_string(idj))
+						iid = json_string_value(idj);
+				}
+			}
+			json_t *action = json_loadb(resp->memory,
+			                            (size_t)resp->memory_len,
+			                            0, &je);
+			if (action && json_is_object(action) && iid)
+				pb_webhook_dispatch_inline_action(b, iid, action);
+			if (action) json_decref(action);
+			if (sent) json_decref(sent);
+		}
+
 		pb_webhook_ctx_free(ctx);
 		return;
 	}
@@ -4752,6 +4763,382 @@ RPC_CALL_FUNC(pb_rpc_suspend)   { pb_rpc_status_change(client, request, params, 
 RPC_CALL_FUNC(pb_rpc_unsuspend) { pb_rpc_status_change(client, request, params, PB_STATUS_ACTIVE, "active"); }
 RPC_CALL_FUNC(pb_rpc_delete)    { pb_rpc_status_change(client, request, params, PB_STATUS_DELETED, "deleted"); }
 
+/* ===================================================================
+ * Shared cores: behaviours called by gateway op handlers, REST
+ * handlers, AND webhook inline-action dispatch. None of these emit
+ * HTTP/WS responses themselves -- they perform the action and report
+ * success/failure via a small enum (forward-declared above) so each
+ * caller can render the appropriate transport reply.
+ * =================================================================== */
+
+/* Build a tag list from a JSON object {"+tag": "value", ...}. Caller
+ * frees with free_message_tags. */
+static MessageTag *pb_build_tags(json_t *tagj)
+{
+	MessageTag *out = NULL;
+	if (!json_is_object(tagj)) return NULL;
+	const char *key;
+	json_t *val;
+	json_object_foreach(tagj, key, val) {
+		if (!key || key[0] != '+') continue;
+		if (!json_is_string(val)) continue;
+		MessageTag *m = safe_alloc(sizeof(*m));
+		safe_strdup(m->name, key);
+		safe_strdup(m->value, json_string_value(val));
+		AddListItem(m, out);
+	}
+	return out;
+}
+
+/* Replace the bot's published command list. The gateway handler and
+ * REST POST /commands both funnel through here. */
+static PbCoreResult pb_core_register_commands(PbBot *b, json_t *cmds_array)
+{
+	if (!b || !json_is_array(cmds_array)) return PB_CORE_BAD_REQUEST;
+	if (b->commands) json_decref(b->commands);
+	b->commands = json_incref(cmds_array);
+
+	json_t *ack_d = json_object();
+	json_object_set_new(ack_d, "count", json_integer(json_array_size(cmds_array)));
+	pb_dispatch_event(b, "COMMANDS_REGISTERED", ack_d);
+
+	unreal_log(ULOG_INFO, "pushbot", "CMDS_REGISTERED", NULL,
+	           "Bot $nick registered $n slash commands",
+	           log_data_string("nick", b->nick),
+	           log_data_integer("n", (int)json_array_size(cmds_array)));
+	pb_broadcast_bot_event(b, "update");
+	return PB_CORE_OK;
+}
+
+/* Answer a COMMAND_INVOKE interaction. Used by gateway op 21 and REST
+ * POST /interactions/:id/respond and webhook inline send_message /
+ * ephemeral_reply / error / workflow. */
+static PbCoreResult pb_core_interaction_respond(PbBot *b, const char *iid,
+                                                const char *content,
+                                                const char *visibility,
+                                                int ephemeral,
+                                                MessageTag *extra_tags)
+{
+	if (!b || !iid) return PB_CORE_BAD_REQUEST;
+	PbInteraction *it = pb_interaction_find(iid);
+	if (!it) return PB_CORE_NOT_FOUND;
+	if (it->bot != b) return PB_CORE_FORBIDDEN;
+	pb_send_interaction_reply(it, content ? content : "",
+	                          visibility ? visibility : "public",
+	                          ephemeral, extra_tags);
+	pb_interaction_free(it);
+	return PB_CORE_OK;
+}
+
+/* Buy the bot another window of time before the user sees a TIMEOUT
+ * FAIL. */
+static PbCoreResult pb_core_interaction_defer(PbBot *b, const char *iid,
+                                              int seconds)
+{
+	if (!b || !iid) return PB_CORE_BAD_REQUEST;
+	PbInteraction *it = pb_interaction_find(iid);
+	if (!it) return PB_CORE_NOT_FOUND;
+	if (it->bot != b) return PB_CORE_FORBIDDEN;
+	it->expires_at = TStime() + (seconds > 0 ? seconds : PB_INTERACTION_DEFER_SEC);
+	it->deferred = 1;
+	return PB_CORE_OK;
+}
+
+/* Emit a +draft/bot-tools workflow / step / action message. As a side
+ * effect, when the payload references a workflow whose `id` matches a
+ * still-open interaction owned by this bot, slide that interaction's
+ * deadline forward (workflow:start gives the bot the full window, every
+ * step refreshes it). This is what lets a bot answer a slash command
+ * five minutes later as long as it keeps reporting progress. */
+static PbCoreResult pb_core_workflow_event(PbBot *b, const char *target,
+                                           json_t *payload)
+{
+	if (!b || !target || !*target || !json_is_object(payload))
+		return PB_CORE_BAD_REQUEST;
+	json_t *msgj = json_object_get(payload, "msg");
+	if (!json_is_string(msgj)) return PB_CORE_BAD_REQUEST;
+	const char *msg = json_string_value(msgj);
+
+	const char *wid = NULL;
+	if (!strcmp(msg, "workflow")) {
+		json_t *idj = json_object_get(payload, "id");
+		if (json_is_string(idj)) wid = json_string_value(idj);
+	} else if (!strcmp(msg, "step")) {
+		json_t *widj = json_object_get(payload, "wid");
+		if (json_is_string(widj)) wid = json_string_value(widj);
+	}
+
+	if (!strcmp(msg, "workflow")) {
+		json_t *statej = json_object_get(payload, "state");
+		if (json_is_string(statej) && wid) {
+			PbWorkflow *w = pb_workflow_touch(b, wid, target);
+			if (w) {
+				const char *state = json_string_value(statej);
+				if (!strcmp(state, "complete") ||
+				    !strcmp(state, "failed") ||
+				    !strcmp(state, "cancelled"))
+					pb_workflow_terminate(w);
+				/* state=start announces a new workflow. Link it
+				 * to the bot's most-recent still-open
+				 * interaction (FIFO from interactions; LIFO
+				 * after AddListItem) so subsequent step events
+				 * on this wid keep that interaction alive. */
+				else if (!strcmp(state, "start")) {
+					for (PbInteraction *it = interactions; it; it = it->next) {
+						if (it->bot != b) continue;
+						if (it->workflow_id) continue;
+						safe_strdup(it->workflow_id, wid);
+						break;
+					}
+				}
+			}
+		}
+	} else if (!strcmp(msg, "step")) {
+		json_t *sidj = json_object_get(payload, "sid");
+		if (wid && json_is_string(sidj)) {
+			PbWorkflow *w = pb_workflow_touch(b, wid, target);
+			if (w) pb_workflow_remember_sid(w, json_string_value(sidj));
+		}
+	}
+
+	/* Workflow keep-alive: any interaction whose trigger was the
+	 * carrying workflow id gets its deadline pushed forward. The bot
+	 * can call respond() much later as long as steps keep arriving. */
+	if (wid) {
+		for (PbInteraction *it = interactions; it; it = it->next) {
+			if (it->bot != b) continue;
+			if (it->workflow_id && !strcmp(it->workflow_id, wid)) {
+				it->expires_at = TStime() + PB_INTERACTION_WORKFLOW_SEC;
+				it->deferred = 1;
+			}
+		}
+	}
+
+	pb_workflow_send_tag(b, target, payload);
+	return PB_CORE_OK;
+}
+
+/* ===================================================================
+ * REST handlers for the bot-tools surface: POST /commands,
+ * POST /interactions/:id/respond, POST /interactions/:id/defer,
+ * POST /workflows/:id/events.
+ * =================================================================== */
+
+/* Parse the POST body as a JSON object. Owner-pattern: caller
+ * json_decref()s on success; on failure the 400 response is sent and
+ * NULL is returned. */
+static json_t *pb_rest_parse_object(Client *client, WebRequest *web)
+{
+	if (!web->request_buffer) {
+		pb_rest_send_error(client, 400, "missing body");
+		return NULL;
+	}
+	json_error_t err;
+	json_t *body = json_loads(web->request_buffer, 0, &err);
+	if (!body || !json_is_object(body)) {
+		pb_rest_send_error(client, 400, "body must be a JSON object");
+		if (body) json_decref(body);
+		return NULL;
+	}
+	return body;
+}
+
+static void pb_rest_ok(Client *client)
+{
+	json_t *body = json_object();
+	json_object_set_new(body, "ok", json_true());
+	pb_rest_send_json(client, 200, body);
+}
+
+static void pb_rest_core_result(Client *client, PbCoreResult r)
+{
+	switch (r) {
+		case PB_CORE_OK:          pb_rest_ok(client); return;
+		case PB_CORE_BAD_REQUEST: pb_rest_send_error(client, 400, "invalid request"); return;
+		case PB_CORE_NOT_FOUND:   pb_rest_send_error(client, 404, "not found"); return;
+		case PB_CORE_FORBIDDEN:   pb_rest_send_error(client, 403, "forbidden"); return;
+	}
+}
+
+static void pb_rest_register_commands(Client *client, WebRequest *web, PbBot *b)
+{
+	json_t *body = pb_rest_parse_object(client, web);
+	if (!body) return;
+	json_t *cmds = json_object_get(body, "commands");
+	if (!json_is_array(cmds)) {
+		pb_rest_send_error(client, 400, "commands must be an array");
+		json_decref(body);
+		return;
+	}
+	PbCoreResult r = pb_core_register_commands(b, cmds);
+	json_decref(body);
+	pb_rest_core_result(client, r);
+}
+
+static void pb_rest_interaction_respond(Client *client, WebRequest *web,
+                                        PbBot *b, const char *iid)
+{
+	json_t *body = pb_rest_parse_object(client, web);
+	if (!body) return;
+
+	const char *content = "";
+	const char *vis = "public";
+	int ephemeral = 0;
+	json_t *cj = json_object_get(body, "content");
+	if (json_is_string(cj)) content = json_string_value(cj);
+	json_t *vj = json_object_get(body, "visibility");
+	if (json_is_string(vj)) vis = json_string_value(vj);
+	json_t *ej = json_object_get(body, "ephemeral");
+	if (json_is_boolean(ej)) ephemeral = json_is_true(ej) ? 1 : 0;
+
+	MessageTag *extra = pb_build_tags(json_object_get(body, "tags"));
+	PbCoreResult r = pb_core_interaction_respond(b, iid, content, vis,
+	                                             ephemeral, extra);
+	free_message_tags(extra);
+	json_decref(body);
+	pb_rest_core_result(client, r);
+}
+
+static void pb_rest_interaction_defer(Client *client, WebRequest *web,
+                                      PbBot *b, const char *iid)
+{
+	int seconds = 0;
+	if (web->request_buffer && *web->request_buffer) {
+		json_t *body = pb_rest_parse_object(client, web);
+		if (!body) return;
+		json_t *sj = json_object_get(body, "seconds");
+		if (json_is_integer(sj)) seconds = (int)json_integer_value(sj);
+		json_decref(body);
+	}
+	pb_rest_core_result(client, pb_core_interaction_defer(b, iid, seconds));
+}
+
+/* POST /workflows/<id>/events with body {target: "...", payload: {msg:...}}
+ * appends a workflow or step event. The bot can call this an unlimited
+ * number of times between the COMMAND_INVOKE and the final respond. */
+static void pb_rest_workflow_event(Client *client, WebRequest *web,
+                                   PbBot *b, const char *wid_in_path)
+{
+	json_t *body = pb_rest_parse_object(client, web);
+	if (!body) return;
+
+	json_t *tj = json_object_get(body, "target");
+	json_t *payload = json_object_get(body, "payload");
+	if (!json_is_string(tj) || !json_is_object(payload)) {
+		pb_rest_send_error(client, 400, "need {target, payload}");
+		json_decref(body);
+		return;
+	}
+	/* If the payload doesn't already carry an id/wid, inject the one
+	 * from the URL. Lets the bot use the cleaner-looking form
+	 * POST /workflows/wf123/events { target, payload: {msg:"step",sid:"s1",...} }
+	 * without restating the id inside the payload too. */
+	if (wid_in_path && *wid_in_path) {
+		json_t *msgj = json_object_get(payload, "msg");
+		const char *msg = json_is_string(msgj) ? json_string_value(msgj) : "";
+		if (!strcmp(msg, "workflow") && !json_object_get(payload, "id"))
+			json_object_set_new(payload, "id", json_string(wid_in_path));
+		else if (!strcmp(msg, "step") && !json_object_get(payload, "wid"))
+			json_object_set_new(payload, "wid", json_string(wid_in_path));
+	}
+
+	PbCoreResult r = pb_core_workflow_event(b, json_string_value(tj), payload);
+	json_decref(body);
+	pb_rest_core_result(client, r);
+}
+
+/* ===================================================================
+ * Webhook inline-action dispatch.
+ *
+ * Per pushbot spec §9, when a bot in transport=webhook mode handles a
+ * COMMAND_INVOKE delivery, it can answer in the 200 response body with
+ * a JSON object {type: "<action>", ...}. That lets purely-serverless
+ * bots (n8n, Cloudflare Workers, Lambda) reply to slash commands
+ * without ever opening a connection back to the IRCd. The dispatcher
+ * below is called from pb_webhook_response after the HTTP 200 lands.
+ * =================================================================== */
+
+static void pb_webhook_dispatch_inline_action(PbBot *b, const char *iid,
+                                              json_t *action)
+{
+	if (!b || !json_is_object(action)) return;
+	json_t *tj = json_object_get(action, "type");
+	if (!json_is_string(tj)) return;
+	const char *type = json_string_value(tj);
+
+	if (!strcmp(type, "send_message")) {
+		const char *content = "", *vis = "public";
+		int ephemeral = 0;
+		json_t *cj = json_object_get(action, "content");
+		json_t *vj = json_object_get(action, "visibility");
+		json_t *ej = json_object_get(action, "ephemeral");
+		if (json_is_string(cj)) content = json_string_value(cj);
+		if (json_is_string(vj)) vis = json_string_value(vj);
+		if (json_is_true(ej)) ephemeral = 1;
+		MessageTag *extra = pb_build_tags(json_object_get(action, "tags"));
+		if (iid)
+			pb_core_interaction_respond(b, iid, content, vis, ephemeral, extra);
+		free_message_tags(extra);
+	} else if (!strcmp(type, "ephemeral_reply")) {
+		const char *content = "";
+		json_t *cj = json_object_get(action, "content");
+		if (json_is_string(cj)) content = json_string_value(cj);
+		if (iid)
+			pb_core_interaction_respond(b, iid, content, "public", 1, NULL);
+	} else if (!strcmp(type, "error")) {
+		const char *content = "(error)";
+		json_t *mj = json_object_get(action, "message");
+		if (json_is_string(mj)) content = json_string_value(mj);
+		if (iid)
+			pb_core_interaction_respond(b, iid, content, "public", 1, NULL);
+	} else if (!strcmp(type, "defer")) {
+		int seconds = 0;
+		json_t *sj = json_object_get(action, "seconds");
+		if (json_is_integer(sj)) seconds = (int)json_integer_value(sj);
+		if (iid)
+			pb_core_interaction_defer(b, iid, seconds);
+	} else if (!strcmp(type, "workflow") || !strcmp(type, "step")) {
+		/* Inline workflow/step: emit the tag now. Target defaults to
+		 * the channel the interaction was invoked on; the bot can
+		 * override with action.target. */
+		json_t *payload = json_object_get(action, "payload");
+		if (!json_is_object(payload)) {
+			/* Treat top-level fields as the payload itself for the
+			 * convenience case `{type:"workflow", state:"start", id:"..."}`. */
+			payload = json_object();
+			const char *key; json_t *v;
+			json_object_foreach(action, key, v) {
+				if (strcmp(key, "type") && strcmp(key, "target"))
+					json_object_set(payload, key, v);
+			}
+			if (!json_object_get(payload, "msg"))
+				json_object_set_new(payload, "msg", json_string(type));
+			const char *target = NULL;
+			json_t *tjj = json_object_get(action, "target");
+			if (json_is_string(tjj)) target = json_string_value(tjj);
+			if (!target && iid) {
+				PbInteraction *it = pb_interaction_find(iid);
+				if (it) target = it->channel;
+			}
+			if (target)
+				pb_core_workflow_event(b, target, payload);
+			json_decref(payload);
+		} else {
+			const char *target = NULL;
+			json_t *tjj = json_object_get(action, "target");
+			if (json_is_string(tjj)) target = json_string_value(tjj);
+			if (!target && iid) {
+				PbInteraction *it = pb_interaction_find(iid);
+				if (it) target = it->channel;
+			}
+			if (target)
+				pb_core_workflow_event(b, target, payload);
+		}
+	}
+	/* Unknown types are silently ignored: spec is permissive about
+	 * forward-compat extensions. */
+}
+
 static int pb_handle_rest(Client *client, WebRequest *web, PbBot *b)
 {
 	if (!web->uri || strncmp(web->uri, "/pushbot/v1/", 12) != 0) {
@@ -4835,6 +5222,59 @@ static int pb_handle_rest(Client *client, WebRequest *web, PbBot *b)
 				pb_rest_react(client, web, b, channel, msgid, 1, NULL);
 				return 0;
 			}
+		}
+	}
+
+	/* /commands -- publish the bot's slash-command schema */
+	if (!strcmp(path, "commands")) {
+		if (web->method != HTTP_METHOD_POST) {
+			pb_rest_send_error(client, 405, "method not allowed");
+			return 0;
+		}
+		pb_rest_register_commands(client, web, b);
+		return 0;
+	}
+
+	/* /interactions/<id>/respond  and  /interactions/<id>/defer */
+	if (!strncmp(path, "interactions/", 13)) {
+		char rest[256];
+		strlcpy(rest, path + 13, sizeof(rest));
+		char *slash = strchr(rest, '/');
+		char *iid = rest;
+		const char *sub = "";
+		if (slash) { *slash = '\0'; sub = slash + 1; }
+		if (pb_pct_decode(iid) < 0) {
+			pb_rest_send_error(client, 400, "bad id encoding");
+			return 0;
+		}
+		if (!strcmp(sub, "respond") && web->method == HTTP_METHOD_POST) {
+			pb_rest_interaction_respond(client, web, b, iid);
+			return 0;
+		}
+		if (!strcmp(sub, "defer") && web->method == HTTP_METHOD_POST) {
+			pb_rest_interaction_defer(client, web, b, iid);
+			return 0;
+		}
+	}
+
+	/* /workflows/<wid>/events -- emit workflow / step / action tags
+	 * over the life of a long-running task. No 3-second cap here:
+	 * each event also slides the linked interaction's expires_at
+	 * forward via pb_core_workflow_event. */
+	if (!strncmp(path, "workflows/", 10)) {
+		char rest[256];
+		strlcpy(rest, path + 10, sizeof(rest));
+		char *slash = strchr(rest, '/');
+		char *wid = rest;
+		const char *sub = "";
+		if (slash) { *slash = '\0'; sub = slash + 1; }
+		if (pb_pct_decode(wid) < 0) {
+			pb_rest_send_error(client, 400, "bad wid encoding");
+			return 0;
+		}
+		if (!strcmp(sub, "events") && web->method == HTTP_METHOD_POST) {
+			pb_rest_workflow_event(client, web, b, wid);
+			return 0;
 		}
 	}
 
