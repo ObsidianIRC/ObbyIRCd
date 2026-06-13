@@ -237,6 +237,8 @@ if [ -d "$CUSTOM_MOD_DIR" ]; then
             -Wl,-export-dynamic -Wl,-z,relro -Wl,-z,now \
             -o "$out" "$src" \
             -I"$SOURCE_TREE/include" -I"$SOURCE_TREE" \
+            -I"$SOURCE_TREE/extras/c-ares/include" \
+            -I"$SOURCE_TREE/extras/argon2/include" \
             $(pkg-config --cflags openssl 2>/dev/null || true); then
             echo "  -> $out"
             echo "loadmodule \"third/${modname}\";" >> "$CUSTOM_MOD_CONF.tmp"
