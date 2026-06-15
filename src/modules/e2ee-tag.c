@@ -1,22 +1,13 @@
 /*
- *   IRC - Internet Relay Chat, src/modules/e2ee-tag.c
- *   (C) 2026 ObbyIRCd Team
+ * src/modules/e2ee-tag.c
  *
- *   This program is free software; you can redistribute it and/or modify
- *   it under the terms of the GNU General Public License as published by
- *   the Free Software Foundation; either version 1, or (at your option)
- *   any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- */
-
-/* Relays the +obby.world/e2ee client-only tag, the transport for Obby-native
+ * Relays the +obby.world/e2ee client-only tag, the transport for Obby-native
  * end-to-end encryption. The tag value is opaque (base64 of an encrypted blob)
  * and the server never inspects it; it only validates the shape and forwards it
  * to recipients, exactly as it does for +obby.world/invoked-by and +draft/reply.
+ *
+ * License: GPLv3 or later
+ * Copyright (c) 2026 obbyworld Team
  */
 
 #include "unrealircd.h"
@@ -80,7 +71,7 @@ int e2ee_mtag_is_ok(Client *client, const char *name, const char *value)
 
 	for (p = value; *p; p++)
 	{
-		if (!isalnum(*p) && *p != '+' && *p != '/' && *p != '=')
+		if (!isalnum((unsigned char)*p) && *p != '+' && *p != '/' && *p != '=')
 			return 0;
 	}
 
