@@ -1417,7 +1417,7 @@ static int persist_usermsg(Client *client, Client *to, MessageTag *mtags,
 	PersistEntry *e;
 	PersistSession *sess;
 
-	if (!IsUser(to) || !IsLoggedIn(to) || sendtype == SEND_TYPE_TAGMSG)
+	if (!IsUser(to) || !IsLoggedIn(to))
 		return 0;
 
 	e = find_entry(to->user->account);
@@ -1431,6 +1431,22 @@ static int persist_usermsg(Client *client, Client *to, MessageTag *mtags,
 		 * one's own sessions, e.g. testing /msg myself). */
 		if (sess->client == current_session_sender)
 			continue;
+		/* TAGMSG carries no text body and is only meaningful to a
+		 * message-tags-aware client.  A nick-targeted TAGMSG (bot-cmds
+		 * replies, typing, reactions) reaches only the canonical via
+		 * the normal user-message path, so mirror it here -- otherwise
+		 * a multi-session account's other connections never see it. */
+		if (sendtype == SEND_TYPE_TAGMSG)
+		{
+			if (!HasCapability(sess->client, "message-tags"))
+				continue;
+			sendto_one(sess->client, mtags, ":%s!%s@%s TAGMSG %s",
+			           client->name,
+			           IsUser(client) ? client->user->username : "*",
+			           IsUser(client) ? GetHost(client) : me.name,
+			           to->name);
+			continue;
+		}
 		sendto_one(sess->client, mtags, ":%s!%s@%s %s %s :%s",
 		           client->name,
 		           IsUser(client) ? client->user->username : "*",
