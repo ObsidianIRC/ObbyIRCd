@@ -2746,6 +2746,40 @@ static void pb_botcmds_batch_remove(PbBotCmdsBatch *b)
 	safe_free(b);
 }
 
+/* Deliver a bot-cmds BATCH frame to `target` and every persistence session
+ * attached to the same account.  A nick-targeted batch otherwise reaches only
+ * the canonical connection, so a multi-session user never sees the bot-cmds
+ * reply on their other clients.  Sessions are discovered through the
+ * account_canonical moddata persistence exposes (the canonical points at
+ * itself, each session at its canonical); with persistence absent the frame
+ * goes to the single target exactly as before. */
+static void pb_botcmds_batch_frame(Client *from, Client *target, const char *batcharg)
+{
+	ModDataInfo *canon = findmoddata_byname("account_canonical", MODDATATYPE_CLIENT);
+	Client *anchor = canon ? moddata_client(target, canon).ptr : NULL;
+	int sent = 0;
+
+	if (anchor)
+	{
+		Client *c;
+		list_for_each_entry(c, &lclient_list, lclient_node)
+		{
+			if (!MyUser(c) || !IsUser(c))
+				continue;
+			if (moddata_client(c, canon).ptr != anchor)
+				continue;
+			if (!HasCapability(c, "batch") || !HasCapability(c, "message-tags"))
+				continue;
+			sendto_prefix_one(c, from, NULL, ":%s BATCH %s", from->name, batcharg);
+			sent = 1;
+		}
+	}
+
+	if (!sent && MyUser(target) &&
+	    HasCapability(target, "batch") && HasCapability(target, "message-tags"))
+		sendto_prefix_one(target, from, NULL, ":%s BATCH %s", from->name, batcharg);
+}
+
 /* BATCH override: claim draft/bot-cmds so cmd_batch doesn't reject it
  * as UNKNOWN_TYPE. Syntax: BATCH +ref draft/bot-cmds <target>. */
 CMD_OVERRIDE_FUNC(pb_override_batch)
@@ -2789,10 +2823,10 @@ CMD_OVERRIDE_FUNC(pb_override_batch)
 		b->opener = client;
 		AddListItem(b, pb_botcmds_batches);
 
-		if (MyUser(target) && HasCapability(target, "batch") && HasCapability(target, "message-tags"))
 		{
-			sendto_prefix_one(target, client, NULL, ":%s BATCH %s draft/bot-cmds",
-			                  client->name, parv[1]);
+			char batcharg[128];
+			ircsnprintf(batcharg, sizeof(batcharg), "%s draft/bot-cmds", parv[1]);
+			pb_botcmds_batch_frame(client, target, batcharg);
 		}
 		return;
 	}
@@ -2806,11 +2840,8 @@ CMD_OVERRIDE_FUNC(pb_override_batch)
 			return;
 		}
 		Client *target = find_user(b->target_nick, NULL);
-		if (target && MyUser(target) && HasCapability(target, "batch"))
-		{
-			sendto_prefix_one(target, client, NULL, ":%s BATCH %s",
-			                  client->name, parv[1]);
-		}
+		if (target)
+			pb_botcmds_batch_frame(client, target, parv[1]);
 		pb_botcmds_batch_remove(b);
 		return;
 	}
