@@ -25,10 +25,12 @@ copy dlltool.exe \users\user\worker\unreal6-w10\build /y
 rem for appveyor, use: cd \projects\unrealircd
 cd \users\user\worker\unreal6-w10\build
 
-rem Install 'unrealircd-tests'
+rem Install 'unrealircd-tests'.  Pin matches extras/build-tests/nix/run-tests.
 cd ..
 rd /q/s unrealircd-tests
 git clone -q --branch unreal60 https://github.com/unrealircd/unrealircd-tests.git unrealircd-tests
+if %ERRORLEVEL% NEQ 0 EXIT /B 1
+git -C unrealircd-tests -c advice.detachedHead=false checkout -q df7b6cd4c5e4a0968dd6f6560c02f6e01819ca56
 if %ERRORLEVEL% NEQ 0 EXIT /B 1
 cd build
 

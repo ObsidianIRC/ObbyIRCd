@@ -12,10 +12,13 @@ set -x
 # Kill old instances
 killall -9 obbyircd || true
 
-# Install 'unrealircd-tests'
+# unrealircd-tests, pinned: unreal60 HEAD uses crule functions this fork lacks
+# (server_flood_count); bump after merging those crules from upstream.
+UNREALIRCD_TESTS_PIN=df7b6cd4c5e4a0968dd6f6560c02f6e01819ca56
 rm -rf unrealircd-tests/
 git clone -q --branch unreal60 https://github.com/unrealircd/unrealircd-tests.git unrealircd-tests
 cd unrealircd-tests
+git -c advice.detachedHead=false checkout -q "$UNREALIRCD_TESTS_PIN"
 
 # The upstream test harness boots the server via 'bin/unrealircd' and reads
 # 'data/unrealircd.pid'. ObbyIRCd renamed the binary/pidfile to obbyircd, so
