@@ -1361,7 +1361,7 @@ MessageTag *duplicate_mtags(MessageTag *mtags)
 
 /** Duplicate a message tag list, excluding tags with MTAG_HANDLER_FLAGS_FIRST_ONLY.
  * Used to build the tag set for subsequent lines (lines 2..N),
- * where tags like msgid and +draft/reply should not be repeated.
+ * where tags like msgid, +reply and +draft/reply should not be repeated.
  */
 MessageTag *duplicate_mtags_for_subsequent_lines(MessageTag *mtags)
 {
@@ -1512,6 +1512,15 @@ int get_floodprot_channel_max_lines_default_handler(Channel *channel)
 int floodprot_check_multiline_batch_default_handler(Channel *channel, Client *client, int line_count)
 {
 	return 0;
+}
+
+int channel_flood_blocked_count_default_handler(Client *client, const char *type)
+{
+	return 0;
+}
+
+void channel_flood_expand_json_default_handler(json_t *root, Client *client)
+{
 }
 
 int make_oper_default_handler(Client *client, const char *operblock_name, const char *operclass,
@@ -2967,7 +2976,7 @@ const char *command_issued_by_rpc(MessageTag *mtags)
 /** Is 's' a valid spamfilter id? A-Z, 0-9 and _ and with a max length. */
 int valid_spamfilter_id(const char *s)
 {
-	if (strlen(s) > MAXSPAMFILTERIDLEN)
+	if (strlen(s) >= TKLIDLEN)
 		return 0;
 	return 1;
 }

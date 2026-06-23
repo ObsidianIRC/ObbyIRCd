@@ -428,6 +428,7 @@ static void init_history_storage(ModuleInfo *modinfo)
 	cap.name = "unrealircd.org/history-storage";
 	cap.flags = CLICAP_FLAGS_ADVERTISE_ONLY;
 	cap.parameter = history_storage_capability_parameter;
+	cap.minimum_cap_version = 302;
 	ClientCapabilityAdd(modinfo->handle, &cap, NULL);
 }
 
@@ -893,6 +894,7 @@ static int hbm_return_after(HistoryResult *r, HistoryLogObject *h, HistoryFilter
 	HistoryLogLine *l, *n;
 	int written = 0;
 	int started = 0;
+	int reached_end = 1;
 	MessageTag *m;
 
 	for (l = h->head; l; l = l->next)
@@ -922,14 +924,20 @@ static int hbm_return_after(HistoryResult *r, HistoryLogObject *h, HistoryFilter
 				break;
 			}
 
+			/* Limit reached but there are more lines available */
+			if (written >= filter->limit)
+			{
+				reached_end = 0;
+				break;
+			}
 			/* Add line to the return buffer */
 			n = duplicate_log_line(l);
 			hbm_result_append_line(r, n);
-			if (++written >= filter->limit)
-				break;
+			written++;
 		}
 	}
 
+	r->reached_end = reached_end;
 	return written;
 }
 
@@ -946,6 +954,7 @@ static int hbm_return_before(HistoryResult *r, HistoryLogObject *h, HistoryFilte
 	HistoryLogLine *l, *n;
 	int written = 0;
 	int started = 0;
+	int reached_end = 1;
 	MessageTag *m;
 
 	for (l = h->tail; l; l = l->prev)
@@ -975,14 +984,20 @@ static int hbm_return_before(HistoryResult *r, HistoryLogObject *h, HistoryFilte
 				break;
 			}
 
+			/* Limit reached but there are more lines available */
+			if (written >= filter->limit)
+			{
+				reached_end = 0;
+				break;
+			}
 			/* Add line to the return buffer */
 			n = duplicate_log_line(l);
 			hbm_result_prepend_line(r, n);
-			if (++written >= filter->limit)
-				break;
+			written++;
 		}
 	}
 
+	r->reached_end = reached_end;
 	return written;
 }
 
@@ -997,6 +1012,7 @@ static int hbm_return_latest(HistoryResult *r, HistoryLogObject *h, HistoryFilte
 {
 	HistoryLogLine *l, *n;
 	int written = 0;
+	int reached_end = 1;
 	MessageTag *m;
 
 	for (l = h->tail; l; l = l->prev)
@@ -1007,12 +1023,18 @@ static int hbm_return_latest(HistoryResult *r, HistoryLogObject *h, HistoryFilte
 		if (filter->msgid_a && !strcmp(l->msgid, filter->msgid_a))
 			break; /* Stop now */
 
+		/* Limit reached but there are more lines available */
+		if (written >= filter->limit)
+		{
+			reached_end = 0;
+			break;
+		}
 		n = duplicate_log_line(l);
 		hbm_result_prepend_line(r, n);
-		if (++written >= filter->limit)
-			break;
+		written++;
 	}
 
+	r->reached_end = reached_end;
 	return written;
 }
 
@@ -1268,8 +1290,9 @@ static int hbm_return_between(HistoryResult *r, HistoryLogObject *h, HistoryFilt
 		f.msgid_b = filter->msgid_a;
 		return hbm_return_after(r, h, &f);
 	}
-	/* else direction is -1 which means not found / invalid */
 
+	/* else direction is -1 which means not found / invalid */
+	r->reached_end = 1;
 	return 0;
 }
 

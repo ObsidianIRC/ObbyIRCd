@@ -271,7 +271,7 @@ void _join_channel(Channel *channel, Client *client, MessageTag *recv_mtags, con
 		parv[0] = NULL;
 		parv[1] = channel->name;
 		parv[2] = NULL;
-		if (!HasCapability(client,"draft/no-implicit-names") /* && !HasCapability(client, "no-implicit-names") */)
+		if (!HasCapability(client,"draft/no-implicit-names") && !HasCapability(client, "no-implicit-names"))
 			do_cmd(client, NULL, "NAMES", 2, parv);;
 
 		unreal_log(ULOG_INFO, "join", "LOCAL_CLIENT_JOIN", client,
@@ -487,6 +487,7 @@ void _do_join(Client *client, int parc, const char *parv[])
 			}
 			if (!ValidatePermissionsForPath("immune:server-ban:deny-channel",client,NULL,NULL,NULL) && (tklban = find_qline(client, name, &ishold)))
 			{
+				tkl_hit(client, tklban);
 				sendnumeric(client, ERR_FORBIDDENCHANNEL, name, tklban->ptr.nameban->reason);
 				continue;
 			}

@@ -73,6 +73,9 @@ TKL *(*tkl_add_banexception)(int type, const char *usermask, const char *hostmas
 void (*tkl_del_line)(TKL *tkl);
 void (*tkl_check_local_remove_shun)(TKL *tmp);
 int (*find_tkline_match)(Client *client, int skip_soft);
+void (*tkl_hit)(Client *client, TKL *tkl);
+void (*remove_config_tkls)(int flag);
+void (*config_tkl_hits_restore)(void);
 int (*find_shun)(Client *client);
 int(*find_spamfilter_user)(Client *client, int flags);
 TKL *(*find_qline)(Client *client, const char *nick, int *ishold);
@@ -83,6 +86,7 @@ void (*cmd_tkl)(ClientContext *clictx, Client *client, MessageTag *mtags, int pa
 int (*take_action)(Client *client, BanAction *action, const char *reason, long duration, int take_action_flags, int *stopped);
 int (*match_spamfilter)(Client *client, const char *str_in, int type, const char *cmd, const char *target, int flags, ClientContext *clictx, TKL **rettk);
 int (*match_spamfilter_mtags)(Client *client, MessageTag *mtags, const char *cmd);
+void (*run_deferred_rule_only_spamfilters)(Client *client);
 int (*join_viruschan)(Client *client, TKL *tk, int type);
 const char *(*StripColors)(const char *text);
 void (*spamfilter_build_user_string)(char *buf, const char *nick, Client *client);
@@ -184,7 +188,7 @@ int (*decode_authenticate_plain)(const char *param, char **authorization_id, cha
 void (*exit_client)(Client *client, MessageTag *recv_mtags, const char *comment);
 void (*exit_client_fmt)(Client *client, MessageTag *recv_mtags, FORMAT_STRING(const char *pattern), ...);
 void (*exit_client_ex)(Client *client, Client *origin, MessageTag *recv_mtags, const char *comment);
-void (*banned_client)(Client *client, const char *bantype, const char *reason, int global, int noexit);
+void (*banned_client)(Client *client, const char *bantype, const char *reason, const char *tklid, int global, int noexit);
 char *(*unreal_expand_string)(const char *str, char *buf, size_t buflen, NameValuePrioList *nvp, int buildvarstring_options, Client *client);
 char *(*utf8_convert_confusables)(const char *i, char *obuf, int olen);
 const char *(*utf8_get_block_name)(int i);
@@ -194,6 +198,8 @@ void (*isupport_check_for_changes)(void);
 int (*get_connections_from_ip)(Client *client);
 int (*get_floodprot_channel_max_lines)(Channel *channel);
 int (*floodprot_check_multiline_batch)(Channel *channel, Client *client, int line_count);
+int (*channel_flood_blocked_count)(Client *client, const char *type);
+void (*channel_flood_expand_json)(json_t *root, Client *client);
 
 Efunction *EfunctionAddMain(Module *module, EfunctionType eftype, int (*func)(), void (*vfunc)(), void *(*pvfunc)(), char *(*stringfunc)(), const char *(*conststringfunc)())
 {
@@ -422,6 +428,9 @@ void efunctions_init(void)
 	efunc_init_function(EFUNC_TKL_DEL_LINE, tkl_del_line, NULL, 0);
 	efunc_init_function(EFUNC_TKL_CHECK_LOCAL_REMOVE_SHUN, tkl_check_local_remove_shun, NULL, 0);
 	efunc_init_function(EFUNC_FIND_TKLINE_MATCH, find_tkline_match, NULL, 0);
+	efunc_init_function(EFUNC_TKL_HIT, tkl_hit, NULL, 0);
+	efunc_init_function(EFUNC_REMOVE_CONFIG_TKLS, remove_config_tkls, NULL, 0);
+	efunc_init_function(EFUNC_CONFIG_TKL_HITS_RESTORE, config_tkl_hits_restore, NULL, 0);
 	efunc_init_function(EFUNC_FIND_SHUN, find_shun, NULL, 0);
 	efunc_init_function(EFUNC_FIND_SPAMFILTER_USER, find_spamfilter_user, NULL, 0);
 	efunc_init_function(EFUNC_FIND_QLINE, find_qline, NULL, 0);
@@ -432,6 +441,7 @@ void efunctions_init(void)
 	efunc_init_function(EFUNC_TAKE_ACTION, take_action, NULL, 0);
 	efunc_init_function(EFUNC_MATCH_SPAMFILTER, match_spamfilter, NULL, 0);
 	efunc_init_function(EFUNC_MATCH_SPAMFILTER_MTAGS, match_spamfilter_mtags, NULL, 0);
+	efunc_init_function(EFUNC_RUN_DEFERRED_RULE_ONLY_SPAMFILTERS, run_deferred_rule_only_spamfilters, NULL, 0);
 	efunc_init_function(EFUNC_JOIN_VIRUSCHAN, join_viruschan, NULL, 0);
 	efunc_init_function(EFUNC_STRIPCOLORS, StripColors, NULL, 0);
 	efunc_init_function(EFUNC_SPAMFILTER_BUILD_USER_STRING, spamfilter_build_user_string, NULL, 0);
@@ -550,4 +560,6 @@ void efunctions_init(void)
 	efunc_init_function(EFUNC_GET_CONNECTIONS_FROM_IP, get_connections_from_ip, get_connections_from_ip_default_handler, 0);
 	efunc_init_function(EFUNC_GET_FLOODPROT_CHANNEL_MAX_LINES, get_floodprot_channel_max_lines, get_floodprot_channel_max_lines_default_handler, 0);
 	efunc_init_function(EFUNC_FLOODPROT_CHECK_MULTILINE_BATCH, floodprot_check_multiline_batch, floodprot_check_multiline_batch_default_handler, 0);
+	efunc_init_function(EFUNC_CHANNEL_FLOOD_BLOCKED_COUNT, channel_flood_blocked_count, channel_flood_blocked_count_default_handler, 0);
+	efunc_init_function(EFUNC_CHANNEL_FLOOD_EXPAND_JSON, channel_flood_expand_json, channel_flood_expand_json_default_handler, 0);
 }

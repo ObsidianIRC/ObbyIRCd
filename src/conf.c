@@ -201,8 +201,7 @@ int reloadable_perm_module_unloaded(void);
 int tls_tests(void);
 
 /* Conf sub-sub-functions */
-void test_tlsblock(ConfigFile *conf, ConfigEntry *cep, int *totalerrors);
-void conf_tlsblock(ConfigFile *conf, ConfigEntry *cep, TLSOptions *tlsoptions);
+void conf_tlsblock(ConfigFile *conf, ConfigEntry *cep, TLSOptions *tlsoptions, TLSOptions *inherit_from);
 void free_tls_options(TLSOptions *tlsoptions);
 
 /*
@@ -248,6 +247,7 @@ Configuration		iConf;
 Configuration		tempiConf;
 BestPractices		bestpractices;
 MODVAR ConfigFile		*conf = NULL;
+static ConfigEntry	*server_linking_tlsoptions_ce = NULL; /* Hack to get set::server-linking::tls-options */
 extern NameValueList *config_defines;
 MODVAR int ipv6_disabled = 0;
 MODVAR Client *remote_rehash_client = NULL;
@@ -274,7 +274,6 @@ int rehash_internal(Client *client);
 int is_blacklisted_module(const char *name);
 int modules_default_conf_modified(const char *filebuf);
 int config_item_allowed_for_config_file(const char *resource, const char *item);
-void remove_config_tkls(int flag);
 void free_operclass_struct(OperClass *o);
 
 /** Return the printable string of a 'cep' location, such as set::something::xyz */
@@ -726,11 +725,12 @@ void chmode_str(struct ChMode *modes, char *mbuf, char *pbuf, size_t mbuf_size, 
 {
 	Cmode *cm;
 
-	if (!(mbuf_size && pbuf_size))
+	if ((mbuf_size < 2) || !pbuf_size)
 		return;
 
 	*pbuf = 0;
 	*mbuf++ = '+';
+	mbuf_size--;
 
 	for (cm=channelmodes; cm; cm = cm->next)
 	{
@@ -1771,6 +1771,8 @@ void free_iConf(Configuration *i)
 	free_tls_options(i->tls_options);
 	i->tls_options = NULL;
 	safe_free(i->tls_options);
+	free_tls_options(i->server_linking_tls_options);
+	i->server_linking_tls_options = NULL;
 	safe_free_multiline(i->plaintext_policy_user_message);
 	safe_free_multiline(i->plaintext_policy_oper_message);
 	safe_free(i->outdated_tls_policy_user_message);
@@ -1906,6 +1908,7 @@ void config_setdefaultsettings(Configuration *i)
 	add_log_throttle_config(&i->log_throttle, "BUG_CT_BUCKET_MISSING", 5, 60, 0);
 	add_log_throttle_config(&i->log_throttle, "BUG_CT_NEGATIVE_COUNTER", 5, 60, 0);
 	add_log_throttle_config(&i->log_throttle, "BUG_DECREASE_IPUSERS_BUCKET", 5, 60, 0);
+	add_log_throttle_config(&i->log_throttle, "SPAMFILTER_REGEX_ERROR", 5, 60, 0);
 
 	/* TLS options */
 	i->tls_options = safe_alloc(sizeof(TLSOptions));
@@ -1921,6 +1924,9 @@ void config_setdefaultsettings(Configuration *i)
 	 */
 	safe_strdup(i->tls_options->outdated_ciphers, "AES*,RC4*,DES*");
 	i->tls_options->certificate_expiry_notification = 1;
+	i->server_linking_tls_options = NULL; /* set::server-linking::tls-options, not configured by default */
+	i->server_linking_mixed_certificates = 0;
+	i->server_linking_allow_ca_certificate = 0;
 	i->plaintext_policy_user = POLICY_ALLOW;
 	i->plaintext_policy_oper = POLICY_DENY;
 	i->plaintext_policy_server = POLICY_DENY;
@@ -1934,8 +1940,8 @@ void config_setdefaultsettings(Configuration *i)
 	safe_strdup(i->reject_message_too_many_new_connections_ipv6_range, "Too many new connections from this IPv6 range ($prefix_addr/$prefix_len) [connthrottle]");
 	safe_strdup(i->reject_message_server_full, "This server is full");
 	safe_strdup(i->reject_message_unauthorized, "You are not authorized to connect to this server");
-	safe_strdup(i->reject_message_kline, "You are not welcome on this server. $bantype: $banreason. Email $klineaddr for more information.");
-	safe_strdup(i->reject_message_gline, "You are not welcome on this network. $bantype: $banreason. Email $glineaddr for more information.");
+	safe_strdup(i->reject_message_kline, "You are not welcome on this server. $bantype: $banreason. Email $klineaddr for more information. $banid");
+	safe_strdup(i->reject_message_gline, "You are not welcome on this network. $bantype: $banreason. Email $glineaddr for more information. $banid");
 
 	i->topic_setter = SETTER_NICK_USER_HOST;
 	i->ban_setter = SETTER_NICK_USER_HOST;
@@ -2101,6 +2107,8 @@ void postconf(void)
 		           log_data_integer("port", bestpractices.listen_nontls_port));
 		bestpractices.listen_nontls_port_hits++;
 	}
+
+	RunHook(HOOKTYPE_POSTCONF);
 }
 
 int isanyserverlinked(void)
@@ -2558,41 +2566,6 @@ int config_read_file(const char *filename, const char *display_name)
 	}
 }
 
-/** Remove all TKL's that were added by the config file(s).
- * This is done after config passed testing and right before
- * adding the (new) entries.
- */
-void remove_config_tkls(int flag)
-{
-	TKL *tk, *tk_next;
-	int index, index2;
-
-	/* IP hashed TKL list */
-	for (index = 0; index < TKLIPHASHLEN1; index++)
-	{
-		for (index2 = 0; index2 < TKLIPHASHLEN2; index2++)
-		{
-			for (tk = tklines_ip_hash[index][index2]; tk; tk = tk_next)
-			{
-				tk_next = tk->next;
-				if (tk->flags & flag)
-					tkl_del_line(tk);
-			}
-		}
-	}
-
-	/* Generic TKL list */
-	for (index = 0; index < TKLISTLEN; index++)
-	{
-		for (tk = tklines[index]; tk; tk = tk_next)
-		{
-			tk_next = tk->next;
-			if (tk->flags & flag)
-				tkl_del_line(tk);
-		}
-	}
-}
-
 void free_proxy_block(ConfigItem_proxy *e)
 {
 	free_security_group(e->mask);
@@ -2757,8 +2730,6 @@ void config_rehash()
 		DelListItem(tld_ptr, conf_tld);
 		safe_free(tld_ptr);
 	}
-
-	remove_config_tkls(TKL_FLAG_CONFIG);
 
 	for (deny_version_ptr = conf_deny_version; deny_version_ptr; deny_version_ptr = (ConfigItem_deny_version *) next) {
 		next = (ListStruct *)deny_version_ptr->next;
@@ -2966,6 +2937,8 @@ int config_item_allowed_for_config_file(const char *resource, const char *item)
 		/* Special hardcoded handling for central spamfilter */
 		if (!strcmp(resource, "central_spamfilter.conf"))
 		{
+			if (!item)
+				return 0;
 			if (!strcmp(item, "spamfilter") ||
 			    !strcmp(item, "ban"))
 				return 1;
@@ -2982,7 +2955,7 @@ int config_item_allowed_for_config_file(const char *resource, const char *item)
 	if (rs->restrict_config == NULL)
 		return 1; /* No restrictions */
 
-	if (item == NULL)
+	if (!item)
 		return 0;
 
 	if (find_name_list(rs->restrict_config, item))
@@ -3199,6 +3172,15 @@ int config_run_blocks_generic(ConfigFile *cfptr, int skip_priority_blocks)
 	return processed;
 }
 
+/** Remember the set::server-linking::tls-options block so core can work on it
+ * after all the other set blocks have been processed (ordering issue).
+ * This is a bit of a hack, but... yeah...
+ */
+void set_server_linking_tlsoptions_ce(ConfigEntry *ce)
+{
+	server_linking_tlsoptions_ce = ce;
+}
+
 int config_run_blocks(void)
 {
 	ConfigEntry 	*ce;
@@ -3208,6 +3190,8 @@ int config_run_blocks(void)
 	int i;
 	Hook *h;
 	ConfigItem_allow *allow;
+
+	server_linking_tlsoptions_ce = NULL; /* processed late, see the set:: handling below */
 
 	/* Stage 1: first the priority blocks, in the order as specified
 	 *          in config_run_priority_blocks[]
@@ -3257,6 +3241,23 @@ int config_run_blocks(void)
 				add_name_list(tempiConf.tls_options->certificate_files, tmp);
 				snprintf(tmp, sizeof(tmp), "%s/tls/server.key.pem", CONFDIR);
 				add_name_list(tempiConf.tls_options->key_files, tmp);
+			}
+
+			/* And NOW that set::tls is fully done (including the default
+			 * certificate above), process set::server-linking::tls-options.
+			 * We do this here and not at parse time in _conf_set(), because
+			 * this could inherit from set::tls, so we have to do it in this
+			 * particular order.
+			 */
+			if (server_linking_tlsoptions_ce)
+			{
+				tempiConf.server_linking_tls_options = safe_alloc(sizeof(TLSOptions));
+				conf_tlsblock(conf, server_linking_tlsoptions_ce, tempiConf.server_linking_tls_options, tempiConf.tls_options);
+				server_linking_tlsoptions_ce = NULL;
+				/* ctx_link_server and ctx_link_client is
+				 * created/updated by init_tls() and reinit_tls(). Those
+				 * also compute the cached spkifp.
+				 */
 			}
 		}
 	}
@@ -3602,6 +3603,24 @@ void convert_to_absolute_path(char **path, const char *reldir)
 	sprintf(s, "%s/%s", reldir, *path); /* safe, see line above */
 	safe_free(*path);
 	*path = s;
+}
+
+/** Return 'path' relative to 'reldir' if it lives below it, otherwise return
+ * 'path' unchanged (absolute path, URL, etc).
+ * This can be used to turn a path into relative again if convert_to_absolute_path()
+ * previously worked on it.
+ * @returns a pointer into 'path' (read-only).
+ */
+const char *display_path(const char *path, const char *reldir)
+{
+	size_t len;
+
+	if (!path || !reldir)
+		return path;
+	len = strlen(reldir);
+	if (!strncmp(path, reldir, len) && (path[len] == '/' || path[len] == '\\'))
+		return path + len + 1;
+	return path;
 }
 
 /* Similar to convert_to_absolute_path() but returns a duplicated string.
@@ -5596,9 +5615,15 @@ void conf_listen_configure(const char *ip, int port, SocketType socket_type, int
 	if (tlsconfig)
 	{
 		listen->tls_options = safe_alloc(sizeof(TLSOptions));
-		conf_tlsblock(conf, tlsconfig, listen->tls_options);
+		conf_tlsblock(conf, tlsconfig, listen->tls_options,
+		              ((options & LISTENER_SERVERSONLY) && tempiConf.server_linking_tls_options) ?
+		              tempiConf.server_linking_tls_options : tempiConf.tls_options);
 		listen->ssl_ctx = init_ctx(listen->tls_options, 1);
 	}
+	/* A serversonly listener with no tls-options of its own uses the shared
+	 * set::server-linking context at runtime (tls_ctx_for_listener()), so we
+	 * deliberately do NOT build a per-listener context here.
+	 */
 
 	/* For modules that hook CONFIG_LISTEN and CONFIG_LISTEN_OPTIONS.
 	 * Yeah, ugly we have this here..
@@ -6418,13 +6443,22 @@ int	_test_allow_channel(ConfigFile *conf, ConfigEntry *ce)
 
 	for (cep = ce->items; cep; cep = cep->next)
 	{
-		if (config_is_blankorempty(cep, "allow channel"))
+		if (!strcmp(cep->name, "match"))
+		{
+			has_match = 1;
+			test_match_block(conf, cep, &errors);
+		}
+		else if (!strcmp(cep->name, "mask"))
+		{
+			has_mask = 1;
+			test_match_block(conf, cep, &errors);
+		}
+		else if (config_is_blankorempty(cep, "allow channel"))
 		{
 			errors++;
 			continue;
 		}
-
-		if (!strcmp(cep->name, "channel"))
+		else if (!strcmp(cep->name, "channel"))
 		{
 			has_channel = 1;
 		}
@@ -6438,16 +6472,6 @@ int	_test_allow_channel(ConfigFile *conf, ConfigEntry *ce)
 				continue;
 			}
 			has_class = 1;
-		}
-		else if (!strcmp(cep->name, "match"))
-		{
-			has_match = 1;
-			test_match_block(conf, cep, &errors);
-		}
-		else if (!strcmp(cep->name, "mask"))
-		{
-			has_mask = 1;
-			test_match_block(conf, cep, &errors);
 		}
 		else
 		{
@@ -6601,7 +6625,7 @@ int	_conf_sni(ConfigFile *conf, ConfigEntry *ce)
 	sni = safe_alloc(sizeof(ConfigItem_listen));
 	safe_strdup(sni->name, name);
 	sni->tls_options = safe_alloc(sizeof(TLSOptions));
-	conf_tlsblock(conf, tlsconfig, sni->tls_options);
+	conf_tlsblock(conf, tlsconfig, sni->tls_options, tempiConf.tls_options);
 	sni->ssl_ctx = init_ctx(sni->tls_options, 1);
 	AddListItem(sni, conf_sni);
 
@@ -6703,7 +6727,9 @@ int	_conf_link(ConfigFile *conf, ConfigEntry *ce)
 				else if (!strcmp(cepp->name, "ssl-options") || !strcmp(cepp->name, "tls-options"))
 				{
 					link->tls_options = safe_alloc(sizeof(TLSOptions));
-					conf_tlsblock(conf, cepp, link->tls_options);
+					conf_tlsblock(conf, cepp, link->tls_options,
+					              tempiConf.server_linking_tls_options ?
+					              tempiConf.server_linking_tls_options : tempiConf.tls_options);
 					link->ssl_ctx = init_ctx(link->tls_options, 0);
 				}
 			}
@@ -6748,6 +6774,11 @@ int	_conf_link(ConfigFile *conf, ConfigEntry *ce)
 	/* The default is 'hub *', unless you specify leaf or hub manually. */
 	if (!link->hub && !link->leaf)
 		safe_strdup(link->hub, "*");
+
+	/* An outgoing link with no link::outgoing::tls-options of its own uses the
+	 * shared set::server-linking context at connect time
+	 * (tls_ctx_for_outgoing_link()), so we do NOT build a per-link context here.
+	 */
 
 	AppendListItem(link, conf_link);
 	return 0;
@@ -7648,7 +7679,7 @@ void test_tlsblock(ConfigFile *conf, ConfigEntry *cep, int *totalerrors)
 		TLSOptions *tlsoptions = safe_alloc(sizeof(TLSOptions));
 		SSL_CTX *ctx;
 
-		conf_tlsblock(conf, cep, tlsoptions);
+		conf_tlsblock(conf, cep, tlsoptions, tempiConf.tls_options);
 		ctx = init_ctx(tlsoptions, 1);
 		free_tls_options(tlsoptions);
 
@@ -7668,6 +7699,7 @@ void free_tls_options(TLSOptions *tlsoptions)
 
 	safe_free_name_list(tlsoptions->certificate_files);
 	safe_free_name_list(tlsoptions->key_files);
+	safe_free_name_list(tlsoptions->spkifp);
 	safe_free(tlsoptions->trusted_ca_file);
 	safe_free(tlsoptions->ciphers);
 	safe_free(tlsoptions->ciphersuites);
@@ -7679,31 +7711,34 @@ void free_tls_options(TLSOptions *tlsoptions)
 	safe_free(tlsoptions);
 }
 
-void conf_tlsblock(ConfigFile *conf, ConfigEntry *cep, TLSOptions *tlsoptions)
+void conf_tlsblock(ConfigFile *conf, ConfigEntry *cep, TLSOptions *tlsoptions, TLSOptions *inherit_from)
 {
 	ConfigEntry *cepp, *ceppp;
 	NameValue *ofl;
 
-	/* First, inherit settings from set::options::tls */
-	if (tlsoptions != tempiConf.tls_options)
+	/* First, inherit settings from the base TLS options (inherit_from).
+	 * This is either set::tls (the usual case), or for link blocks and
+	 * serversonly listeners it's set::server-linking::tls-options.
+	 */
+	if (tlsoptions != inherit_from)
 	{
 		// certificate_files: done at end of function
 		// key_files: done at end of function
-		safe_strdup(tlsoptions->trusted_ca_file, tempiConf.tls_options->trusted_ca_file);
-		tlsoptions->protocols = tempiConf.tls_options->protocols;
-		safe_strdup(tlsoptions->ciphers, tempiConf.tls_options->ciphers);
-		safe_strdup(tlsoptions->ciphersuites, tempiConf.tls_options->ciphersuites);
-		safe_strdup(tlsoptions->groups, tempiConf.tls_options->groups);
-		safe_strdup(tlsoptions->signature_algorithms, tempiConf.tls_options->signature_algorithms);
-		safe_strdup(tlsoptions->outdated_protocols, tempiConf.tls_options->outdated_protocols);
-		safe_strdup(tlsoptions->outdated_ciphers, tempiConf.tls_options->outdated_ciphers);
-		tlsoptions->options = tempiConf.tls_options->options;
-		tlsoptions->renegotiate_bytes = tempiConf.tls_options->renegotiate_bytes;
-		tlsoptions->renegotiate_timeout = tempiConf.tls_options->renegotiate_timeout;
-		tlsoptions->sts_port = tempiConf.tls_options->sts_port;
-		tlsoptions->sts_duration = tempiConf.tls_options->sts_duration;
-		tlsoptions->sts_preload = tempiConf.tls_options->sts_preload;
-		tlsoptions->certificate_expiry_notification = tempiConf.tls_options->certificate_expiry_notification;
+		safe_strdup(tlsoptions->trusted_ca_file, inherit_from->trusted_ca_file);
+		tlsoptions->protocols = inherit_from->protocols;
+		safe_strdup(tlsoptions->ciphers, inherit_from->ciphers);
+		safe_strdup(tlsoptions->ciphersuites, inherit_from->ciphersuites);
+		safe_strdup(tlsoptions->groups, inherit_from->groups);
+		safe_strdup(tlsoptions->signature_algorithms, inherit_from->signature_algorithms);
+		safe_strdup(tlsoptions->outdated_protocols, inherit_from->outdated_protocols);
+		safe_strdup(tlsoptions->outdated_ciphers, inherit_from->outdated_ciphers);
+		tlsoptions->options = inherit_from->options;
+		tlsoptions->renegotiate_bytes = inherit_from->renegotiate_bytes;
+		tlsoptions->renegotiate_timeout = inherit_from->renegotiate_timeout;
+		tlsoptions->sts_port = inherit_from->sts_port;
+		tlsoptions->sts_duration = inherit_from->sts_duration;
+		tlsoptions->sts_preload = inherit_from->sts_preload;
+		tlsoptions->certificate_expiry_notification = inherit_from->certificate_expiry_notification;
 	}
 
 	/* Now process the options */
@@ -7769,12 +7804,12 @@ void conf_tlsblock(ConfigFile *conf, ConfigEntry *cep, TLSOptions *tlsoptions)
 		else if (!strcmp(cepp->name, "certificate"))
 		{
 			convert_to_absolute_path(&cepp->value, CONFDIR);
-			add_name_list(tlsoptions->certificate_files, cepp->value);
+			append_name_list(tlsoptions->certificate_files, cepp->value);
 		}
 		else if (!strcmp(cepp->name, "key"))
 		{
 			convert_to_absolute_path(&cepp->value, CONFDIR);
-			add_name_list(tlsoptions->key_files, cepp->value);
+			append_name_list(tlsoptions->key_files, cepp->value);
 		}
 		else if (!strcmp(cepp->name, "trusted-ca-file"))
 		{
@@ -7835,12 +7870,12 @@ void conf_tlsblock(ConfigFile *conf, ConfigEntry *cep, TLSOptions *tlsoptions)
 	 * additional certs/keys due to the nature of it being a name list.
 	 * So we simply only add these here at the end if they were not set.
 	 */
-	if (tlsoptions != tempiConf.tls_options)
+	if (tlsoptions != inherit_from)
 	{
 		if (!tlsoptions->certificate_files)
-			tlsoptions->certificate_files = duplicate_name_list(tempiConf.tls_options->certificate_files);
+			tlsoptions->certificate_files = duplicate_name_list(inherit_from->certificate_files);
 		if (!tlsoptions->key_files)
-			tlsoptions->key_files = duplicate_name_list(tempiConf.tls_options->key_files);
+			tlsoptions->key_files = duplicate_name_list(inherit_from->key_files);
 	}
 }
 
@@ -8347,7 +8382,7 @@ int	_conf_set(ConfigFile *conf, ConfigEntry *ce)
 		}
 		else if (!strcmp(cep->name, "ssl") || !strcmp(cep->name, "tls")) {
 			/* no need to alloc tempiConf.tls_options since config_defaults() already ensures it exists */
-			conf_tlsblock(conf, cep, tempiConf.tls_options);
+			conf_tlsblock(conf, cep, tempiConf.tls_options, tempiConf.tls_options);
 		}
 		else if (!strcmp(cep->name, "plaintext-policy"))
 		{
@@ -9188,8 +9223,9 @@ int	_test_set(ConfigFile *conf, ConfigEntry *ce)
 					}
 					else if (!strcmp(ceppp->name, "away-count"))
 					{
-						int temp = atol(ceppp->value);
+						int temp;
 						CheckNull(ceppp);
+						temp = atol(ceppp->value);
 						if (temp < 1 || temp > 255)
 						{
 							config_error("%s:%i: set::anti-flood::away-count must be between 1 and 255",
@@ -10623,7 +10659,7 @@ int _test_alias(ConfigFile *conf, ConfigEntry *ce) {
 			continue;
 		}
 		if (!strcmp(cep->name, "format")) {
-			char *err = NULL;
+			const char *err = NULL;
 			Match *expr;
 			char has_type = 0, has_target = 0, has_parameters = 0;
 
@@ -10873,12 +10909,22 @@ int     _test_deny(ConfigFile *conf, ConfigEntry *ce)
 		char has_mask = 0, has_match = 0;
 		for (cep = ce->items; cep; cep = cep->next)
 		{
-			if (config_is_blankorempty(cep, "deny channel"))
+			if (!strcmp(cep->name, "match"))
+			{
+				has_match = 1;
+				test_match_block(conf, cep, &errors);
+			}
+			else if (!strcmp(cep->name, "mask"))
+			{
+				has_mask = 1;
+				test_match_block(conf, cep, &errors);
+			}
+			else if (config_is_blankorempty(cep, "deny channel"))
 			{
 				errors++;
 				continue;
 			}
-			if (!strcmp(cep->name, "channel"))
+			else if (!strcmp(cep->name, "channel"))
 			{
 				if (has_channel)
 				{
@@ -10927,16 +10973,6 @@ int     _test_deny(ConfigFile *conf, ConfigEntry *ce)
 					continue;
 				}
 				has_class = 1;
-			}
-			else if (!strcmp(cep->name, "match"))
-			{
-				has_match = 1;
-				test_match_block(conf, cep, &errors);
-			}
-			else if (!strcmp(cep->name, "mask"))
-			{
-				has_mask = 1;
-				test_match_block(conf, cep, &errors);
 			}
 			else
 			{
@@ -11889,29 +11925,14 @@ int reloadable_perm_module_unloaded(void)
 	return ret;
 }
 
-const char *link_generator_spkifp(TLSOptions *tlsoptions)
-{
-	SSL_CTX *ctx;
-	SSL *ssl;
-	X509 *cert;
-
-	ctx = init_ctx(tlsoptions, 1);
-	if (!ctx)
-		exit(1);
-	ssl = SSL_new(ctx);
-	if (!ssl)
-		exit(1);
-	cert = SSL_get_certificate(ssl);
-	return spki_fingerprint_ex(cert);
-}
-
 void link_generator(void)
 {
 	ConfigItem_listen *lstn;
-	TLSOptions *tlsopt = iConf.tls_options; /* never null */
+	TLSOptions *tlsopt = iConf.server_linking_tls_options ? iConf.server_linking_tls_options : iConf.tls_options; /* set::server-linking::tls-options and otherwise set::tls */
 	int port = 0;
 	char *ip = NULL;
-	const char *spkifp;
+	SSL_CTX *ctx;
+	NameList *fp;
 
 	for (lstn = conf_listen; lstn; lstn = lstn->next)
 	{
@@ -11936,8 +11957,9 @@ void link_generator(void)
 		exit(1);
 	}
 
-	spkifp = link_generator_spkifp(tlsopt);
-	if (!spkifp)
+	/* init_ctx() will compute the spkifp(s) */
+	ctx = init_ctx(tlsopt, 1);
+	if (!ctx || !tlsopt->spkifp)
 	{
 		printf("Could not calculate spkifp. Maybe you have uncommon TLS options set? Odd...\n");
 		exit(1);
@@ -11955,14 +11977,18 @@ void link_generator(void)
 	       "        hostname %s;\n"
 	       "        port %d;\n"
 	       "        options { tls; autoconnect; }\n"
-	       "    }\n"
-	       "    password \"%s\" { spkifp; }\n"
-	       "    class servers;\n"
-	       "}\n",
+	       "    }\n",
 	       conf_me->name,
 	       ip ? ip : conf_me->name,
-	       port,
-	       spkifp);
+	       port);
+	/* The simple case is a single password ".." { spkifp; } line, but we also
+	 * have to deal with the case of multiple certificate/keys with multiple
+	 * password..spkifp lines. Like for ECC+RSA or ECC+ML-DSA.
+	 */
+	for (fp = tlsopt->spkifp; fp; fp = fp->next)
+		printf("    password \"%s\" { spkifp; }\n", fp->name);
+	printf("    class servers;\n"
+	       "}\n");
 	printf("################################################################################\n");
 	exit(0);
 }
@@ -12309,6 +12335,10 @@ void central_spamfilter_download_complete(OutgoingWebRequest *request, OutgoingW
 
 	/* And load the new ones... */
 	num_rules = config_run_blocks_generic(cfptr, 0);
+	/* Restore hit counters onto the freshly re-added central spamfilters (matched
+	 * by key), from the snapshot taken in remove_config_tkls() just above.
+	 */
+	config_tkl_hits_restore();
 	active_rules = count_central_spamfilter_rules();
 
 	if (iConf.central_spamfilter_verbose > 2)

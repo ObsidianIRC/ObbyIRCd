@@ -29,7 +29,7 @@ ModuleHeader MOD_HEADER = {
 
 #define TKLDB_MAGIC 0x10101010
 /* Database version */
-#define TKLDB_VERSION 4999
+#define TKLDB_VERSION 6260
 /* Save tkls to file every <this> seconds */
 #define TKLDB_SAVE_EVERY 300
 /* The very first save after boot, apply this delta, this
@@ -401,6 +401,12 @@ int write_tkline(UnrealDB *db, const char *tmpfname, TKL *tkl)
 	W_SAFE(unrealdb_write_str(db, tkl->set_by));
 	W_SAFE(unrealdb_write_int64(db, tkl->set_at));
 	W_SAFE(unrealdb_write_int64(db, tkl->expire_at));
+	W_SAFE(unrealdb_write_str(db, tkl->id));     /* since TKLDB_VERSION 6260 */
+	W_SAFE(unrealdb_write_str(db, tkl->spamfilter_id)); /* since TKLDB_VERSION 6260 */
+
+	/* Hit-stat fields for all TKL types (since TKLDB_VERSION 6260): hits, lasthit. */
+	W_SAFE(unrealdb_write_int64(db, tkl->hits));
+	W_SAFE(unrealdb_write_int64(db, tkl->lasthit));
 
 	if (TKLIsServerBan(tkl))
 	{
@@ -446,6 +452,9 @@ int write_tkline(UnrealDB *db, const char *tmpfname, TKL *tkl)
 		W_SAFE(unrealdb_write_char(db, action));
 		W_SAFE(unrealdb_write_str(db, tkl->ptr.spamfilter->tkl_reason));
 		W_SAFE(unrealdb_write_int64(db, tkl->ptr.spamfilter->tkl_duration));
+		/* Spamfilter-only hit-stat fields (since TKLDB_VERSION 6260): hits_except, lasthit_except. */
+		W_SAFE(unrealdb_write_int64(db, tkl->ptr.spamfilter->hits_except));
+		W_SAFE(unrealdb_write_int64(db, tkl->ptr.spamfilter->lasthit_except));
 	}
 
 	return 1;
@@ -530,6 +539,7 @@ int read_tkldb(void)
 	for (cnt = 0; cnt < tklcount; cnt++)
 	{
 		int do_not_add = 0;
+		TKL *added = NULL;
 
 		tkl = safe_alloc(sizeof(TKL));
 
@@ -555,6 +565,22 @@ int read_tkldb(void)
 		tkl->set_at = v;
 		R_SAFE(unrealdb_read_int64(db, &v));
 		tkl->expire_at = v;
+
+		/* id and spamfilter_id were added in TKLDB_VERSION 6260 */
+		if (version >= 6260)
+		{
+			R_SAFE(unrealdb_read_str(db, &str));
+			strlcpy(tkl->id, str, sizeof(tkl->id));
+			safe_free(str);
+			R_SAFE(unrealdb_read_str(db, &str));
+			strlcpy(tkl->spamfilter_id, str, sizeof(tkl->spamfilter_id));
+			safe_free(str);
+			/* Hit-stat fields for all TKL types (hits, lasthit). */
+			R_SAFE(unrealdb_read_int64(db, &v));
+			tkl->hits = v;
+			R_SAFE(unrealdb_read_int64(db, &v));
+			tkl->lasthit = v;
+		}
 
 		/* Save some CPU... if it's already expired then don't bother adding */
 		if (tkl->expire_at != 0 && tkl->expire_at <= TStime())
@@ -599,7 +625,7 @@ int read_tkldb(void)
 
 			if (!do_not_add)
 			{
-				tkl_add_serverban(tkl->type, tkl->ptr.serverban->usermask,
+				added = tkl_add_serverban(tkl->type, tkl->ptr.serverban->usermask,
 				                  tkl->ptr.serverban->hostmask,
 				                  NULL,
 				                  tkl->ptr.serverban->reason,
@@ -639,7 +665,7 @@ int read_tkldb(void)
 
 			if (!do_not_add)
 			{
-				tkl_add_banexception(tkl->type, tkl->ptr.banexception->usermask,
+				added = tkl_add_banexception(tkl->type, tkl->ptr.banexception->usermask,
 				                     tkl->ptr.banexception->hostmask,
 				                     NULL,
 				                     tkl->ptr.banexception->reason,
@@ -668,7 +694,7 @@ int read_tkldb(void)
 
 			if (!do_not_add)
 			{
-				tkl_add_nameban(tkl->type, tkl->ptr.nameban->name,
+				added = tkl_add_nameban(tkl->type, tkl->ptr.nameban->name,
 				                tkl->ptr.nameban->hold,
 				                tkl->ptr.nameban->reason,
 				                tkl->set_by, tkl->expire_at,
@@ -678,7 +704,7 @@ int read_tkldb(void)
 		if (TKLIsSpamfilter(tkl))
 		{
 			int match_method;
-			char *err = NULL;
+			const char *err = NULL;
 
 			tkl->ptr.spamfilter = safe_alloc(sizeof(Spamfilter));
 
@@ -726,6 +752,14 @@ int read_tkldb(void)
 			R_SAFE(unrealdb_read_str(db, &tkl->ptr.spamfilter->tkl_reason));
 			R_SAFE(unrealdb_read_int64(db, &v));
 			tkl->ptr.spamfilter->tkl_duration = v;
+			/* Spamfilter-only hit-stat fields (hits_except, lasthit_except). */
+			if (version >= 6260)
+			{
+				R_SAFE(unrealdb_read_int64(db, &v));
+				tkl->ptr.spamfilter->hits_except = v;
+				R_SAFE(unrealdb_read_int64(db, &v));
+				tkl->ptr.spamfilter->lasthit_except = v;
+			}
 
 			if (!do_not_add &&
 			    find_tkl_spamfilter(tkl->type, tkl->ptr.spamfilter->match->str,
@@ -744,7 +778,7 @@ int read_tkldb(void)
 
 			if (!do_not_add)
 			{
-				tkl_add_spamfilter(tkl->type, NULL, tkl->ptr.spamfilter->target,
+				added = tkl_add_spamfilter(tkl->type, NULL, tkl->ptr.spamfilter->target,
 				                   tkl->ptr.spamfilter->action,
 				                   tkl->ptr.spamfilter->match,
 				                   NULL,
@@ -769,6 +803,19 @@ int read_tkldb(void)
 			config_warn("[tkldb] Unhandled type!! TKLDB is missing support for type %ld -- STOPPED reading db entries!", (long)tkl->type);
 			FreeTKLRead();
 			break; /* we MUST stop reading */
+		}
+
+		if (added)
+		{
+			strlcpy(added->id, tkl->id, sizeof(added->id));
+			strlcpy(added->spamfilter_id, tkl->spamfilter_id, sizeof(added->spamfilter_id));
+			added->hits = tkl->hits;
+			added->lasthit = tkl->lasthit;
+			if (TKLIsSpamfilter(added))
+			{
+				added->ptr.spamfilter->hits_except = tkl->ptr.spamfilter->hits_except;
+				added->ptr.spamfilter->lasthit_except = tkl->ptr.spamfilter->lasthit_except;
+			}
 		}
 
 		if (!do_not_add)

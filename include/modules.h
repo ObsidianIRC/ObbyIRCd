@@ -529,6 +529,7 @@ struct ClientCapability {
 	MessageTagHandler *mtag_handler;         /**< For reverse dependency */
 	Module *owner;                           /**< Module introducing this CAP. */
 	char unloaded;                           /**< Internal flag to indicate module is being unloaded */
+	int minimum_cap_version;                 /**< Minimum CAP version to show this CAP */
 };
 
 typedef struct {
@@ -536,6 +537,7 @@ typedef struct {
 	int flags;
 	int (*visible)(Client *);
 	const char *(*parameter)(Client *);
+	int minimum_cap_version;
 } ClientCapabilityInfo;
 
 /** @defgroup MessagetagAPI Message tag API
@@ -633,6 +635,7 @@ struct HistoryResult {
         HistoryLogLine *log_tail;			/**< Last entry in the log lines */
         int num_lines;					/**< Total number of lines in the result */
         int num_bytes;					/**< Total bytes of all lines in the result */
+        int reached_end;				/**< Set by backend: 1 = no more history beyond this page, 0 = more may exist (or unknown). Used by the draft/chathistory-end tag. Default 0. */
 };
 
 /** History Backend */
@@ -1576,6 +1579,8 @@ extern APICallback *APICallbackAdd(Module *module, APICallback *mreq);
 #define HOOKTYPE_KNOWN_USER_CACHE_CHANGE	131
 /** See hooktype_chanmsg_multiline() */
 #define HOOKTYPE_CHANMSG_MULTILINE	132
+/** See hooktype_postconf() */
+#define HOOKTYPE_POSTCONF	133
 
 
 /* Adding a new hook here?
@@ -2061,6 +2066,13 @@ int hooktype_rehash(void);
  * @return The return value is ignored (use return 0)
  */
 int hooktype_rehash_complete(void);
+
+/** Called at the end of postconf(), after the configuration is fully applied and
+ * TLS contexts are (re)built, on both boot and rehash (function prototype for
+ * HOOKTYPE_POSTCONF).
+ * @return The return value is ignored (use return 0)
+ */
+int hooktype_postconf(void);
 
 /** Called when searching for a test function for a specific configuration item (function prototype for HOOKTYPE_CONFIGTEST).
  * This is part of the configuration API, which is better documented at the
@@ -2806,6 +2818,7 @@ _UNREAL_ERROR(_hook_error_incompatible, "Incompatible hook function. Check argum
         ((hooktype == HOOKTYPE_UMODE_CHANGE) && !ValidateHook(hooktype_umode_change, func)) || \
         ((hooktype == HOOKTYPE_TOPIC) && !ValidateHook(hooktype_topic, func)) || \
         ((hooktype == HOOKTYPE_REHASH_COMPLETE) && !ValidateHook(hooktype_rehash_complete, func)) || \
+        ((hooktype == HOOKTYPE_POSTCONF) && !ValidateHook(hooktype_postconf, func)) || \
         ((hooktype == HOOKTYPE_TKL_ADD) && !ValidateHook(hooktype_tkl_add, func)) || \
         ((hooktype == HOOKTYPE_TKL_DEL) && !ValidateHook(hooktype_tkl_del, func)) || \
         ((hooktype == HOOKTYPE_LOCAL_KILL) && !ValidateHook(hooktype_local_kill, func)) || \
@@ -2945,6 +2958,7 @@ enum EfunctionType {
 	EFUNC_TAKE_ACTION,
 	EFUNC_MATCH_SPAMFILTER,
 	EFUNC_MATCH_SPAMFILTER_MTAGS,
+	EFUNC_RUN_DEFERRED_RULE_ONLY_SPAMFILTERS,
 	EFUNC_JOIN_VIRUSCHAN,
 	EFUNC_FIND_TKLINE_MATCH_ZAP_EX,
 	EFUNC_SEND_LIST,
@@ -3067,6 +3081,11 @@ enum EfunctionType {
 	EFUNC_GET_CONNECTIONS_FROM_IP,
 	EFUNC_GET_FLOODPROT_CHANNEL_MAX_LINES,
 	EFUNC_FLOODPROT_CHECK_MULTILINE_BATCH,
+	EFUNC_CHANNEL_FLOOD_BLOCKED_COUNT,
+	EFUNC_CHANNEL_FLOOD_EXPAND_JSON,
+	EFUNC_TKL_HIT,
+	EFUNC_REMOVE_CONFIG_TKLS,
+	EFUNC_CONFIG_TKL_HITS_RESTORE,
 };
 
 /* Module flags */

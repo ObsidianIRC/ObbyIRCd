@@ -125,6 +125,8 @@ static int crule__not(crule_context *, int, void **);
 static int crule_online_time(crule_context *, int, void **);
 static int crule_reputation(crule_context *, int, void **);
 static int crule_tag(crule_context *, int, void **);
+static int crule_server_flood_count(crule_context *, int, void **);
+static int crule_total_channel_flood_count(crule_context *, int, void **);
 static int crule_in_channel(crule_context *, int, void **);
 static int crule_destination(crule_context *, int, void **);
 static int crule_cap_version(crule_context *, int, void **);
@@ -260,10 +262,12 @@ struct crule_funclistent crule_funclist[] = {
 	{"non_ascii_percentage", 0, crule_non_ascii_percentage},
 	{"online_time", 0, crule_online_time},
 	{"reputation", 0, crule_reputation},
+	{"server_flood_count", 1, crule_server_flood_count},
 	{"server_port", 0, crule_server_port},
 	{"tag", 1, crule_tag},
 	{"text_byte_count", 0, crule_text_byte_count},
 	{"text_character_count", 0, crule_text_character_count},
+	{"total_channel_flood_count", 1, crule_total_channel_flood_count},
 	{"unicode_block_count", 0, crule_unicode_block_count},
 	{"unicode_count", 1, crule_unicode_count},
 	{"uppercase_percentage", 0, crule_uppercase_percentage},
@@ -447,6 +451,43 @@ static int crule_reputation(crule_context *context, int numargs, void *crulearg[
 	if (context && context->client)
 		return GetReputation(context->client);
 	return 0;
+}
+
+/* server_flood_count('away') etc: how many times the client hit that server flood limit
+ * this session. 'all' gives the grand total across types. Unknown type returns 0.
+ */
+static int crule_server_flood_count(crule_context *context, int numargs, void *crulearg[])
+{
+	const char *type = (char *)crulearg[0];
+	int i, total = 0;
+
+	if (!context || !context->client || !MyConnect(context->client))
+		return 0;
+
+	if (!strcasecmp(type, "all"))
+	{
+		for (i = 0; i < MAXFLOODOPTIONS; i++)
+			total += context->client->local->flood[i].blocked;
+		return total;
+	}
+
+	for (i = 0; i < MAXFLOODOPTIONS; i++)
+		if (floodoption_shortnames[i] && !strcasecmp(floodoption_shortnames[i], type))
+			return context->client->local->flood[i].blocked;
+
+	return 0; /* unknown flood type */
+}
+
+/* total_channel_flood_count('nick') etc: how many times the client was blocked by channel
+ * flood protection (+f/+F) of that type this session, summed across all their channels.
+ * 'all' is the grand total. Backed by the floodprot module via the channel_flood_blocked_count
+ * efunc (returns 0 if floodprot is not loaded, or for an unknown type).
+ */
+static int crule_total_channel_flood_count(crule_context *context, int numargs, void *crulearg[])
+{
+	if (!context || !context->client)
+		return 0;
+	return channel_flood_blocked_count(context->client, (char *)crulearg[0]);
 }
 
 static int crule_tag(crule_context *context, int numargs, void *crulearg[])
