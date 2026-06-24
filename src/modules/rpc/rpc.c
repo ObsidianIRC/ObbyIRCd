@@ -9,7 +9,7 @@
 ModuleHeader MOD_HEADER
   = {
 	"rpc/rpc",
-	"1.0.4",
+	"1.0.5",
 	"RPC module for remote management",
 	"UnrealIRCd Team",
 	"unrealircd-6",
@@ -925,8 +925,9 @@ void _rpc_error(Client *client, json_t *request, JsonRpcError error_code, const 
 	json_object_set_new(error, "message", json_string_unreal(error_message));
 
 	unreal_log(ULOG_INFO, "rpc", "RPC_CALL_ERROR", client,
-	           "[rpc] Client $client: RPC call $method",
-	           log_data_string("method", method ? method : "<invalid>"));
+	           "[rpc] Client $client: RPC call $method: $error_message",
+	           log_data_string("method", method ? method : "<invalid>"),
+	           log_data_string("error_message", error_message));
 
 
 	json_serialized = json_dumps(j, 0);
@@ -1884,6 +1885,7 @@ void rpc_call_remote(RRPC *r)
 		return;
 	}
 	client = make_client(server->direction, server);
+	SetRPC(client);
 	strlcpy(client->id, r->source, sizeof(client->id));
 	client->rpc = safe_alloc(sizeof(RPCClient));
 	strlcpy(client->name, "RPC:remote", sizeof(client->name));
@@ -2028,7 +2030,7 @@ void rpc_send_generic_to_remote(Client *source, Client *target, const char *requ
 	safe_free(json_serialized);
 }
 
-int _rrpc_supported_simple(Client *target, char **problem_server)
+int rrpc_supported_simple_helper(Client *target, char **problem_server)
 {
 	if (!moddata_client_get(target, "rrpc"))
 	{
@@ -2036,20 +2038,51 @@ int _rrpc_supported_simple(Client *target, char **problem_server)
 			*problem_server = target->name;
 		return 0;
 	}
-	if ((target != target->direction) && !rrpc_supported_simple(target->direction, problem_server))
+	if ((target != target->direction) && !rrpc_supported_simple_helper(target->direction, problem_server))
 		return 0;
 	return 1;
 }
 
+int _rrpc_supported_simple(Client *target, char **problem_server)
+{
+	/* We require the RPC module and at least module version 1.0.5.
+	 * This is because there is a bug in 1.0.4 where remote RPC did
+	 * not work due to an auth check that was only meant locally.
+	 */
+	return rrpc_supported(target, "rpc", "1.0.5", problem_server);
+}
+
 int _rrpc_supported(Client *target, const char *module, const char *minimum_version, char **problem_server)
 {
+	const char *have_version;
+
 	if (!moddata_client_get(target, "rrpc"))
 	{
 		if (problem_server)
 			*problem_server = target->name;
 		return 0;
 	}
-	if ((target != target->direction) && !rrpc_supported_simple(target->direction, problem_server))
+
+	/* If a specific rpc module (and optionally a minimum version) is requested, check that
+	 * 'target' actually advertises it. The module list (name -> version) travels via the
+	 * synced "rrpc" moddata, so we can check this for any server on the network.
+	 */
+	if (module)
+	{
+		have_version = get_nvplist(RRPCMODULES(target), module);
+		if (!have_version ||
+		    (minimum_version && (strnatcmp(have_version, minimum_version) < 0)))
+		{
+			if (problem_server)
+				*problem_server = target->name;
+			return 0;
+		}
+	}
+
+	/* And the entire path towards 'target' must support remote RPC (transport only;
+	 * intermediate servers just relay, so they don't need the module itself).
+	 */
+	if ((target != target->direction) && !rrpc_supported_simple_helper(target->direction, problem_server))
 		return 0;
 	return 1;
 }
@@ -2188,6 +2221,13 @@ RPC_CALL_FUNC(rpc_rpc_add_timer)
 	const char *method;
 	RPCHandler *handler;
 	RPCTimer *timer;
+
+	/* Remote timers would be weird, complex and are not supported */
+	if (!MyConnect(client))
+	{
+		rpc_error(client, request, JSON_RPC_ERROR_INVALID_REQUEST, "rpc.add_timer is not available for remote RPC requests");
+		return;
+	}
 
 	REQUIRE_PARAM_INTEGER("every_msec", every_msec);
 	REQUIRE_PARAM_STRING("timer_id", timer_id);

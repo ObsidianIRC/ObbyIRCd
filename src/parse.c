@@ -143,6 +143,16 @@ void parse_client_queued(Client *client)
 			return;
 
 		dopacket(client, buf, dolen);
+
+		/* Tags and similar may change outside of match_spamfilter(), such as a flood
+		 * counter or a central spamfilter tag. We run rule-only spamfilters here.
+		 * This is outside the command handler so we can safely kill the client here.
+		 */
+		if (!IsDead(client) && client->local &&
+		    (client->local->tags_serial != client->local->spamfilter_run_tags_serial))
+		{
+			run_deferred_rule_only_spamfilters(client);
+		}
 		
 		if (IsDead(client))
 			return;
@@ -676,8 +686,12 @@ long parse_addlag(Client *client, int command_bytes, int mtags_bytes)
  */
 void add_fake_lag(Client *client, long msec)
 {
-	if (!MyConnect(client))
+	if (!MyConnect(client) || IsNoFakeLag(client))
 		return;
+#ifdef FAKELAG_CONFIGURABLE
+	if (client->local->class && (client->local->class->options & CLASS_OPT_NOFAKELAG))
+		return;
+#endif
 
 	client->local->fake_lag_msec += msec;
 	client->local->fake_lag += (client->local->fake_lag_msec / 1000);

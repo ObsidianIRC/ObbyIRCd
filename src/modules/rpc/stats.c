@@ -955,7 +955,7 @@ static void collect_tkl_stats(json_t *parent, int detail)
 				{
 					spamfilter++;
 					if (tkl->ptr.spamfilter)
-						total_spamfilter_hits += tkl->ptr.spamfilter->hits;
+						total_spamfilter_hits += tkl->hits;
 				}
 				else if (TKLIsBanException(tkl))
 					except++;
@@ -985,7 +985,7 @@ static void collect_tkl_stats(json_t *parent, int detail)
 			{
 				spamfilter++;
 				if (tkl->ptr.spamfilter)
-					total_spamfilter_hits += tkl->ptr.spamfilter->hits;
+					total_spamfilter_hits += tkl->hits;
 			}
 			else if (TKLIsBanException(tkl))
 				except++;

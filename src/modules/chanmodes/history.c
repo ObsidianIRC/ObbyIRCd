@@ -781,7 +781,7 @@ int history_join(Client *client, Channel *channel, MessageTag *mtags)
 				}
 				l = next;
 			}
-			history_send_result(client, r);
+			history_send_result(client, r, 0);
 			free_history_result(r);
 		}
 	}

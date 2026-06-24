@@ -41,11 +41,11 @@ if [ "$SSLDIR" != "" ]; then
 fi
 ./Config -quick || (tail -n 5000 config.log; exit 1)
 $MAKE
-yes ''|$MAKE pem
 $MAKE || exit 1
 $MAKE install || exit 1
 # The control binary is installed into BASEPATH and is named obbyircd after the
 # rebrand; run it from there rather than the (binary-less) source dir.
+(cd ~/unrealircd && (echo 'Y'; yes '')|./obbyircd mkcert) || exit 1
 (cd ~/unrealircd && ./obbyircd module install third/dumpcmds) || exit 1
 
 set +x

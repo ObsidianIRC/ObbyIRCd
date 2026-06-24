@@ -1,26 +1,182 @@
 UnrealIRCd 6.2.6
-=================
+=====================
 
-This is the git version (development version) for future UnrealIRCd 6.2.6.
-This is work in progress and may not always be a stable version.
+This is the Release Candidate for future version 6.2.6. You can help us by
+testing this release and reporting bugs to https://bugs.unrealircd.org/
+
+This version enables multiline by default, adds TKL IDs and tracking of
+hit counts on *LINES/Spamfilter. New crule functions were added to fetch
+server flood counts. Guidance to admins for server linking with 'spkifp'
+has been improved.
 
 ### Enhancements:
+* [IRCv3 draft/multiline](https://ircv3.net/specs/extensions/multiline)
+  is now enabled by default. See the [UnrealIRCd 6.2.4 release](#unrealircd-624)
+  for all information on what this feature does, the default limits, etc.
+  To turn it off completely you can use: `blacklist-module multiline;`
+* Server bans and Spamfilters now have a unique ID, like `G7K2MP9WQX3`:
+  * The first letter denotes the type: `G` for gline, `K` for kline,
+    `Z` for (g)zline, `H` for shun. Spamfilter IDs start with `SPAM`.
+  * The ID is shown to the affected user, so they can paste the ID back to
+    network staff. It is `$banid` in
+    [set::reject-message](https://www.unrealircd.org/docs/Set_block#set::reject-message)
+    and included by default. If you have a custom set::reject-message in
+    your config file then you will have to add it in manually.
+  * IRCOps see the ID in `STATS gline` and similar and can search for it
+    with e.g. `STATS gline +i G7K2MP9WQX3`.
+  * Spamfilters also have an ID, and we already had something similar that
+    could be used for `SPAMFILTER del <id>` that was only local-server.
+    For new spamfilters this is now a network wide ID.
+  * When a server ban was placed by a spamfilter, `STATS gline` shows the
+    originating spamfilter's ID, so it can be traced back.
+  * The TKL ID and related Spamfilter ID (if any), also appear in log
+    messages `TKL_ADD`, `TKL_DEL`, `TKL_EXPIRE` and `SPAMFILTER_MATCH`.
+  * The `STATS gline` and other TKL stats changed format, see
+    *Developers and protocol* if you use scripts or your client depends
+    on the exact numeric format.
+  * For TKL IDs to reach all servers, all servers need to be on 6.2.6
+    or later, especially the hubs. If there is one server in-between
+    that is older, then TKL IDs don't propagate properly and the ID
+    will be empty.
+* Server bans and Spamfilters now track how often they are hit and the time
+  of the last hit, eg in `STATS gline` for GLINEs. These counts happen on
+  each individual server and are not network-wide. This allows IRCOps to see
+  which entries never get any hits and can potentially be removed.
+  * Important exception: config-based spamfilters/bans lose their counters
+    on restart.
+  * For non-config TKLs, the hit count and last hit timestamp are preserved
+    across reboots (via tkldb).
+  * Again, see *Developers and protocol* for the exact STATS field.
+* New [crule functions](https://www.unrealircd.org/docs/Crule) that return
+  the number of times a flood was blocked for a user.
+  * `server_flood_count('..setting..')` returns the number of times
+    set::anti-flood settings were exceeded by that user. Available are:
+    `away`, `nick`, `join`, `invite`, `knock`, `vhost` and `conversations`.
+    Plus, there is `all` for the sum of all items.
+  * `total_channel_flood_count('..setting..')` returns the number of
+    times `+f`/`+F` limits were exceeded by that user in all channels
+    the user is or was in. Available are: `nick`, `join`, `knock`, `msg`,
+    `ctcp`, `text`, `repeat` and `paste` (and `all` for the sum).
+  * All these are counted for the duration of the session (user connection).
+  * These can be used in a security-group::rule or spamfilter::rule. Eg:  
+    `spamfilter { rule "server_flood_count('nick')>4"; reason "Nick flood"; action gline; ban-time 1h; }`
+* Central Spamreport now also receives those flood counters.
 
 ### Changes:
+* Server linking and certificates: we now treat listener blocks that are
+  `serversonly` (such as port 6900 in the example.conf) and link { } blocks
+  in a different way than regular listen { } blocks:
+  * If there are different certificates used in the serversonly listen block
+    vs link blocks, then this is almost always means server linking is broken,
+    so we now print a warning on boot and rehash.
+  * We also print an 'advice' if any of these are not using (long-lived)
+    self-signed certificate. This is because CA issued certificates are
+    typically not suitable because they typically rotate keys and thus change
+    the `spkifp`. Changing spkifp breaks server linking. We will now print
+    an advice along with command and config block instructions to fix it.
+  * We now use `set::server-linking::tls-options` for link { } blocks
+    and listen { } blocks that are `serversonly`. All the rest uses the
+    `set::tls` settings by default (eg the regular listen { } block on 6697).
+    * This means our guide on
+      [Using Let's Encrypt with UnrealIRCd](https://www.unrealircd.org/docs/Using_Let's_Encrypt_with_UnrealIRCd)
+      and generic usage is more intuitive. You just set both set settings
+      and then no longer need to use any tls-options in listen blocks or link
+      blocks. The example conf has also been updated with this.
+    * If `set::server-linking::tls-options` is not configured, it defaults
+      to `set::tls`, so there is no unexpected behavior change for anyone.
+  * In a future release we will make server linking with `spkifp` mandatory,
+    so all of this helps with getting people ready for that, making such
+    a future transition smooth.
+  * The command `./unrealircd genlinkblock` now also deals with ECC + ML-DSA
+    where you have multiple `password ".." { spkifp; }` entries.
+* Spamfilter regexes now use more sensible defaults in terms of "max effort",
+  similar to what PHP has been using for years. This means very slow regexes
+  will now raise a `SPAMFILTER_REGEX_ERROR` warning during execution if
+  this happens (should be extremely rare).
+* The UnrealIRCd base directory (eg `~/unrealircd/`) is now created with
+  0700 permissions, just like most subdirectories were.
+* We now have `./unrealircd mkcert` which replaces `make pem`
+  certificate/key generation.
+* Translation updates: `help.fr.conf`
+* CHATHISTORY now sends a `draft/chathistory-end` if the end of history
+  has been reached ([a recent spec improvement](https://github.com/unrealircd/unrealircd/pull/337)).
+* The IRCv3 [reply](https://ircv3.net/specs/client-tags/reply) client tag
+  and [no-implicit-names](https://ircv3.net/specs/extensions/no-implicit-names)
+  extensions have been ratified. During the transition period we support both.
 
 ### Fixes:
-* Harden the built-in HTTPS client
+* The following config items previously raised a config error:
+  allow channel::except, deny channel::except and spamfilter::except.
+* deny channel::mask with a [Mask item](https://www.unrealircd.org/docs/Mask_item)
+  caused a config error.
+* Long multiline messages could be cut off when sent to clients that do not
+  support multiline.
+* Hardening of the built-in HTTPS client
+* JSON-RPC: Remote RPC was broken and causing "not authorized" error messages.
+  This was used by `server.rehash` and `server.module_list`. Plus,
+  this release `user.get` under some circumstances. This is now
+  fixed but requires the target server to be on UnrealIRCd 6.2.6.
+  If the target server does not meet this condition then we error
+  telling the server "does not support remote JSON-RPC".
 
 ### Developers and protocol:
+* If you use `CAP LS` instead of `CAP LS 302` then you will now miss various
+  capabilities. We had to trim it down because only 302 and later allow
+  responses that span multiple lines. If your client is still not using 302
+  then please do so soon (the IRCv3 spec is from Nov'2017). For this first
+  change, you won't miss out much, but somewhere in the future this can
+  become a real problem for you.
 * URL API: The OutgoingWebRequest `max_size` (introduced last release) now
   also caps file-backed downloads. Default for file-backed when left at 0
   is 50MB (`DOWNLOAD_MAX_SIZE_FILE_BACKED`). For memory-backed, it stays
   at 1MB like in 6.2.5 (`DOWNLOAD_MAX_SIZE_MEMORY_BACKED`).
+* The `unreal_match()` function now has a 3rd argument `const char **error`
+  for communicating regex errors back. Just set to `NULL` if you don't care.
+* Similarly, `unreal_create_match()` last argument is now `const char **error`
+  (const was added). So when callers use that, their variable `char *err`
+  needs to become `const char *err`.
 * If you do something to a user that would (potentially) move the user from
   `unknown-users` to `known-users` (or vice versa) then you should call
   `update_known_user_cache(client);` to update the known users cache.
   For example, if you have some authentication module that marks a user
   as IsLoggedIn.
+* TKL entries can now use message tags to carry extra data, similar to how
+  `s2s-md` worked for early moddata, we have `s2s-tkl`. We have two at
+  the moment:
+  * `s2s-tkl/id`: network-wide unique ID for the TKL entry
+  * `s2s-tkl/spamfilter_id`: for server bans, if they were set by spamfilter,
+    the spamfilter TKL ID.
+  * Example: `@s2s-tkl/id=xxxx;s2s-tkl/spamfilter_id=yyyy :server TKL .....`
+  * Older servers will not pass these along, so for this functionality to
+    work all servers need to be on latest version, especially your hub.
+* The TKL `STATS` numerics has more fields now, they are added right before
+  last (so before the `:reason` or `:regex`):
+  * `RPL_STATSGLINE` (223) ends with `hits lasthit spamfilter_id id :reason`
+  * `RPL_STATSQLINE` (217) ends with `hits lasthit id :reason`
+  * `RPL_STATSSPAMF` (229) ends with `lasthit lasthit_except id :regex`
+    (which comes right after `hits hits_except`, which was already there)
+  * `RPL_STATSEXCEPTTKL` (230) ends with `id :reason`
+  * An absent id or spamfilter_id is sent as `-`
+  * The hits/lasthit/lasthit_except show how often the TKL was hit and
+    the timestamp of the last hit (the usual, unix time), or 0 for never.
+    These counts are local to each server.
+* `banned_client()` has an extra parameter `const char *tklid` for the
+   TKL ID (or NULL if none).
+* The tkldb database version is now 6260 and stores the id, spamfilter_id and
+  the hit statistics (hit count and last-hit time per ban).
+  Older databases still load. Downside: you cannot downgrade UnrealIRCd.
+* JSON for TKL entries (server logs and JSON-RPC) now includes `id`, and
+  `spamfilter_id` for spamfilter-created server bans.
+* JSON-RPC `user.get` can now expose flood counters (see next).
+* JSON-RPC: We can now route `user.get` requests to the server that user is
+  on. This so we can fetch all fields for that user (including flood
+  counters, idle time, snomask) that are normally not available remotely.
+  * We do this automatically in `user.get` when `object_detail_level` is 5+.
+  * You can force this explicitly with `object_remote_fetch` set to `true`.
+    So you can also use it with detail level 2 if you want, e.g. if you
+    don't need the flood counters but do want the idle time.
+  * When RRPC is not available we answer ourselves (so safe fallback, but
+    you won't have the local-only fields).
 
 UnrealIRCd 6.2.5
 -----------------

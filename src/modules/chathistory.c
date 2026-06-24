@@ -27,6 +27,7 @@ struct ChatHistoryTarget {
 /* Forward declarations */
 CMD_FUNC(cmd_chathistory);
 static int chathistory_account_is_member(Client *client, Channel *channel);
+int chathistory_end_mtag_is_ok(Client *client, const char *name, const char *value);
 
 /* Global variables */
 long CAP_CHATHISTORY = 0L;
@@ -36,13 +37,22 @@ long CAP_CHATHISTORY = 0L;
 MOD_INIT()
 {
 	ClientCapabilityInfo c;
+	ClientCapability *cap;
+	MessageTagHandlerInfo mtag;
 
 	MARK_AS_OFFICIAL_MODULE(modinfo);
 	CommandAdd(modinfo->handle, "CHATHISTORY", cmd_chathistory, MAXPARA, CMD_USER);
 
 	memset(&c, 0, sizeof(c));
 	c.name = "draft/chathistory";
-	ClientCapabilityAdd(modinfo->handle, &c, &CAP_CHATHISTORY);
+	cap = ClientCapabilityAdd(modinfo->handle, &c, &CAP_CHATHISTORY);
+
+	memset(&mtag, 0, sizeof(mtag));
+	mtag.name = "draft/chathistory-end";
+	mtag.is_ok = chathistory_end_mtag_is_ok;
+	mtag.clicap_handler = cap;
+	MessageTagHandlerAdd(modinfo->handle, &mtag);
+
 	return MOD_SUCCESS;
 }
 
@@ -56,6 +66,14 @@ MOD_LOAD()
 MOD_UNLOAD()
 {
 	return MOD_SUCCESS;
+}
+
+/** The draft/chathistory-end tag is server-generated only; reject it from clients */
+int chathistory_end_mtag_is_ok(Client *client, const char *name, const char *value)
+{
+	if (IsServer(client))
+		return 1;
+	return 0;
 }
 
 int chathistory_token(const char *str, char *token, char **store)
@@ -189,18 +207,34 @@ void chathistory_targets(Client *client, HistoryFilter *filter, int limit)
 
 	/* 2. Now send it to the client */
 
+	/* Count total matching targets to determine end-of-pagination */
+	{
+		ChatHistoryTarget *t;
+		for (t = targets; t; t = t->next)
+			sent++;
+	}
+
 	batch[0] = '\0';
 	if (HasCapability(client, "batch"))
 	{
 		/* Start a new batch */
+		MessageTag *batch_open_mtags = NULL;
 		generate_batch_id(batch);
-		sendto_one(client, NULL, ":%s BATCH +%s draft/chathistory-targets", me.name, batch);
+		if (sent <= limit)
+		{
+			batch_open_mtags = safe_alloc(sizeof(MessageTag));
+			safe_strdup(batch_open_mtags->name, "draft/chathistory-end");
+		}
+		sendto_one(client, batch_open_mtags, ":%s BATCH +%s draft/chathistory-targets", me.name, batch);
+		if (batch_open_mtags)
+			free_message_tags(batch_open_mtags);
 	}
 
+	sent = 0;
 	for (; targets; targets = targets_next)
 	{
 		targets_next = targets->next;
-		if (++sent < limit)
+		if (sent++ < limit)
 			chathistory_targets_send_line(client, targets, batch);
 		safe_free(targets->datetime);
 		safe_free(targets->object);
@@ -451,7 +485,7 @@ CMD_FUNC(cmd_chathistory)
 			if (fakelag_ms > 5000)
 				fakelag_ms = 5000;
 			add_fake_lag(client, fakelag_ms);
-			history_send_result(client, r);
+			history_send_result(client, r, r->reached_end);
 		}
 	}
 
