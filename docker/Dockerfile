@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.6
+# syntax=docker/dockerfile:1.25
 #
 # ObbyIRCd Docker image.  Builds the IRCd straight from this repository,
 # so every native module shipped with the fork (account-registration,
