@@ -202,6 +202,23 @@ static void bridge_forward_quit(Client *client)
  * into bridge_inbuf, parse newline-delimited JSON frames, and emit
  * one TAGMSG per frame using me.name as the source.
  * =================================================================== */
+/* Resolve persistence's per-client "account_canonical" ModData lazily
+ * (persistence may load after us). It maps every multiclient session to its
+ * presence's canonical client; the canonical maps to itself. */
+static ModDataInfo *account_canonical_md(void)
+{
+	static ModDataInfo *md = NULL;
+	if (!md)
+		md = findmoddata_byname("account_canonical", MODDATATYPE_CLIENT);
+	return md;
+}
+
+static void send_rtc_tagmsg(Client *dest, const char *escaped)
+{
+	sendto_one(dest, NULL, "@" VOICE_RTC_TAG "=%s :%s TAGMSG %s",
+	           escaped, me.name, dest->name);
+}
+
 static void emit_outbound_signal(const char *to, const char *payload_json)
 {
 	if (!to || !*to || !payload_json)
@@ -254,13 +271,25 @@ static void emit_outbound_signal(const char *to, const char *payload_json)
 	}
 	else
 	{
-		/* Direct to a specific user (nick lookup). */
+		/* Direct to a specific user. find_user returns the canonical;
+		 * multiclient session clients are out of the nick hash. Deliver to
+		 * the canonical AND every attached session of the presence, so
+		 * whichever client is actually viewing the channel receives the
+		 * signaling -- clients not viewing simply ignore the rtc tag. */
 		Client *target = find_user(to, NULL);
 		if (target && MyUser(target))
+			send_rtc_tagmsg(target, escaped);
+		ModDataInfo *md = account_canonical_md();
+		if (target && md)
 		{
-			sendto_one(target, NULL,
-			           "@" VOICE_RTC_TAG "=%s :%s TAGMSG %s",
-			           escaped, me.name, target->name);
+			Client *c;
+			list_for_each_entry(c, &lclient_list, lclient_node)
+			{
+				if (c == target || !MyUser(c))
+					continue;
+				if (moddata_client(c, md).ptr == target)
+					send_rtc_tagmsg(c, escaped);
+			}
 		}
 	}
 	safe_free(escaped);
