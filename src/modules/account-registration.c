@@ -6395,6 +6395,9 @@ CMD_FUNC(register_account)
         sendto_one(client, NULL,
                    ":%s REGISTER SUCCESS %s :Account registered successfully.",
                    me.name, name);
+        /* CMD_UNREGISTERED: no User struct until cmd_user runs. */
+        if (!client->user)
+            make_user(client);
         strlcpy(client->user->account, name, sizeof(client->user->account));
         user_account_login(NULL, client);
         RunHook(HOOKTYPE_ACCOUNT_REGISTER, acc, client);
@@ -6748,6 +6751,8 @@ CMD_FUNC(cmd_verify)
                log_data_string("account", acc->name));
 
     /* Auto-login the verifying client. */
+    if (!client->user)
+        make_user(client);
     strlcpy(client->user->account, acc->name, sizeof(client->user->account));
     user_account_login(NULL, client);
 
